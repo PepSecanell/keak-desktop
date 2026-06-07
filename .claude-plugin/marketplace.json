@@ -6,9 +6,8 @@
       "name": "mi-primer-plugin",
       "description": "Mi primer plugin en la nube",
       "source": { 
-        "type": "github",
-        "repo": "keolyapp/mis-plugins-claude",
-        "path": "plugins/mi-primer-plugin"
+        "type": "url",
+        "url": "https://githubusercontent.com"
       }
     }
   ]
