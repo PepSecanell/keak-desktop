@@ -1,0 +1,513 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Keoly App — Analytics Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #0e1a11;
+    --surface: #1B3624;
+    --surface2: #243d2b;
+    --border: #2C543E;
+    --green: #B8955A;
+    --green-dim: #9a7a48;
+    --blue: #2C543E;
+    --yellow: #B8955A;
+    --red: #7A2A21;
+    --text: #F7F3ED;
+    --text-muted: #8fa896;
+    --text-dim: #c8bfb0;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; min-height: 100vh; }
+
+  .header { background: var(--surface); border-bottom: 1px solid var(--border); padding: 20px 32px; display: flex; align-items: center; justify-content: space-between; }
+  .header-left { display: flex; align-items: center; gap: 12px; }
+  .logo-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--green); box-shadow: 0 0 8px rgba(184,149,90,0.6); }
+  .header h1 { font-size: 18px; font-weight: 700; letter-spacing: -0.3px; }
+  .header h1 span { color: var(--green); }
+  .header-meta { font-size: 12px; color: var(--text-muted); }
+
+  .main { max-width: 1280px; margin: 0 auto; padding: 28px 32px; }
+  .section-title { font-size: 11px; font-weight: 700; letter-spacing: 1.5px; color: var(--text-muted); text-transform: uppercase; margin-bottom: 16px; margin-top: 36px; }
+  .section-title:first-child { margin-top: 0; }
+
+  /* KPI Cards */
+  .kpi-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+  .kpi-card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 20px; position: relative; overflow: hidden; }
+  .kpi-card::before { content: ''; position: absolute; top: 0; left: 0; right: 0; height: 2px; background: var(--accent, var(--green)); }
+  .kpi-card.blue { --accent: var(--blue); }
+  .kpi-card.yellow { --accent: var(--yellow); }
+  .kpi-label { font-size: 11px; color: var(--text-muted); font-weight: 600; text-transform: uppercase; letter-spacing: 0.8px; margin-bottom: 10px; }
+  .kpi-value { font-size: 28px; font-weight: 800; letter-spacing: -1px; line-height: 1; }
+  .kpi-value.green { color: var(--green); }
+  .kpi-value.blue { color: var(--blue); }
+  .kpi-value.yellow { color: var(--yellow); }
+  .kpi-value.muted { color: var(--text-muted); }
+  .kpi-sub { font-size: 12px; color: var(--text-muted); margin-top: 6px; }
+
+  /* Charts */
+  .charts-row { display: grid; gap: 16px; }
+  .charts-row.two-col { grid-template-columns: 3fr 2fr; }
+  .chart-card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 24px; }
+  .chart-title { font-size: 13px; font-weight: 700; color: var(--text); margin-bottom: 4px; }
+  .chart-subtitle { font-size: 11px; color: var(--text-muted); margin-bottom: 20px; }
+  .chart-wrap { position: relative; }
+
+  /* Empty state */
+  .empty-state { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 160px; gap: 8px; }
+  .empty-icon { font-size: 28px; opacity: 0.3; }
+  .empty-text { font-size: 12px; color: var(--text-muted); }
+
+  /* Countries */
+  .countries-list { display: flex; flex-direction: column; gap: 10px; margin-top: 8px; }
+  .country-row { display: flex; align-items: center; gap: 10px; }
+  .country-flag { font-size: 18px; width: 24px; }
+  .country-name { font-size: 13px; color: var(--text-dim); flex: 1; }
+  .country-bar-wrap { flex: 2; background: var(--bg); border-radius: 4px; height: 6px; overflow: hidden; }
+  .country-bar { height: 100%; background: #B8955A; border-radius: 4px; }
+  .country-count { font-size: 13px; font-weight: 700; color: var(--text); width: 20px; text-align: right; }
+
+  /* Stars */
+  .stars-breakdown { display: flex; flex-direction: column; gap: 8px; margin-top: 4px; }
+  .star-row { display: flex; align-items: center; gap: 8px; }
+  .star-label { font-size: 12px; color: var(--text-dim); width: 22px; text-align: right; }
+  .star-bar-wrap { flex: 1; background: var(--bg); border-radius: 4px; height: 8px; }
+  .star-bar { height: 100%; border-radius: 4px; }
+  .star-count { font-size: 12px; color: var(--text-muted); width: 20px; }
+
+  /* Workflow Registry */
+  .workflow-grid { display: grid; gap: 10px; }
+  .wf-card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 16px 20px; display: flex; align-items: center; gap: 16px; }
+  .wf-status { width: 8px; height: 8px; border-radius: 50%; background: var(--green); box-shadow: 0 0 6px rgba(184,149,90,0.5); flex-shrink: 0; }
+  .wf-info { flex: 1; min-width: 0; }
+  .wf-name { font-size: 13px; font-weight: 600; color: var(--text); }
+  .wf-desc { font-size: 11px; color: var(--text-muted); margin-top: 2px; }
+  .wf-trigger { font-size: 11px; color: var(--text-dim); background: var(--surface2); border: 1px solid var(--border); padding: 3px 10px; border-radius: 20px; white-space: nowrap; flex-shrink: 0; }
+  .wf-output { display: flex; gap: 6px; flex-shrink: 0; }
+  .wf-tag { font-size: 10px; font-weight: 600; padding: 2px 8px; border-radius: 20px; }
+  .wf-tag.email { background: rgba(44,84,62,0.4);   color: #a8c4b0; border: 1px solid rgba(44,84,62,0.8); }
+  .wf-tag.wa    { background: rgba(184,149,90,0.15); color: #B8955A; border: 1px solid rgba(184,149,90,0.35); }
+  .wf-tag.doc   { background: rgba(184,149,90,0.15); color: #B8955A; border: 1px solid rgba(184,149,90,0.35); }
+  .wf-tag.db    { background: rgba(122,42,33,0.2);   color: #c9786f; border: 1px solid rgba(122,42,33,0.5); }
+  .wf-section-label { font-size: 11px; font-weight: 700; letter-spacing: 1px; color: var(--text-muted); text-transform: uppercase; padding: 4px 0; }
+
+  .footer { text-align: center; padding: 32px; color: var(--text-muted); font-size: 11px; border-top: 1px solid var(--border); margin-top: 48px; }
+</style>
+</head>
+<body>
+
+<!-- Data auto-fetched from GitHub every time the dashboard is opened -->
+<script>
+const GITHUB_DATA_URL = "https://raw.githubusercontent.com/keolyapp/mis-plugins-claude/main/PROJECTS/KEOLY-APP/analytics/data.json";
+
+const EMPTY_DATA = {
+  lastUpdated: null,
+  downloads: { weekly: [], countries: [] },
+  revenue: { currency: "USD", weekly: [], activeSubscribers: 0, allTimeNet: 0 },
+  reviews: { weekly: [] }
+};
+</script>
+
+<!-- HEADER -->
+<div class="header">
+  <div class="header-left">
+    <div class="logo-dot"></div>
+    <h1><span>Keoly</span> App Analytics</h1>
+  </div>
+  <div class="header-meta" id="header-date">Waiting for first data</div>
+</div>
+
+<div class="main">
+
+  <!-- KPI CARDS -->
+  <div class="section-title">At a Glance</div>
+  <div class="kpi-grid">
+    <div class="kpi-card">
+      <div class="kpi-label">Total Downloads (All Time)</div>
+      <div class="kpi-value green" id="kpi-total">—</div>
+      <div class="kpi-sub" id="kpi-weekly">Waiting for first report</div>
+    </div>
+    <div class="kpi-card yellow">
+      <div class="kpi-label">Revenue (All Time)</div>
+      <div class="kpi-value yellow" id="kpi-revenue">—</div>
+      <div class="kpi-sub">Net USD after Apple 30%</div>
+    </div>
+    <div class="kpi-card blue">
+      <div class="kpi-label">Active Subscribers</div>
+      <div class="kpi-value blue" id="kpi-subs">—</div>
+      <div class="kpi-sub">Paying users right now</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Reviews (Latest Week)</div>
+      <div class="kpi-value green" id="kpi-reviews">—</div>
+      <div class="kpi-sub" id="kpi-rating">App Store</div>
+    </div>
+  </div>
+
+  <!-- DOWNLOADS -->
+  <div class="section-title">Downloads</div>
+  <div class="chart-card">
+    <div class="chart-title">Weekly New Installs</div>
+    <div class="chart-subtitle">New app users per week — source: RevenueCat via Relay</div>
+    <div class="chart-wrap" style="height:220px" id="downloads-wrap">
+      <canvas id="downloadsChart" style="display:none"></canvas>
+      <div class="empty-state" id="downloads-empty">
+        <div class="empty-icon">📥</div>
+        <div class="empty-text">Data will appear here after the app is published</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- REVENUE + COUNTRIES -->
+  <div class="section-title">Revenue &amp; Geography</div>
+  <div class="charts-row two-col">
+    <div class="chart-card">
+      <div class="chart-title">Weekly Revenue (USD)</div>
+      <div class="chart-subtitle">Gross vs Net — after Apple's ~30% cut</div>
+      <div class="chart-wrap" style="height:200px">
+        <canvas id="revenueChart" style="display:none"></canvas>
+        <div class="empty-state" id="revenue-empty">
+          <div class="empty-icon">💰</div>
+          <div class="empty-text">Revenue data will appear here</div>
+        </div>
+      </div>
+    </div>
+    <div class="chart-card">
+      <div class="chart-title">Top Countries</div>
+      <div class="chart-subtitle">Downloads by country</div>
+      <div class="countries-list" id="countries-list">
+        <div class="empty-state">
+          <div class="empty-icon">🌍</div>
+          <div class="empty-text">Country data will appear here</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- REVIEWS -->
+  <div class="section-title">App Store Reviews</div>
+  <div class="charts-row two-col">
+    <div class="chart-card">
+      <div class="chart-title">Weekly Review Count</div>
+      <div class="chart-subtitle">Total reviews received per week</div>
+      <div class="chart-wrap" style="height:200px">
+        <canvas id="reviewsChart" style="display:none"></canvas>
+        <div class="empty-state" id="reviews-empty">
+          <div class="empty-icon">⭐</div>
+          <div class="empty-text">Review data will appear here</div>
+        </div>
+      </div>
+    </div>
+    <div class="chart-card">
+      <div class="chart-title">Star Rating Breakdown</div>
+      <div class="chart-subtitle" id="reviews-week-label">Latest week</div>
+      <div class="stars-breakdown" id="stars-breakdown">
+        <div class="empty-state" style="height:120px">
+          <div class="empty-icon">⭐</div>
+          <div class="empty-text">No reviews yet</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- WORKFLOW REGISTRY -->
+  <div class="section-title">Active Relay Workflows</div>
+  <div class="workflow-grid">
+
+    <div class="wf-section-label">Apple Store</div>
+
+    <div class="wf-card">
+      <div class="wf-status"></div>
+      <div class="wf-info">
+        <div class="wf-name">App Review Email Alert</div>
+        <div class="wf-desc">New bad review (≤2 stars) → instant alert</div>
+      </div>
+      <div class="wf-trigger">Hourly · if ≤2⭐</div>
+      <div class="wf-output">
+        <span class="wf-tag email">Email</span>
+        <span class="wf-tag wa">WhatsApp</span>
+      </div>
+    </div>
+
+    <div class="wf-card">
+      <div class="wf-status"></div>
+      <div class="wf-info">
+        <div class="wf-name">Borrador de Respuesta con IA</div>
+        <div class="wf-desc">Every new review → AI writes a reply draft</div>
+      </div>
+      <div class="wf-trigger">On new review</div>
+      <div class="wf-output">
+        <span class="wf-tag email">Email</span>
+        <span class="wf-tag wa">WhatsApp</span>
+      </div>
+    </div>
+
+    <div class="wf-card">
+      <div class="wf-status"></div>
+      <div class="wf-info">
+        <div class="wf-name">Keoly — Weekly Downloads Report</div>
+        <div class="wf-desc">Weekly downloads, countries, trend analysis from RevenueCat</div>
+      </div>
+      <div class="wf-trigger">Mon 3:00 AM</div>
+      <div class="wf-output">
+        <span class="wf-tag email">Email</span>
+        <span class="wf-tag wa">WhatsApp</span>
+      </div>
+    </div>
+
+    <div class="wf-card">
+      <div class="wf-status"></div>
+      <div class="wf-info">
+        <div class="wf-name">Keoly — Weekly Revenue Report</div>
+        <div class="wf-desc">Gross/net revenue, subscribers, churn, country breakdown</div>
+      </div>
+      <div class="wf-trigger">Mon 3:00 AM</div>
+      <div class="wf-output">
+        <span class="wf-tag email">Email</span>
+        <span class="wf-tag wa">WhatsApp</span>
+      </div>
+    </div>
+
+    <div class="wf-card">
+      <div class="wf-status"></div>
+      <div class="wf-info">
+        <div class="wf-name">Keoly App Store Reviews (Capture)</div>
+        <div class="wf-desc">Saves every incoming review to a table for history</div>
+      </div>
+      <div class="wf-trigger">Hourly</div>
+      <div class="wf-output">
+        <span class="wf-tag db">Database</span>
+      </div>
+    </div>
+
+    <div class="wf-card">
+      <div class="wf-status"></div>
+      <div class="wf-info">
+        <div class="wf-name">Resumen Semanal</div>
+        <div class="wf-desc">Aggregates 7-day reviews, AI analysis, weekly digest</div>
+      </div>
+      <div class="wf-trigger">Mon 3:00 AM</div>
+      <div class="wf-output">
+        <span class="wf-tag email">Email</span>
+        <span class="wf-tag wa">WhatsApp</span>
+      </div>
+    </div>
+
+    <div class="wf-card">
+      <div class="wf-status"></div>
+      <div class="wf-info">
+        <div class="wf-name">Alerta Review Negativa (1-2 estrellas)</div>
+        <div class="wf-desc">Urgent alert if rating ≤2 stars detected</div>
+      </div>
+      <div class="wf-trigger">Hourly · if ≤2⭐</div>
+      <div class="wf-output">
+        <span class="wf-tag email">Email</span>
+        <span class="wf-tag wa">WhatsApp</span>
+      </div>
+    </div>
+
+    <div class="wf-section-label" style="margin-top:8px">Skool</div>
+
+    <div class="wf-card">
+      <div class="wf-status"></div>
+      <div class="wf-info">
+        <div class="wf-name">New YouTube Video → Skool Post Draft</div>
+        <div class="wf-desc">New YT video detected → AI writes Skool post → Google Doc + Email</div>
+      </div>
+      <div class="wf-trigger">On new video</div>
+      <div class="wf-output">
+        <span class="wf-tag doc">Google Doc</span>
+        <span class="wf-tag email">Email</span>
+      </div>
+    </div>
+
+    <div class="wf-card">
+      <div class="wf-status"></div>
+      <div class="wf-info">
+        <div class="wf-name">Weekly Skool Engagement Question</div>
+        <div class="wf-desc">AI generates a community engagement question → Google Doc + Email</div>
+      </div>
+      <div class="wf-trigger">Wed 8:00 AM</div>
+      <div class="wf-output">
+        <span class="wf-tag doc">Google Doc</span>
+        <span class="wf-tag email">Email</span>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<div class="footer">
+  Keoly App Analytics · Data from Relay workflows via keoly.app@gmail.com · Updated weekly by Claude
+</div>
+
+<script>
+async function loadAndRender() {
+  let DATA = EMPTY_DATA;
+  try {
+    const res = await fetch(GITHUB_DATA_URL + '?t=' + Date.now());
+    if (res.ok) DATA = await res.json();
+  } catch(e) {
+    document.getElementById('header-date').textContent = 'Offline — showing local data';
+  }
+
+Chart.defaults.color = '#8fa896';
+Chart.defaults.borderColor = '#2C543E';
+Chart.defaults.font.family = "-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
+
+// Header date
+if (DATA.lastUpdated) {
+  document.getElementById('header-date').textContent = 'Last updated: ' + DATA.lastUpdated;
+}
+
+// KPI cards
+const lastDL = DATA.downloads.weekly.at(-1);
+if (lastDL) {
+  document.getElementById('kpi-total').textContent = lastDL.allTime;
+  document.getElementById('kpi-weekly').textContent = lastDL.downloads + ' this week';
+} else {
+  document.getElementById('kpi-total').textContent = '—';
+}
+
+document.getElementById('kpi-revenue').textContent = DATA.revenue.allTimeNet > 0 ? '$' + DATA.revenue.allTimeNet : '—';
+document.getElementById('kpi-subs').textContent = DATA.revenue.activeSubscribers > 0 ? DATA.revenue.activeSubscribers : '—';
+
+const lastRev = DATA.reviews.weekly.at(-1);
+if (lastRev) {
+  document.getElementById('kpi-reviews').textContent = lastRev.total;
+  document.getElementById('kpi-rating').textContent = lastRev.avgRating > 0 ? '★ ' + lastRev.avgRating.toFixed(1) + ' avg' : 'Rating pending';
+  document.getElementById('reviews-week-label').textContent = 'Week of ' + lastRev.week;
+} else {
+  document.getElementById('kpi-reviews').textContent = '—';
+}
+
+// Downloads chart
+if (DATA.downloads.weekly.length > 0) {
+  document.getElementById('downloads-empty').style.display = 'none';
+  document.getElementById('downloadsChart').style.display = 'block';
+  new Chart(document.getElementById('downloadsChart'), {
+    type: 'line',
+    data: {
+      labels: DATA.downloads.weekly.map(w => w.week + (w.provisional ? ' *' : '')),
+      datasets: [{
+        label: 'Downloads',
+        data: DATA.downloads.weekly.map(w => w.downloads),
+        borderColor: '#B8955A',
+        backgroundColor: 'rgba(184,149,90,0.08)',
+        pointBackgroundColor: '#B8955A',
+        pointBorderColor: '#B8955A',
+        pointRadius: 5,
+        pointHoverRadius: 7,
+        borderWidth: 2,
+        fill: true,
+        tension: 0.35
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: { legend: { display: false }, tooltip: { callbacks: { label: ctx => ' ' + ctx.parsed.y + ' downloads' } } },
+      scales: {
+        x: { grid: { color: '#2C543E' } },
+        y: { grid: { color: '#2C543E' }, beginAtZero: true, ticks: { stepSize: 1 } }
+      }
+    }
+  });
+}
+
+// Revenue chart
+if (DATA.revenue.weekly.length > 0) {
+  document.getElementById('revenue-empty').style.display = 'none';
+  document.getElementById('revenueChart').style.display = 'block';
+  new Chart(document.getElementById('revenueChart'), {
+    type: 'bar',
+    data: {
+      labels: DATA.revenue.weekly.map(w => w.week),
+      datasets: [
+        { label: 'Gross', data: DATA.revenue.weekly.map(w => w.gross), backgroundColor: 'rgba(184,149,90,0.2)',  borderColor: '#B8955A', borderWidth: 1, borderRadius: 4 },
+        { label: 'Net',   data: DATA.revenue.weekly.map(w => w.net),   backgroundColor: 'rgba(184,149,90,0.5)',  borderColor: '#B8955A', borderWidth: 1, borderRadius: 4 }
+      ]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: { legend: { labels: { boxWidth: 10, font: { size: 11 } } }, tooltip: { callbacks: { label: ctx => ' $' + ctx.parsed.y } } },
+      scales: {
+        x: { grid: { color: '#2C543E' } },
+        y: { grid: { color: '#2C543E' }, beginAtZero: true, ticks: { callback: v => '$' + v } }
+      }
+    }
+  });
+}
+
+// Countries
+if (DATA.downloads.countries.length > 0) {
+  const cList = document.getElementById('countries-list');
+  cList.innerHTML = '';
+  const maxDL = Math.max(...DATA.downloads.countries.map(c => c.downloads), 1);
+  DATA.downloads.countries.forEach(c => {
+    const pct = Math.round((c.downloads / maxDL) * 100);
+    cList.innerHTML += `
+      <div class="country-row">
+        <span class="country-flag">${c.flag}</span>
+        <span class="country-name">${c.country}</span>
+        <div class="country-bar-wrap"><div class="country-bar" style="width:${pct}%"></div></div>
+        <span class="country-count">${c.downloads}</span>
+      </div>`;
+  });
+}
+
+// Reviews chart
+if (DATA.reviews.weekly.length > 0) {
+  document.getElementById('reviews-empty').style.display = 'none';
+  document.getElementById('reviewsChart').style.display = 'block';
+  new Chart(document.getElementById('reviewsChart'), {
+    type: 'bar',
+    data: {
+      labels: DATA.reviews.weekly.map(w => w.week),
+      datasets: [{
+        label: 'Reviews',
+        data: DATA.reviews.weekly.map(w => w.total),
+        backgroundColor: 'rgba(44,84,62,0.6)',
+        borderColor: '#2C543E',
+        borderWidth: 1,
+        borderRadius: 6
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: {
+        x: { grid: { color: '#2C543E' } },
+        y: { grid: { color: '#2C543E' }, beginAtZero: true, ticks: { stepSize: 1 } }
+      }
+    }
+  });
+
+  // Stars breakdown
+  const bd = lastRev.breakdown;
+  const totalStars = Object.values(bd).reduce((a, b) => a + b, 0) || 1;
+  const sbEl = document.getElementById('stars-breakdown');
+  sbEl.innerHTML = '';
+  [5, 4, 3, 2, 1].forEach(n => {
+    const count = bd[n] || 0;
+    const pct = Math.round((count / totalStars) * 100);
+    const color = n >= 4 ? '#B8955A' : n === 3 ? '#9a7a48' : '#7A2A21';
+    sbEl.innerHTML += `
+      <div class="star-row">
+        <span class="star-label">${n}⭐</span>
+        <div class="star-bar-wrap"><div class="star-bar" style="width:${pct}%;background:${color}"></div></div>
+        <span class="star-count">${count}</span>
+      </div>`;
+  });
+}
+} // end loadAndRender
+
+loadAndRender();
+</script>
+</body>
+</html>
