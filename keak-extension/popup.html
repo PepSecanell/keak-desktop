@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    width: 220px;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: #F5EDD8;
+    color: #2C1508;
+    padding: 16px;
+  }
+  .logo { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+  .logo-text { font-weight: 700; font-size: 15px; }
+  .status {
+    display: flex; align-items: center; gap: 7px;
+    font-size: 12px; padding: 8px 10px;
+    background: #EDE4CC; border-radius: 8px;
+  }
+  .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: #ccc; flex-shrink: 0;
+  }
+  .dot.on { background: #4ade80; }
+  .dot.off { background: #D4A49A; }
+  .hint {
+    margin-top: 10px; font-size: 11px;
+    color: #7a5c48; line-height: 1.5;
+  }
+</style>
+</head>
+<body>
+<div class="logo">
+  <strong class="logo-text">Keak Browser Bridge</strong>
+</div>
+<div class="status">
+  <div class="dot" id="dot"></div>
+  <span id="label">Checking...</span>
+</div>
+<p class="hint">Hold <strong>Ctrl + Alt</strong> and ask Keak AI to click, type, or interact with this page.</p>
+<script src="popup.js"></script>
+</body>
+</html>

@@ -28,6 +28,9 @@ arboard = "3"
 xcap = "0.4"
 image = "0.25"
 base64 = "0.22"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-global-shortcut = "2"

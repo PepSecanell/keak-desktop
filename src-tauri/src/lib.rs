@@ -8,6 +8,9 @@ use tauri::{
 use tauri_plugin_deep_link::DeepLinkExt;
 use tauri_plugin_opener::OpenerExt;
 
+// Shared sender so Tauri commands can push browser commands to the connected extension.
+static BROWSER_TX: Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>> = Mutex::new(None);
+
 // Holds the user's clipboard while a Rewrite is in progress, so we can put it back afterward.
 static CLIPBOARD_STASH: Mutex<Option<String>> = Mutex::new(None);
 
@@ -97,6 +100,19 @@ fn capture_screen(_app: AppHandle) -> Result<String, String> {
     result
 }
 
+// Send a browser command (JSON string) to the Chrome extension via WebSocket.
+// Called from the overlay JS when Keak AI returns a browser_action.
+#[tauri::command]
+fn send_browser_command(command: String) -> Result<(), String> {
+    let tx = BROWSER_TX.lock().unwrap();
+    if let Some(sender) = tx.as_ref() {
+        sender.send(command).map_err(|e| e.to_string())?;
+        Ok(())
+    } else {
+        Err("Chrome extension not connected".into())
+    }
+}
+
 #[tauri::command]
 fn open_url(app: AppHandle, url: String) -> Result<(), String> {
     app.opener().open_url(&url, None::<&str>).map_err(|e| e.to_string())
@@ -158,6 +174,42 @@ pub fn run() {
             #[cfg(windows)]
             ptt_watch::install(app.handle().clone());
 
+            // Start the Chrome extension WebSocket bridge on localhost:7777.
+            // The extension connects here so Keak AI can send browser commands (click, type, etc.).
+            {
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                *BROWSER_TX.lock().unwrap() = Some(tx);
+                std::thread::spawn(move || {
+                    use tokio_tungstenite::accept_async;
+                    use futures_util::{SinkExt, StreamExt};
+                    let rt = tokio::runtime::Runtime::new().unwrap();
+                    rt.block_on(async move {
+                        let listener = tokio::net::TcpListener::bind("127.0.0.1:7777").await
+                            .expect("Could not bind WebSocket port 7777");
+                        // Only one extension tab connects at a time. Loop accepts new connections
+                        // (e.g. browser restart) and replaces the previous sender.
+                        loop {
+                            let Ok((stream, _)) = listener.accept().await else { continue };
+                            let Ok(ws_stream) = accept_async(stream).await else { continue };
+                            let (mut sink, mut source) = ws_stream.split();
+                            // Drain any queued commands to the new connection
+                            let drain = tokio::spawn(async move {
+                                while let Some(msg) = rx.recv().await {
+                                    let _ = sink.send(tokio_tungstenite::tungstenite::Message::Text(msg.into())).await;
+                                }
+                            });
+                            // Read until the extension disconnects
+                            while source.next().await.is_some() {}
+                            drain.abort();
+                            // Recreate channel for next connection
+                            let (new_tx, new_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                            rx = new_rx;
+                            *BROWSER_TX.lock().unwrap() = Some(new_tx);
+                        }
+                    });
+                });
+            }
+
             // Register keak:// deep link scheme (needed in dev mode)
             #[cfg(desktop)]
             let _ = app.deep_link().register_all();
@@ -210,7 +262,7 @@ pub fn run() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![open_url, inject_text, hide_overlay, show_main, restore_clipboard, capture_selection, capture_screen])
+        .invoke_handler(tauri::generate_handler![open_url, inject_text, hide_overlay, show_main, restore_clipboard, capture_selection, capture_screen, send_browser_command])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

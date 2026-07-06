@@ -726,6 +726,25 @@ export default function Overlay() {
         return;
       }
       const aData = await aRes.json();
+
+      // Browser action: Keak AI wants to interact with the browser (click, type, scroll, etc.)
+      // Forward to the Chrome extension via the desktop WebSocket bridge.
+      if (aData.browser_action?.type) {
+        try {
+          await invoke("send_browser_command", {
+            command: JSON.stringify({ id: Date.now(), ...aData.browser_action }),
+          });
+        } catch {
+          // Extension not connected — surface it in the reply so the user knows
+          if (!aData.reply) {
+            setAiReply("Keak Browser Bridge isn't connected. Install the Keak Chrome extension to use browser actions.");
+            setStateSafe("idle");
+            scheduleAssistantClose(9000);
+            return;
+          }
+        }
+      }
+
       // Diagnostic: if we DID send a screenshot but the backend didn't attach it to the model
       // (saw_screen === false), the account permission wasn't read. Say so plainly instead of
       // letting the model claim it "has no eyes".
