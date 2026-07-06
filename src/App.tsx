@@ -63,6 +63,12 @@ export default function App() {
   const [language, setLanguage] = useState<string>(() => localStorage.getItem("keak_language") || "auto");
 
   useEffect(() => {
+    // Request mic permission in the main (visible, decorated) window so WebView2 can show the dialog.
+    // Once granted here, the overlay window (same tauri://localhost origin) inherits it silently.
+    navigator.mediaDevices?.getUserMedia({ audio: true })
+      .then(s => s.getTracks().forEach(t => t.stop()))
+      .catch(() => {});
+
     const stored = localStorage.getItem("keak_session");
     if (stored) {
       const s: Session = JSON.parse(stored);

@@ -7,7 +7,9 @@ const host = process.env.TAURI_DEV_HOST;
 // https://vite.dev/config/
 export default defineConfig(async () => ({
   plugins: [react()],
-  envDir: "../PEP'S SECOND BRAIN/PROJECTS/KEAK",
+  // Dev: load .env from the local Second Brain project folder.
+  // Production (GitHub Actions): the .env is written to the repo root, so use ".".
+  envDir: process.env.NODE_ENV === "production" ? "." : "../PEP'S SECOND BRAIN/PROJECTS/KEAK",
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //
