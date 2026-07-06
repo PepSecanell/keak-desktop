@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
-import keakLogo from "./assets/icon_keak.png";
+import keakLogo from "./assets/icon_keak_2.png";
 import keakLogoDark from "./assets/icon_keak_2.png";
 import "./App.css";
 
