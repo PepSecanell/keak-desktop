@@ -23,11 +23,12 @@ function connect() {
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ type: "result", id: cmd.id, ...result }));
       }
-      // After any action that changes the page, send a snapshot so Keak AI can see what happened
-      // and decide the next step (the multi-step agent loop in Overlay.tsx reads these).
-      const mutating = ["click", "navigate", "type", "key", "fill_form"];
-      if (mutating.includes(cmd.type)) {
-        await new Promise(r => setTimeout(r, 900)); // wait for page to settle
+      // After page-mutating actions, send a snapshot so Overlay knows the step completed.
+      // Settle delays are tuned per action type: navigate needs more time than a click.
+      const settleMs = { navigate: 1200, fill_form: 400, type: 250, key: 250, click: 300 };
+      const delay = settleMs[cmd.type] ?? 0;
+      if (delay > 0) {
+        await new Promise(r => setTimeout(r, delay));
         const snap = await executeCommand({ type: "get_page_info" });
         if (ws && ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({ type: "page_snapshot", id: cmd.id, ...snap }));

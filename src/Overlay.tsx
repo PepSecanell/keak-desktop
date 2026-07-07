@@ -712,6 +712,44 @@ export default function Overlay() {
     });
   }
 
+  // Plan-then-execute: Keak AI returns all steps upfront, we run them in sequence with no
+  // extra AI calls between steps. Fastest path — one AI round trip for the whole task.
+  async function executeBrowserPlan(task: string, plan: any[], announcement: string, token: string) {
+    const announce = cleanReply(announcement || `On it — ${plan.length} steps.`);
+    setAiReply(announce);
+    setStateSafe("idle");
+
+    for (let i = 0; i < plan.length; i++) {
+      const step = plan[i];
+      setAiReply(`${announce} (${i + 1}/${plan.length})`);
+      try {
+        await invoke("send_browser_command", {
+          command: JSON.stringify({ id: Date.now(), ...step }),
+        });
+      } catch {
+        setAiReply("Browser Bridge not connected. Reload the Chrome extension.");
+        setStateSafe("idle");
+        scheduleAssistantClose(9000);
+        return;
+      }
+      // Wait for the page snapshot that confirms the step landed
+      await waitForBrowserResult(1500);
+    }
+
+    const doneMsg = "Done.";
+    historyRef.current.push({ role: "user", text: task }, { role: "assistant", text: doneMsg });
+    let revealed = false;
+    const reveal = () => { if (revealed) return; revealed = true; setAiReply(doneMsg); setStateSafe("idle"); };
+    const safety = window.setTimeout(reveal, 10000);
+    try {
+      await speakReply(doneMsg, token, () => { clearTimeout(safety); reveal(); });
+    } finally {
+      clearTimeout(safety);
+      reveal();
+      if (stateRef.current === "idle") scheduleAssistantClose(10000);
+    }
+  }
+
   // Multi-step browser agent. Sends commands and feeds page snapshots back to Keak AI
   // until the task is done (no browser_action returned) or MAX_STEPS is reached.
   async function runBrowserAgent(task: string, firstResp: any, token: string) {
@@ -757,7 +795,7 @@ export default function Overlay() {
       }
 
       // Wait for the page snapshot the extension sends after each action
-      const snap = await waitForBrowserResult(3500);
+      const snap = await waitForBrowserResult(1500);
       let pageCtx = "";
       if (snap?.page) {
         const pg = snap.page;
@@ -827,7 +865,12 @@ export default function Overlay() {
       }
       const aData = await aRes.json();
 
-      // Browser action — hand off to the multi-step agent loop.
+      // Multi-step plan (fastest path — all steps in one AI call, no AI between steps).
+      if (Array.isArray(aData.browser_plan) && aData.browser_plan.length > 0) {
+        await executeBrowserPlan(question, aData.browser_plan, aData.reply, token);
+        return;
+      }
+      // Single browser action — fall back to the step-by-step agent loop.
       if (aData.browser_action?.type) {
         await runBrowserAgent(question, aData, token);
         return;
