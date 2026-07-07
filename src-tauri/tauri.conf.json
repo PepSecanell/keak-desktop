@@ -61,8 +61,7 @@
       "nsis": {
         "installerIcon": "icons/icon.ico",
         "headerImage": "installer/header.bmp",
-        "sidebarImage": "installer/sidebar.bmp",
-        "postinstallScript": "nsis/post-install.nsi"
+        "sidebarImage": "installer/sidebar.bmp"
       }
     }
   }
