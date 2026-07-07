@@ -695,6 +695,106 @@ export default function Overlay() {
     }
   }
 
+  // One-shot listener for a "browser-result" page_snapshot from the Chrome extension.
+  // Returns the parsed snapshot or null on timeout.
+  function waitForBrowserResult(timeoutMs: number): Promise<any | null> {
+    return new Promise(async (resolve) => {
+      let settled = false;
+      const settle = (val: any) => { if (settled) return; settled = true; resolve(val); };
+      const timer = setTimeout(() => settle(null), timeoutMs);
+      const unlisten = await listen<string>("browser-result", (event) => {
+        try {
+          const data = JSON.parse(event.payload);
+          if (data.type === "page_snapshot") { clearTimeout(timer); unlisten(); settle(data); }
+        } catch {}
+      });
+      if (settled) unlisten();
+    });
+  }
+
+  // Multi-step browser agent. Sends commands and feeds page snapshots back to Keak AI
+  // until the task is done (no browser_action returned) or MAX_STEPS is reached.
+  async function runBrowserAgent(task: string, firstResp: any, token: string) {
+    const MAX_STEPS = 6;
+    const userName = localStorage.getItem("keak_user_name") || "there";
+    const assistantName = localStorage.getItem("keak_assistant_name") || "Keak";
+    let resp = firstResp;
+
+    for (let step = 0; step < MAX_STEPS; step++) {
+      if (!resp.browser_action?.type) {
+        // Task complete — speak the final reply
+        const reply = cleanReply(resp.reply || "Done.");
+        historyRef.current.push({ role: "user", text: task }, { role: "assistant", text: reply });
+        let revealed = false;
+        const reveal = () => { if (revealed) return; revealed = true; setAiReply(reply); setStateSafe("idle"); };
+        const safety = window.setTimeout(reveal, 20000);
+        try {
+          await fillerDone;
+          await speakReply(reply, token, () => { clearTimeout(safety); reveal(); });
+        } finally {
+          clearTimeout(safety);
+          reveal();
+          if (stateRef.current === "idle") scheduleAssistantClose(12000);
+        }
+        return;
+      }
+
+      // Show what we're doing this step
+      const stepMsg = cleanReply(resp.reply || `Working on step ${step + 1}…`);
+      setAiReply(stepMsg);
+      setStateSafe("idle");
+
+      // Send the browser command
+      try {
+        await invoke("send_browser_command", {
+          command: JSON.stringify({ id: Date.now(), ...resp.browser_action }),
+        });
+      } catch {
+        setAiReply("Keak Browser Bridge isn't connected. Reload the Chrome extension.");
+        setStateSafe("idle");
+        scheduleAssistantClose(9000);
+        return;
+      }
+
+      // Wait for the page snapshot the extension sends after each action
+      const snap = await waitForBrowserResult(3500);
+      let pageCtx = "";
+      if (snap?.page) {
+        const pg = snap.page;
+        const btns = (pg.buttons || []).slice(0, 12).join(", ");
+        pageCtx = `URL: ${pg.url} | Title: "${pg.title}" | Buttons: [${btns}] | Content: ${(pg.text || "").slice(0, 600)}`;
+      }
+
+      // Ask Keak AI what to do next
+      try {
+        const nextRes = await fetch(`${SUPABASE_URL}/functions/v1/keak-assistant`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+          body: JSON.stringify({
+            text: pageCtx
+              ? `[Task]: ${task}\n[Page after step ${step + 1}]: ${pageCtx}\n[Continue the task or reply done if finished.]`
+              : task,
+            user_name: userName,
+            assistant_name: assistantName,
+            history: historyRef.current.slice(-6).map(h => ({ role: h.role, content: h.text })),
+          }),
+        });
+        resp = await nextRes.json();
+      } catch {
+        setAiReply("Lost connection mid-task. Try again.");
+        setStateSafe("idle");
+        scheduleAssistantClose(9000);
+        return;
+      }
+    }
+
+    // Reached max steps
+    const doneMsg = cleanReply(resp.reply || "I've completed all the steps I can.");
+    setAiReply(doneMsg);
+    setStateSafe("idle");
+    scheduleAssistantClose(9000);
+  }
+
   async function runAssistant(question: string, token: string, image?: string) {
     cancelAssistantClose();
     const assistantName = localStorage.getItem("keak_assistant_name") || "Keak";
@@ -727,22 +827,10 @@ export default function Overlay() {
       }
       const aData = await aRes.json();
 
-      // Browser action: Keak AI wants to interact with the browser (click, type, scroll, etc.)
-      // Forward to the Chrome extension via the desktop WebSocket bridge.
+      // Browser action — hand off to the multi-step agent loop.
       if (aData.browser_action?.type) {
-        try {
-          await invoke("send_browser_command", {
-            command: JSON.stringify({ id: Date.now(), ...aData.browser_action }),
-          });
-        } catch {
-          // Extension not connected — surface it in the reply so the user knows
-          if (!aData.reply) {
-            setAiReply("Keak Browser Bridge isn't connected. Install the Keak Chrome extension to use browser actions.");
-            setStateSafe("idle");
-            scheduleAssistantClose(9000);
-            return;
-          }
-        }
+        await runBrowserAgent(question, aData, token);
+        return;
       }
 
       // Diagnostic: if we DID send a screenshot but the backend didn't attach it to the model

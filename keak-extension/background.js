@@ -1,56 +1,76 @@
 // Keak Browser Bridge — background service worker
 // Maintains a WebSocket connection to the Keak desktop app (ws://localhost:7777).
 // Receives browser commands from Keak AI and executes them in the active tab.
+// After each page-mutating command, sends a page snapshot back so Keak AI can chain steps.
 
 const WS_PORT = 7777;
 let ws = null;
-let reconnectTimer = null;
+let connecting = false;
 
 function connect() {
+  if (connecting || (ws && ws.readyState === WebSocket.OPEN)) return;
+  connecting = true;
   try {
     ws = new WebSocket(`ws://localhost:${WS_PORT}`);
-
     ws.onopen = () => {
-      console.log("[Keak] Connected to Keak desktop");
-      clearTimeout(reconnectTimer);
-      reconnectTimer = null;
+      connecting = false;
       ws.send(JSON.stringify({ type: "hello", client: "chrome-extension" }));
     };
-
     ws.onmessage = async (event) => {
       let cmd;
       try { cmd = JSON.parse(event.data); } catch { return; }
       const result = await executeCommand(cmd);
-      ws.send(JSON.stringify({ type: "result", id: cmd.id, ...result }));
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "result", id: cmd.id, ...result }));
+      }
+      // After any action that changes the page, send a snapshot so Keak AI can see what happened
+      // and decide the next step (the multi-step agent loop in Overlay.tsx reads these).
+      const mutating = ["click", "navigate", "type", "key", "fill_form"];
+      if (mutating.includes(cmd.type)) {
+        await new Promise(r => setTimeout(r, 900)); // wait for page to settle
+        const snap = await executeCommand({ type: "get_page_info" });
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "page_snapshot", id: cmd.id, ...snap }));
+        }
+      }
     };
-
-    ws.onclose = () => {
-      ws = null;
-      if (!reconnectTimer) reconnectTimer = setTimeout(connect, 3000);
-    };
-
-    ws.onerror = () => {
-      ws?.close();
-    };
+    ws.onclose = () => { ws = null; connecting = false; };
+    ws.onerror = () => { ws?.close(); };
   } catch {
-    if (!reconnectTimer) reconnectTimer = setTimeout(connect, 3000);
+    ws = null;
+    connecting = false;
   }
 }
+
+// Keep the service worker alive. Chrome MV3 service workers sleep when idle;
+// the alarm fires every minute to reconnect if the WS was lost during sleep.
+chrome.alarms.create("keepalive", { periodInMinutes: 1 });
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === "keepalive" && (!ws || ws.readyState !== WebSocket.OPEN)) connect();
+});
+
+// Connect immediately on extension load / SW wake-up
+connect();
+
+// Popup status check — also triggers a reconnect attempt so the dot turns green quickly.
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  if (msg.type === "status") {
+    if (!ws || ws.readyState !== WebSocket.OPEN) connect();
+    sendResponse({ connected: !!(ws && ws.readyState === WebSocket.OPEN) });
+  }
+  return true;
+});
 
 async function getActiveTab() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   return tab || null;
 }
 
-// Execute a browser command sent by Keak AI.
-// Each command has a `type` and optional params.
 async function executeCommand(cmd) {
   const tab = await getActiveTab();
   if (!tab) return { success: false, error: "No active tab" };
-
   try {
     switch (cmd.type) {
-      // Click an element — by CSS selector OR by visible text content
       case "click": {
         const [res] = await chrome.scripting.executeScript({
           target: { tabId: tab.id },
@@ -73,7 +93,6 @@ async function executeCommand(cmd) {
           : { success: false, error: res.result.error };
       }
 
-      // Type text into the focused or selected element
       case "type": {
         const [res] = await chrome.scripting.executeScript({
           target: { tabId: tab.id },
@@ -91,9 +110,9 @@ async function executeCommand(cmd) {
               el.textContent += text;
               el.dispatchEvent(new Event("input", { bubbles: true }));
             } else {
-              const nativeInput = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")
+              const desc = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")
                 || Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value");
-              if (nativeInput && nativeInput.set) nativeInput.set.call(el, (append ? el.value : "") + text);
+              if (desc?.set) desc.set.call(el, (append ? el.value : "") + text);
               else el.value = (append ? el.value : "") + text;
               el.dispatchEvent(new Event("input", { bubbles: true }));
               el.dispatchEvent(new Event("change", { bubbles: true }));
@@ -105,39 +124,37 @@ async function executeCommand(cmd) {
         return res.result.ok ? { success: true } : { success: false, error: res.result.error };
       }
 
-      // Press a key (Enter, Tab, Escape, etc.)
       case "key": {
         await chrome.scripting.executeScript({
           target: { tabId: tab.id },
           func: (key) => {
-            document.activeElement?.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true }));
-            document.activeElement?.dispatchEvent(new KeyboardEvent("keyup", { key, bubbles: true }));
+            const el = document.activeElement || document.body;
+            el.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true }));
+            el.dispatchEvent(new KeyboardEvent("keyup", { key, bubbles: true }));
           },
           args: [cmd.key || "Enter"],
         });
         return { success: true };
       }
 
-      // Scroll the page
       case "scroll": {
         await chrome.scripting.executeScript({
           target: { tabId: tab.id },
           func: (dir, amount) => {
-            const px = amount || 400;
-            window.scrollBy({ top: dir === "up" ? -px : px, behavior: "smooth" });
+            window.scrollBy({ top: dir === "up" ? -amount : amount, behavior: "smooth" });
           },
           args: [cmd.direction || "down", cmd.amount || 400],
         });
         return { success: true };
       }
 
-      // Navigate to a URL
       case "navigate": {
         await chrome.tabs.update(tab.id, { url: cmd.url });
+        // Wait for page load before snapshot
+        await new Promise(r => setTimeout(r, 1500));
         return { success: true };
       }
 
-      // Read the page — returns title, URL, and visible text (for Keak AI context)
       case "get_page_info": {
         const [res] = await chrome.scripting.executeScript({
           target: { tabId: tab.id },
@@ -148,16 +165,15 @@ async function executeCommand(cmd) {
             inputs: [...document.querySelectorAll("input, textarea, select")]
               .map(el => ({ tag: el.tagName, type: el.type, name: el.name, placeholder: el.placeholder, id: el.id }))
               .slice(0, 20),
-            buttons: [...document.querySelectorAll("button, [role='button'], input[type='submit']")]
+            buttons: [...document.querySelectorAll("button, [role='button'], input[type='submit'], a[href]")]
               .map(el => el.textContent.trim().slice(0, 60))
               .filter(Boolean)
-              .slice(0, 15),
+              .slice(0, 20),
           }),
         });
         return { success: true, page: res.result };
       }
 
-      // Fill multiple form fields at once
       case "fill_form": {
         const [res] = await chrome.scripting.executeScript({
           target: { tabId: tab.id },
@@ -194,12 +210,3 @@ async function executeCommand(cmd) {
     return { success: false, error: e.message };
   }
 }
-
-// Start connecting on extension load
-connect();
-
-// Keep the service worker alive by responding to any message
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-  if (msg.type === "status") sendResponse({ connected: ws?.readyState === 1 });
-  return true;
-});

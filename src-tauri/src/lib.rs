@@ -179,15 +179,15 @@ pub fn run() {
             {
                 let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
                 *BROWSER_TX.lock().unwrap() = Some(tx);
+                let app_for_ws = app.handle().clone();
                 std::thread::spawn(move || {
                     use tokio_tungstenite::accept_async;
+                    use tokio_tungstenite::tungstenite::Message;
                     use futures_util::{SinkExt, StreamExt};
                     let rt = tokio::runtime::Runtime::new().unwrap();
                     rt.block_on(async move {
                         let listener = tokio::net::TcpListener::bind("127.0.0.1:7777").await
                             .expect("Could not bind WebSocket port 7777");
-                        // Only one extension tab connects at a time. Loop accepts new connections
-                        // (e.g. browser restart) and replaces the previous sender.
                         loop {
                             let Ok((stream, _)) = listener.accept().await else { continue };
                             let Ok(ws_stream) = accept_async(stream).await else { continue };
@@ -195,11 +195,21 @@ pub fn run() {
                             // Drain any queued commands to the new connection
                             let drain = tokio::spawn(async move {
                                 while let Some(msg) = rx.recv().await {
-                                    let _ = sink.send(tokio_tungstenite::tungstenite::Message::Text(msg.into())).await;
+                                    let _ = sink.send(Message::Text(msg.into())).await;
                                 }
                             });
-                            // Read until the extension disconnects
-                            while source.next().await.is_some() {}
+                            // Forward incoming messages (page snapshots, results) to the overlay
+                            // as Tauri events so the multi-step browser agent loop can react.
+                            let handle = app_for_ws.clone();
+                            loop {
+                                match source.next().await {
+                                    Some(Ok(Message::Text(s))) => {
+                                        let _ = handle.emit("browser-result", s.to_string());
+                                    }
+                                    Some(Ok(_)) => {} // ignore binary, ping, pong
+                                    _ => break,        // disconnect or error
+                                }
+                            }
                             drain.abort();
                             // Recreate channel for next connection
                             let (new_tx, new_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
