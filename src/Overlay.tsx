@@ -408,8 +408,17 @@ export default function Overlay() {
     });
     // Ctrl+Alt — decide Keak AI vs Thought Dump from the saved setting.
     const altStartP = listen("alt-start", () => {
-      if (stateRef.current !== "idle") return;
       const alt = localStorage.getItem("keak_alt_mode") || "keak_ai";
+      // Allow interrupting the AI mid-response to ask a follow-up in the same conversation.
+      // Only skip if we're actively recording or processing a different mode (dictate/rewrite).
+      const interruptable = alt !== "thought_dump"
+        && assistantVisibleRef.current
+        && (stateRef.current === "responding" || stateRef.current === "processing" || stateRef.current === "result");
+      if (stateRef.current !== "idle" && !interruptable) return;
+      if (interruptable) {
+        stopSpeaking();
+        setStateSafe("idle");
+      }
       if (alt === "thought_dump") {
         modeRef.current = "dictate";
         thoughtDumpRef.current = true;
@@ -418,8 +427,8 @@ export default function Overlay() {
       } else {
         modeRef.current = "assistant";
         if (assistantVisibleRef.current) {
-          // Overlay still visible — continue the conversation. Cancel the auto-close and keep
-          // the previous reply + history so this feels like a natural follow-up.
+          // Overlay still visible (or was interrupted mid-response) — continue the conversation.
+          // Cancel the auto-close and keep history so this feels like a natural follow-up.
           cancelAssistantClose();
         } else {
           // Overlay was already closed — start a fresh conversation.
