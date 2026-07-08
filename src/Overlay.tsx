@@ -369,6 +369,7 @@ export default function Overlay() {
   const [screenAllowed, setScreenAllowed] = useState(() => localStorage.getItem("keak_screen_vision_allowed") === "1");
   const historyRef = useRef<{ role: string; text: string }[]>([]); // Keak AI conversation memory
   const closeTimerRef = useRef<number | null>(null); // pending auto-close of the assistant panel
+  const assistantVisibleRef = useRef(false); // true while the assistant orb is on screen
   const mrRef = useRef<MediaRecorder | null>(null);
   const chunks = useRef<Blob[]>([]);
   const streamRef = useRef<MediaStream | null>(null); // the (warm) mic stream, reused between dictations
@@ -392,6 +393,7 @@ export default function Overlay() {
     const startP = listen<boolean>("ptt-start", (e) => {
       if (stateRef.current === "idle") {
         modeRef.current = "dictate";
+        assistantVisibleRef.current = false;
         setAssistant(false); // leaving any open Keak AI conversation
         setAiReply("");
         historyRef.current = [];
@@ -415,8 +417,17 @@ export default function Overlay() {
         startRecording();
       } else {
         modeRef.current = "assistant";
-        setAssistant(true);
-        setAiReply("");
+        if (assistantVisibleRef.current) {
+          // Overlay still visible — continue the conversation. Cancel the auto-close and keep
+          // the previous reply + history so this feels like a natural follow-up.
+          cancelAssistantClose();
+        } else {
+          // Overlay was already closed — start a fresh conversation.
+          assistantVisibleRef.current = true;
+          setAssistant(true);
+          setAiReply("");
+          historyRef.current = [];
+        }
         setAttachedScreen(false);
         screenOffThisTurnRef.current = false;
         // Screen is OFF by default every question. Keak only looks at your screen when you deliberately
@@ -436,6 +447,7 @@ export default function Overlay() {
     const rewriteStartP = listen("rewrite-start", () => {
       if (stateRef.current !== "idle") return;
       modeRef.current = "rewrite";
+      assistantVisibleRef.current = false;
       setAssistant(false); // leaving any open Keak AI conversation
       setAiReply("");
       historyRef.current = [];
@@ -1082,6 +1094,7 @@ export default function Overlay() {
     setErrorMsg("");
     setAiReply("");
     setPendingAction(null);
+    assistantVisibleRef.current = false;
     setAssistant(false);
     setRewriting(false);
     setSeeScreen(false);

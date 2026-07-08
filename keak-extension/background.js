@@ -25,7 +25,7 @@ function connect() {
       }
       // After page-mutating actions, send a snapshot so Overlay knows the step completed.
       // Settle delays are tuned per action type: navigate needs more time than a click.
-      const settleMs = { navigate: 1200, fill_form: 400, type: 250, key: 250, click: 300 };
+      const settleMs = { navigate: 400, fill_form: 400, type: 250, key: 250, click: 300 };
       const delay = settleMs[cmd.type] ?? 0;
       if (delay > 0) {
         await new Promise(r => setTimeout(r, delay));
@@ -151,8 +151,15 @@ async function executeCommand(cmd) {
 
       case "navigate": {
         await chrome.tabs.update(tab.id, { url: cmd.url });
-        // Wait for page load before snapshot
-        await new Promise(r => setTimeout(r, 1500));
+        // Wait for actual page load instead of a fixed delay (max 6s fallback)
+        await new Promise(resolve => {
+          const done = () => { chrome.tabs.onUpdated.removeListener(listener); resolve(); };
+          const timer = setTimeout(done, 6000);
+          function listener(tabId, info) {
+            if (tabId === tab.id && info.status === "complete") { clearTimeout(timer); done(); }
+          }
+          chrome.tabs.onUpdated.addListener(listener);
+        });
         return { success: true };
       }
 
