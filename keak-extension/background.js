@@ -79,18 +79,36 @@ async function executeCommand(cmd) {
             let el = null;
             if (selector) el = document.querySelector(selector);
             if (!el && text) {
-              el = [...document.querySelectorAll("button, a, [role='button'], input[type='submit'], input[type='button'], label")]
-                .find(e => e.textContent.trim().toLowerCase().includes(text.toLowerCase()));
+              const lower = text.toLowerCase();
+              const pool = [...document.querySelectorAll(
+                "button, a, [role='button'], [role='menuitem'], [role='option'], [role='tab'], [role='link'], input[type='submit'], input[type='button'], label, [tabindex]"
+              )];
+              // 1. Exact or partial visible text
+              el = pool.find(e => e.textContent.trim().toLowerCase().includes(lower));
+              // 2. aria-label (Google Drive, Gmail use this for icon buttons)
+              if (!el) el = pool.find(e => e.getAttribute("aria-label")?.toLowerCase().includes(lower));
+              // 3. data-tooltip or title attribute
+              if (!el) el = pool.find(e =>
+                e.getAttribute("data-tooltip")?.toLowerCase().includes(lower) ||
+                e.getAttribute("title")?.toLowerCase().includes(lower)
+              );
+              // 4. Broader — any visible element whose only text matches
+              if (!el) el = [...document.querySelectorAll("*")].find(e =>
+                e.children.length === 0 &&
+                (e.textContent.trim().toLowerCase() === lower ||
+                 e.getAttribute("aria-label")?.toLowerCase() === lower)
+              );
             }
-            if (!el) return { ok: false, error: "Element not found" };
+            if (!el) return { ok: false, error: `No element found for: "${text}"` };
             el.scrollIntoView({ block: "center" });
+            el.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
             el.click();
-            return { ok: true, tag: el.tagName, text: el.textContent.trim().slice(0, 80) };
+            return { ok: true, tag: el.tagName, label: (el.getAttribute("aria-label") || el.textContent).trim().slice(0, 80) };
           },
           args: [cmd.selector || null, cmd.text || null],
         });
         return res.result.ok
-          ? { success: true, detail: `Clicked: ${res.result.text}` }
+          ? { success: true, detail: `Clicked: ${res.result.label}` }
           : { success: false, error: res.result.error };
       }
 
@@ -173,10 +191,18 @@ async function executeCommand(cmd) {
             inputs: [...document.querySelectorAll("input, textarea, select")]
               .map(el => ({ tag: el.tagName, type: el.type, name: el.name, placeholder: el.placeholder, id: el.id }))
               .slice(0, 20),
-            buttons: [...document.querySelectorAll("button, [role='button'], input[type='submit'], a[href]")]
-              .map(el => el.textContent.trim().slice(0, 60))
+            buttons: [...document.querySelectorAll(
+              "button, [role='button'], [role='menuitem'], [role='tab'], input[type='submit'], a[href]"
+            )].map(el => {
+                const text = el.textContent?.trim();
+                const label = el.getAttribute("aria-label");
+                const tooltip = el.getAttribute("data-tooltip") || el.getAttribute("title");
+                const best = label || text || tooltip || "";
+                return best.slice(0, 60);
+              })
               .filter(Boolean)
-              .slice(0, 20),
+              .filter((v, i, a) => a.indexOf(v) === i) // dedupe
+              .slice(0, 30),
           }),
         });
         return { success: true, page: res.result };
