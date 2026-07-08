@@ -676,6 +676,33 @@ export default function Overlay() {
         return;
       }
 
+      // Kodes: check if the transcription matches any saved trigger and expand it.
+      // Fetch the user's kodes, replace any triggers found in the text, and if any matched
+      // inject the result directly (skip enhance — kodes are exact, not AI-rewritten).
+      try {
+        const kRes = await fetch(
+          `${SUPABASE_URL}/rest/v1/kodes?select=trigger,expansion`,
+          { headers: { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${session.access_token}` } }
+        );
+        if (kRes.ok) {
+          const kodes: { trigger: string; expansion: string }[] = await kRes.json();
+          if (kodes.length > 0) {
+            let expanded = tData.text;
+            for (const k of kodes) {
+              if (!k.trigger || !k.expansion) continue;
+              const escaped = k.trigger.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+              expanded = expanded.replace(new RegExp(`(?<![\\w])${escaped}(?![\\w])`, "gi"), k.expansion);
+            }
+            if (expanded !== tData.text) {
+              await invoke("inject_text", { text: expanded });
+              saveHistory(session, { raw_text: tData.text, final_text: expanded, mode: "kode" });
+              reset();
+              return;
+            }
+          }
+        }
+      } catch { /* kodes are best-effort — fall through to normal enhance */ }
+
       const stylePrompt = localStorage.getItem("keak_default_style") || null;
       const eRes = await fetch(`${SUPABASE_URL}/functions/v1/enhance`, {
         method: "POST",
