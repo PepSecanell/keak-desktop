@@ -116,31 +116,70 @@ async function executeCommand(cmd) {
         const [res] = await chrome.scripting.executeScript({
           target: { tabId: tab.id },
           func: (selector, text, append) => {
-            let el = selector ? document.querySelector(selector) : document.activeElement;
-            if (!el || (el.tagName !== "INPUT" && el.tagName !== "TEXTAREA" && !el.isContentEditable))
-              el = document.querySelector("input:not([type='hidden']):not([type='submit']):not([type='button']), textarea");
-            if (!el) return { ok: false, error: "No input found" };
-            el.focus();
-            if (!append) {
-              if (el.isContentEditable) el.textContent = "";
-              else el.value = "";
+            // Find the best editable target. Order: explicit selector -> the focused editable ->
+            // a known rich-text compose body (Gmail / Docs / Outlook) -> the first real text field.
+            function findTarget() {
+              if (selector) { const s = document.querySelector(selector); if (s) return s; }
+              const ae = document.activeElement;
+              if (ae && (ae.tagName === "INPUT" || ae.tagName === "TEXTAREA" || ae.isContentEditable)) return ae;
+              // Gmail / rich compose bodies use a contenteditable div with these markers.
+              const compose = document.querySelector(
+                'div[aria-label="Message Body"], div[aria-label*="Body"], div[g_editable="true"], ' +
+                'div[role="textbox"][contenteditable="true"], [contenteditable="true"]'
+              );
+              if (compose) return compose;
+              return document.querySelector(
+                "input:not([type='hidden']):not([type='submit']):not([type='button']):not([type='checkbox']):not([type='radio']), textarea"
+              );
             }
-            if (el.isContentEditable) {
-              el.textContent += text;
-              el.dispatchEvent(new Event("input", { bubbles: true }));
+            const el = findTarget();
+            if (!el) return { ok: false, error: "No input found" };
+            el.scrollIntoView({ block: "center" });
+            el.focus();
+            try { el.click(); } catch {}
+            const isCE = el.isContentEditable;
+
+            // Clear first unless appending.
+            if (!append) {
+              if (isCE) {
+                el.textContent = "";
+              } else {
+                const d = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")
+                  || Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value");
+                if (d?.set) d.set.call(el, ""); else el.value = "";
+                el.dispatchEvent(new Event("input", { bubbles: true }));
+              }
+            }
+
+            if (isCE) {
+              // execCommand insertText fires the exact input events Gmail/Docs listen for. This is the
+              // reliable way to type into a rich compose box (plain textContent += does not register).
+              let ok = false;
+              try { el.focus(); ok = document.execCommand("insertText", false, text); } catch {}
+              if (!ok) {
+                el.textContent = (append ? el.textContent : "") + text;
+                el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: text }));
+              }
             } else {
-              const desc = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")
+              // Native value setter + input/change so React-controlled fields (Google Calendar's
+              // title/date inputs are React) actually pick up the value.
+              const d = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")
                 || Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value");
-              if (desc?.set) desc.set.call(el, (append ? el.value : "") + text);
-              else el.value = (append ? el.value : "") + text;
+              const val = (append ? el.value : "") + text;
+              if (d?.set) d.set.call(el, val); else el.value = val;
               el.dispatchEvent(new Event("input", { bubbles: true }));
               el.dispatchEvent(new Event("change", { bubbles: true }));
+              const last = text.slice(-1) || "a";
+              el.dispatchEvent(new KeyboardEvent("keydown", { key: last, bubbles: true }));
+              el.dispatchEvent(new KeyboardEvent("keyup", { key: last, bubbles: true }));
             }
-            return { ok: true };
+            return { ok: true, tag: el.tagName, editable: isCE };
           },
           args: [cmd.selector || null, cmd.text || "", !!cmd.append],
         });
-        return res.result.ok ? { success: true } : { success: false, error: res.result.error };
+        return res.result.ok
+          ? { success: true, detail: `Typed into ${res.result.tag}${res.result.editable ? " (rich)" : ""}` }
+          : { success: false, error: res.result.error };
       }
 
       case "key": {

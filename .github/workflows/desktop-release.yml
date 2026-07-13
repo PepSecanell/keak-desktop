@@ -57,6 +57,16 @@ jobs:
         run: |
           echo "VITE_SUPABASE_URL=${{ vars.VITE_SUPABASE_URL }}" >> .env
           echo "VITE_SUPABASE_ANON_KEY=${{ vars.VITE_SUPABASE_ANON_KEY }}" >> .env
+          # Shared OAuth app credentials for the one-click sign-ins. Stored as repo Secrets (not in the code),
+          # baked in by Vite at build time. Add each in Settings > Secrets and variables > Actions > Secrets.
+          echo "VITE_KEAK_GOOGLE_CLIENT_ID=${{ secrets.KEAK_GOOGLE_CLIENT_ID }}" >> .env
+          echo "VITE_KEAK_GOOGLE_CLIENT_SECRET=${{ secrets.KEAK_GOOGLE_CLIENT_SECRET }}" >> .env
+          echo "VITE_KEAK_MS_CLIENT_ID=${{ secrets.KEAK_MS_CLIENT_ID }}" >> .env
+          echo "VITE_KEAK_NOTION_CLIENT_ID=${{ secrets.KEAK_NOTION_CLIENT_ID }}" >> .env
+          echo "VITE_KEAK_NOTION_CLIENT_SECRET=${{ secrets.KEAK_NOTION_CLIENT_SECRET }}" >> .env
+          echo "VITE_KEAK_SLACK_CLIENT_ID=${{ secrets.KEAK_SLACK_CLIENT_ID }}" >> .env
+          echo "VITE_KEAK_SLACK_CLIENT_SECRET=${{ secrets.KEAK_SLACK_CLIENT_SECRET }}" >> .env
+          echo "VITE_KEAK_GITHUB_CLIENT_ID=${{ secrets.KEAK_GITHUB_CLIENT_ID }}" >> .env
 
       - name: Build and release
         uses: tauri-apps/tauri-action@v0

@@ -203,3 +203,34 @@ kbd {
   align-self: flex-start;
 }
 .logout-btn:hover { background: var(--cream-hi); color: var(--ink); }
+
+/* Connect your AI (screen control) */
+.cu-lead { margin-top: -2px; }
+.cu-ok { color: var(--rose-deep); font-weight: 600; }
+.cu-body { display: flex; flex-direction: column; gap: 10px; margin-top: 4px; }
+.cu-step { margin: 0; font-size: 12.5px; line-height: 1.45; color: var(--muted); }
+.cu-cmd {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  background: var(--cream-hi); border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px;
+}
+.cu-cmd code { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12.5px; color: var(--ink); }
+.cu-copy { padding: 5px 12px; font-size: 12px; border-radius: 8px; }
+.cu-input {
+  width: 100%; box-sizing: border-box; padding: 9px 11px; font-size: 13px;
+  background: var(--cream-hi); border: 1px solid var(--line); border-radius: 10px; color: var(--ink);
+}
+.cu-input:focus { outline: none; border-color: var(--rose); box-shadow: 0 0 0 3px rgba(212, 164, 154, 0.25); }
+.cu-input::placeholder { color: #A98C74; }
+.cu-save { align-self: flex-start; padding: 8px 16px; font-size: 13px; border-radius: 10px; }
+.cu-oauth { width: 100%; padding: 10px; font-size: 13px; font-weight: 600; border-radius: 10px; }
+.cu-msg { margin: 2px 0 0; font-size: 12.5px; color: var(--rose-deep); font-weight: 500; }
+
+.cu-code {
+  display: flex; flex-direction: column; align-items: center; gap: 4px;
+  background: var(--cream-hi); border: 1px solid var(--rose); border-radius: 12px; padding: 12px;
+}
+.cu-code-label { font-size: 11.5px; color: var(--muted); }
+.cu-code-value {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 22px; font-weight: 700;
+  letter-spacing: 3px; color: var(--ink);
+}

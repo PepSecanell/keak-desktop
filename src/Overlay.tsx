@@ -3,10 +3,13 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import keakLogo from "./assets/icon_keak_2.png";
 import keakLogoDark from "./assets/icon_keak_2.png";
+import { effectiveDefaults, saveDefaultOverride } from "./agents-defaults";
+import { readRoutines, isRoutineDue, setRoutineRun, upsertRoutine, newRoutineId, nextRunLabel, type Routine } from "./routines";
+import { useUiLang } from "./i18n";
 import "./Overlay.css";
 
-const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL as string;
-const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY as string;
+const SUPABASE_URL = (import.meta.env.VITE_SUPABASE_URL || "https://c--8d6c4aab-d6cd-4281-ad41-da14196d68fc-prod.lovable.cloud") as string;
+const SUPABASE_ANON_KEY = (import.meta.env.VITE_SUPABASE_ANON_KEY || "sb_publishable_GjF5OPvQRDcdLyuiFGroOg_FiyrnhjN") as string;
 
 type OverlayState = "idle" | "recording" | "processing" | "result" | "error" | "responding";
 
@@ -84,13 +87,16 @@ function saveHistory(session: any, fields: Record<string, unknown>) {
 // Warm up the voice list early (getVoices() is empty until the engine loads them).
 try { window.speechSynthesis?.getVoices(); window.speechSynthesis?.addEventListener?.("voiceschanged", () => window.speechSynthesis.getVoices()); } catch {}
 
-const BCP47: Record<string, string> = { es: "es-ES", en: "en-US", zh: "zh-CN", hi: "hi-IN", ar: "ar-SA" };
+const BCP47: Record<string, string> = { es: "es-ES", en: "en-US", zh: "zh-CN", hi: "hi-IN", ar: "ar-SA", fr: "fr-FR", de: "de-DE", pt: "pt-PT", it: "it-IT" };
 
-// Which language is this reply in? Use the pinned setting if concrete, else a light heuristic (Pep's
-// two main languages are ES/EN). Getting this right is what stops the voice mixing languages mid-phrase.
+// Which language is this reply in? Use the pinned dictation setting if concrete, else the interface language
+// (keak_ui_lang) if the user chose one, else a light heuristic (Pep's two main languages are ES/EN). Getting
+// this right is what stops the voice mixing languages mid-phrase.
 function replyLang(text: string): string {
   const pinned = localStorage.getItem("keak_language");
   if (pinned && pinned !== "auto" && BCP47[pinned]) return pinned;
+  const ui = localStorage.getItem("keak_ui_lang");
+  if (ui && ui !== "en" && BCP47[ui] && !/[ñ¿¡áéíóú]/i.test(text)) return ui;
   if (/[ñ¿¡áéíóú]/i.test(text)) return "es";
   const t = ` ${text.toLowerCase()} `;
   const es = (t.match(/ (el|la|los|las|de|que|y|en|un|una|es|por|con|para|como|pero|más|está|hola|gracias|qué|cómo) /g) || []).length;
@@ -100,9 +106,933 @@ function replyLang(text: string): string {
 
 function pickVoice(lang: string): SpeechSynthesisVoice | null {
   const voices = window.speechSynthesis?.getVoices?.() || [];
+  // If the user chose a specific voice in Settings, honor it (when it fits the language, or always if they
+  // picked one). This is the "pick a better Windows voice" path.
+  const savedUri = localStorage.getItem("keak_voice_uri") || "";
+  if (savedUri) {
+    const saved = voices.find((v) => v.voiceURI === savedUri);
+    if (saved) return saved;
+  }
   const byLang = voices.filter((v) => v.lang.toLowerCase().startsWith(lang));
-  // Prefer a natural/online/neural voice if the OS exposes one.
-  return byLang.find((v) => /natural|online|neural/i.test(v.name)) || byLang[0] || null;
+  const pool = byLang.length ? byLang : voices;
+  // Rank voices so the fallback sounds good: natural/neural/online + known-good names win; the old robotic
+  // "Microsoft David/Zira Desktop" voices lose. This is what plays when the premium keak-tts voice is down.
+  const score = (v: SpeechSynthesisVoice) => {
+    const n = v.name.toLowerCase();
+    let s = 0;
+    if (/natural|neural/.test(n)) s += 12;
+    if (/online/.test(n)) s += 7;
+    if (/google/.test(n)) s += 6;
+    if (/aria|jenny|michelle|ana|libby|sofia|elvira|sonia|nova|guy|christopher|dalia/.test(n)) s += 4;
+    if (/desktop/.test(n)) s -= 4;
+    if (/david|zira|mark|hazel|helena|sabina/.test(n)) s -= 3;
+    return s;
+  };
+  return pool.slice().sort((a, b) => score(b) - score(a))[0] || null;
+}
+
+// Extract city name from weather queries in English or Spanish.
+function extractWeatherCity(task: string): string | null {
+  const m =
+    task.match(/weather\s+(?:in|for)\s+([A-Za-zÀ-ÿ\s,]+?)(?:\?|$)/i) ||
+    task.match(/(?:tiempo|clima|temperatura)\s+(?:en|de)\s+([A-Za-zÀ-ÿ\s,]+?)(?:\?|$)/i) ||
+    task.match(/(?:what(?:'s| is)(?: the)? weather.*?in)\s+([A-Za-zÀ-ÿ\s,]+?)(?:\?|$)/i);
+  return m ? m[1].trim() : null;
+}
+
+function weatherDesc(code: number, lang: string): string {
+  const key =
+    code === 0 ? "clear" : code <= 3 ? "partly" : code <= 48 ? "fog" :
+    code <= 57 ? "drizzle" : code <= 67 ? "rain" : code <= 77 ? "snow" :
+    code <= 82 ? "showers" : "storm";
+  const EN: Record<string, string> = { clear: "clear sky", partly: "partly cloudy", fog: "foggy", drizzle: "drizzling", rain: "raining", snow: "snowing", showers: "showers", storm: "stormy" };
+  const ES: Record<string, string> = { clear: "cielo despejado", partly: "parcialmente nublado", fog: "niebla", drizzle: "llovizna", rain: "lluvia", snow: "nieve", showers: "chubascos", storm: "tormenta" };
+  return (lang === "es" ? ES : EN)[key] ?? "unknown";
+}
+
+async function fetchWeatherSpeech(city: string): Promise<string | null> {
+  try {
+    const lang = localStorage.getItem("keak_language") || "en";
+    const geoRes = await fetch(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(city)}&count=1&language=en&format=json`);
+    const geoData = await geoRes.json();
+    const loc = geoData.results?.[0];
+    if (!loc) return null;
+    const wRes = await fetch(`https://api.open-meteo.com/v1/forecast?latitude=${loc.latitude}&longitude=${loc.longitude}&current=temperature_2m,weather_code,wind_speed_10m&wind_speed_unit=kmh`);
+    const wData = await wRes.json();
+    const cur = wData.current;
+    if (!cur) return null;
+    const temp = Math.round(cur.temperature_2m);
+    const wind = Math.round(cur.wind_speed_10m);
+    const desc = weatherDesc(cur.weather_code, lang);
+    return lang === "es"
+      ? `En ${loc.name} hay ${temp}°C con ${desc}, y vientos de ${wind} km/h.`
+      : `In ${loc.name}, it's ${temp}°C with ${desc}, and winds at ${wind} km/h.`;
+  } catch {
+    return null;
+  }
+}
+
+// Local calendar-intent parser. Deterministic (no model round trip) so the event TITLE and DAY always
+// land — the old path let Keak AI open a blank Google Calendar link with nothing filled in. Returns
+// { title, start, end } or null when it's not confidently a calendar request.
+function parseCalendarEvent(task: string): { title: string; start: Date; end: Date } | null {
+  const t = task.toLowerCase();
+  // Don't fire on QUESTIONS about the calendar ("what's my schedule today") — only on commands.
+  const isQuestion = /\b(what|when|where|which|who|how|do i|is there|are there|show|tell|check|list|qué|que|cuándo|cuando|dónde|donde|tengo|hay)\b/.test(t) && !/\bremind me\b/.test(t);
+  if (isQuestion) return null;
+  const intent =
+    /\b(add|create|schedule|set ?up|make|put|new|book|arrange)\b[\s\S]{0,40}\b(event|meeting|appointment|reminder|calendar|call|invite)\b/.test(t) ||
+    /\b(event|meeting|appointment)\b[\s\S]{0,25}\b(on|at|for|tomorrow|today|this|next|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/.test(t) ||
+    /\bremind me\b/.test(t) ||
+    /\badd\b[\s\S]{0,40}\bto (my |the )?calendar\b/.test(t) ||
+    /\b(crea|añade|agrega|agenda|programa|pon)\b[\s\S]{0,40}\b(evento|reunión|reunion|cita|recordatorio)\b/.test(t);
+  if (!intent) return null;
+
+  const now = new Date();
+  const start = new Date(now);
+  let matchedDay = false;
+
+  if (/\btomorrow\b|\bmañana\b/.test(t)) { start.setDate(now.getDate() + 1); matchedDay = true; }
+  else if (/\btoday\b|\bhoy\b/.test(t)) { matchedDay = true; }
+  else {
+    const en = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
+    let di = en.findIndex((d) => t.includes(d));
+    if (di < 0) {
+      const es: [RegExp, number][] = [[/domingo/, 0], [/lunes/, 1], [/martes/, 2], [/mi[eé]rcoles/, 3], [/jueves/, 4], [/viernes/, 5], [/s[aá]bado/, 6]];
+      const hit = es.find(([re]) => re.test(t)); if (hit) di = hit[1];
+    }
+    if (di >= 0) { let diff = (di - now.getDay() + 7) % 7; if (diff === 0) diff = 7; start.setDate(now.getDate() + diff); matchedDay = true; }
+  }
+
+  let hour = 9, min = 0, matchedTime = false;
+  const tm = t.match(/\b(?:at|a las|@)\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm|a\.m\.|p\.m\.)?/);
+  if (tm) {
+    hour = parseInt(tm[1], 10); min = tm[2] ? parseInt(tm[2], 10) : 0;
+    const ap = tm[3] || "";
+    if (/p/.test(ap) && hour < 12) hour += 12;
+    if (/a/.test(ap) && hour === 12) hour = 0;
+    matchedTime = true;
+  }
+  start.setHours(hour, min, 0, 0);
+  if (!matchedDay && !matchedTime) return null;
+  if (!matchedDay && matchedTime && start.getTime() < now.getTime()) start.setDate(now.getDate() + 1);
+
+  const end = new Date(start.getTime() + 60 * 60 * 1000);
+
+  let title = "";
+  const q = task.match(/["“'']([^"”'']{2,60})["”'']/);
+  const named = task.match(/\b(?:called|titled|named|about|llamad[oa]|titulad[oa]|sobre)\s+(.+?)(?:\s+(?:on|at|tomorrow|today|this|next|a las|el|mañana|hoy)\b|$)/i);
+  if (q) title = q[1].trim();
+  else if (named) title = named[1].trim();
+  if (!title) {
+    title = task
+      .replace(/\b(hey |ok )?keak[,]?\s*/i, "")
+      .replace(/\b(please|can you|could you|add|create|schedule|set ?up|make|put|new|book|to|my|the|a|an|event|meeting|appointment|reminder|calendar|google|remind me|crea|añade|agrega|agenda|programa|pon|un|una|evento|reunión|reunion|cita|recordatorio|calendario)\b/gi, " ")
+      .replace(/\b(tomorrow|today|mañana|hoy|monday|tuesday|wednesday|thursday|friday|saturday|sunday|lunes|martes|mi[eé]rcoles|jueves|viernes|s[aá]bado|domingo)\b/gi, " ")
+      .replace(/\b(?:at|a las|@)\s*\d{1,2}(?::\d{2})?\s*(am|pm)?\b/gi, " ")
+      .replace(/\b(on|el)\b/gi, " ")
+      .replace(/\s+/g, " ").trim();
+  }
+  if (!title || title.length < 2) title = "New event";
+  title = title.charAt(0).toUpperCase() + title.slice(1);
+  return { title, start, end };
+}
+
+function fmtCalDate(d: Date): string {
+  const p = (n: number) => String(n).padStart(2, "0");
+  // Floating local time (no Z) so Google Calendar uses the user's own timezone.
+  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}T${p(d.getHours())}${p(d.getMinutes())}00`;
+}
+
+function buildCalendarUrl(ev: { title: string; start: Date; end: Date }): string {
+  const params = new URLSearchParams({
+    action: "TEMPLATE",
+    text: ev.title,
+    dates: `${fmtCalDate(ev.start)}/${fmtCalDate(ev.end)}`,
+  });
+  return `https://calendar.google.com/calendar/render?${params.toString()}`;
+}
+
+// How far Keak is allowed to go when it takes an action, set by the user in Keak settings:
+//   full = finish the job (click Save on the event, hit Send on the reply) with no extra tap
+//   ask  = set everything up but leave the final click to the user (safe default)
+//   off  = don't run local action handlers at all — Keak only talks/dictates
+function actionMode(): "full" | "ask" | "off" {
+  const m = localStorage.getItem("keak_action_mode");
+  return m === "full" || m === "off" ? m : "ask";
+}
+
+// Turns the 0-100 personality dials into a system-prompt instruction (used by Keak AI answers).
+function personaLines(): string {
+  const g = (k: string, d: number) => parseInt(localStorage.getItem(k) || String(d), 10);
+  const band = (v: number, a: string, b: string, c: string, d: string) =>
+    v < 16 ? a : v < 41 ? b : v < 71 ? c : d;
+  const humor = band(g("keak_humor", 20),
+    "Keep your tone neutral and professional; do not joke.",
+    "A light, occasional touch of humor is welcome.",
+    "Be playful and witty where it naturally fits.",
+    "Be very funny and playful; joke around a lot while still being genuinely helpful.");
+  const warmth = band(g("keak_warmth", 50),
+    "Stay matter-of-fact.", "Be friendly.", "Be warm and encouraging.",
+    "Be very warm, caring and supportive.");
+  const formality = band(g("keak_formality", 30),
+    "Use casual, conversational language and contractions.", "Use a relaxed, natural tone.",
+    "Use a fairly polished tone.", "Use formal, professional language.");
+  const directness = band(g("keak_directness", 50),
+    "Be gentle and diplomatic.", "Be clear and straightforward.", "Be direct and to the point.",
+    "Be blunt and direct; no sugar-coating.");
+  return `${humor} ${warmth} ${formality} ${directness}`;
+}
+
+// Lets the user tune Keak AI's personality by voice ("be funnier", "less formal", "set humor to 80").
+// Writes the dial to localStorage and returns a spoken confirmation, or null if it wasn't a tune command.
+function adjustPersonaFromSpeech(task: string): string | null {
+  const t = task.toLowerCase();
+  // Trigger verbs (EN + ES). "change" and "put" were missing before, so "change the humor to 70" fell through
+  // to a normal answer — Keak said "done" without moving the dial.
+  if (!/\b(be|make|act|sound|more|less|turn|increase|decrease|raise|lower|bump|set|change|put|adjust|tone|dial|funnier|warmer|gentler|softer|serious|casual|colder|cambia|cambiar|pon|poner|sube|subir|baja|bajar|ajusta|más|mas|menos)\b/.test(t)) return null;
+  const dials: { re: RegExp; key: string; label: string; downRe: RegExp }[] = [
+    { re: /\b(humou?r|funny|funnier|joke|jokes|playful|gracioso|divertido)\b/, key: "keak_humor", label: "humor", downRe: /\b(serious|serio)\b/ },
+    { re: /\b(warm|warmer|warmth|friendly|friendlier|caring|kind|nicer|c[áa]lido|amable)\b/, key: "keak_warmth", label: "warmth", downRe: /\b(cold|colder|fr[íi]o)\b/ },
+    { re: /\b(formal|formality|professional|casual|formalidad)\b/, key: "keak_formality", label: "formality", downRe: /\b(casual|informal)\b/ },
+    { re: /\b(direct|directness|blunt|honest|straightforward|gentle|gentler|softer|diplomatic|directo)\b/, key: "keak_directness", label: "directness", downRe: /\b(gentle|gentler|softer|diplomatic|suave)\b/ },
+  ];
+  const hit = dials.find((d) => d.re.test(t));
+  if (!hit) return null;
+  // Drop "not/instead of <num>" first, so "to 70 not 100" keeps 70 (not the last number seen).
+  const cleaned = t.replace(/\b(?:not|no|instead of|rather than|but not|en vez de)\s+\d{1,3}\b/g, " ");
+  // Prefer a number introduced by to/at/on/=/of; else the first bare number.
+  const absM = cleaned.match(/\b(?:to|at|on|=|:|of|a|al)\s*(\d{1,3})\b/) || cleaned.match(/\b(\d{1,3})\b/);
+  let dir = 1;
+  const abs: number | null = absM ? parseInt(absM[1], 10) : null;
+  if (abs == null) {
+    const down = /\b(less|tone down|lower|decrease|turn down|menos|baja|bajar)\b/.test(t);
+    dir = down ? -1 : 1;
+    if (hit.downRe.test(t)) dir = -1;
+  }
+  const cur = parseInt(localStorage.getItem(hit.key) || "50", 10);
+  const next = Math.max(0, Math.min(100, abs != null ? abs : cur + dir * 25));
+  localStorage.setItem(hit.key, String(next));
+  return `Done, ${hit.label} is now ${next} out of 100.`;
+}
+
+// Lets the user switch the connected AI's model/provider (or the Claude effort) by voice:
+// "change the model to Sonnet", "switch to ChatGPT", "use Haiku", "set effort to high". Writes the same
+// localStorage keys the Connect window uses, so the picker and the voice command stay in sync. Returns a
+// spoken confirmation, or null if it wasn't a switch command.
+function parseModelSwitch(task: string): string | null {
+  const t = task.toLowerCase().trim();
+
+  // Never hijack a genuine question ABOUT models ("which is better, opus or sonnet?", "what model are you").
+  if (/^(?:what|which|who|why|how|whats|what's|is |are |does |do |tell me|explain|compare|difference)\b/.test(t)) return null;
+
+  // Intent: an explicit switch/change verb (EN + ES), or the word model/effort itself.
+  const hasIntent =
+    /\b(switch|change|swap|set|use|using|select|pick|put|go with|activate|turn on|make it)\b/.test(t) ||
+    /\b(cambia|cambiar|cámbia|usa|usar|pon|ponlo|poner|activa|selecciona|quiero|dame|ponme|pasa a)\b/.test(t) ||
+    /\b(model|models|modelo|effort|esfuerzo)\b/.test(t);
+  if (!hasIntent) return null;
+
+  console.log("[KEAK] model-switch intent:", JSON.stringify(t));
+
+  // Effort (Claude): "set effort to high", "maximum effort", "esfuerzo alto".
+  const effM = t.match(/\b(?:effort|esfuerzo)\b[^a-z]*(low|medium|high|max|maximum|bajo|medio|alto|máximo|maximo)\b|\b(low|medium|high|max|maximum|bajo|medio|alto|máximo|maximo)\b[^a-z]*(?:effort|esfuerzo)\b/);
+  if (effM) {
+    const raw = (effM[1] || effM[2] || "");
+    const map: Record<string, string> = { maximum: "max", bajo: "low", medio: "medium", alto: "high", "máximo": "max", maximo: "max" };
+    const word = map[raw] || raw;
+    localStorage.setItem("keak_cu_claude_effort", word);
+    return `Done, effort is set to ${word}.`;
+  }
+
+  // A named model — switch provider AND set that provider's model in one go.
+  const models: { rx: RegExp; provider: string; model: string; say: string }[] = [
+    { rx: /\bopus\b/, provider: "claude", model: "claude-opus-4-8", say: "Claude Opus" },
+    { rx: /\bsonnet\b|\bsonet\b/, provider: "claude", model: "claude-sonnet-5", say: "Claude Sonnet 5" },
+    { rx: /\bhaiku\b|\bhaikú\b/, provider: "claude", model: "claude-haiku-4-5", say: "Claude Haiku" },
+    { rx: /\bfable\b|\bfábula\b/, provider: "claude", model: "claude-fable-5", say: "Claude Fable" },
+    { rx: /\bgpt[\s-]?5(?:\.\d)?\b|\bgpt five\b|\bchat ?gpt 5\b/, provider: "openai", model: "gpt-5.6", say: "GPT 5.6" },
+    { rx: /\bgpt[\s-]?4o?\b|\bgpt four\b|\b4o\b/, provider: "openai", model: "gpt-4o", say: "GPT 4o" },
+    { rx: /\bgemini\s?flash\b|\b3\.5\s?flash\b|\bflash\s?lite\b|\bflash\b|\blite\b|\b2\.5\s?flash\b|\bgemini\s?pro\b|\b2\.5\s?pro\b/, provider: "gemini", model: "gemini-3.5-flash", say: "Gemini Flash" },
+  ];
+  for (const m of models) {
+    if (m.rx.test(t)) {
+      localStorage.setItem("keak_cu_provider", m.provider);
+      localStorage.setItem(`keak_cu_${m.provider}_model`, m.model);
+      console.log("[KEAK] switched model ->", m.model);
+      return `Done, I switched to ${m.say}.`;
+    }
+  }
+
+  // Just a provider named, no specific model — switch the provider only.
+  const providers: { rx: RegExp; provider: string; say: string }[] = [
+    { rx: /\b(claude|anthropic)\b/, provider: "claude", say: "Claude" },
+    { rx: /\b(chat\s?gpt|open\s?ai|gpt)\b/, provider: "openai", say: "ChatGPT" },
+    { rx: /\b(gemini|google)\b/, provider: "gemini", say: "Gemini" },
+    { rx: /\b(local|ollama|offline|on[\s-]?device|my own (?:model|ai)|mi propio|local model)\b/, provider: "ollama", say: "your local model" },
+  ];
+  for (const p of providers) {
+    if (p.rx.test(t)) {
+      localStorage.setItem("keak_cu_provider", p.provider);
+      console.log("[KEAK] switched provider ->", p.provider);
+      return `Done, I switched to ${p.say}.`;
+    }
+  }
+
+  // They clearly want to change the model but didn't name one — offer the menu instead of letting the
+  // model answer "I can't do that".
+  if (/\b(model|models|modelo|effort|esfuerzo)\b/.test(t)) {
+    return "Sure. Which one? You can say Opus, Sonnet, Haiku, Fable, ChatGPT, Gemini, or your local model.";
+  }
+  return null;
+}
+
+// Decides whether a command should drive the real screen agent (TARS) instead of the old navigate-only
+// assistant. Since screen control is opt-in (a provider is connected + not "off"), we can be generous:
+// anything that needs real clicking/typing goes to the agent. Pure questions stay as normal answers.
+function parseComputerTask(task: string): string | null {
+  const stripped = task.trim().replace(/^\s*(?:hey |ok )?keak[, ]*/i, "");
+  const low = stripped.toLowerCase();
+  if (stripped.length < 3) return null;
+
+  // Strong explicit triggers — always take over.
+  const strong = stripped.match(/^(?:\/do|take over|take control|control my screen|use my (?:computer|screen)|do this for me|do it for me)\b[:,]?\s*(?:and\s+)?(.*)/i);
+  if (strong) return (strong[1] && strong[1].trim().length >= 3) ? strong[1].trim() : stripped;
+
+  // Plain questions are never screen tasks.
+  if (/^(?:what|why|how|when|who|which|where|is |are |am |do |does |did |can you (?:tell|explain|say)|tell me|explain|summar|translate)\b/i.test(low)) return null;
+
+  // On-screen manipulation the old navigate-only path can't do (the real differentiator = clicking).
+  if (/\b(click|double[- ]?click|select|choose|tap|press|play|scroll|drag|hover|check the box|tick|untick|toggle|fill (?:in|out)|add to cart|reply|compose|download|install|sign in|log in)\b/i.test(low)) {
+    return stripped;
+  }
+  // Compound "open/go to X and <do Y>" — more than just navigating somewhere.
+  if (/\b(?:open|go to|navigate to|launch|find|search)\b.+\b(?:and|then)\b/i.test(low)) return stripped;
+  return null;
+}
+
+// ---- Agents (Phase 7) ------------------------------------------------------------------------------
+// A big multi-part job ("research X and build Y and write Z") gets split across named "star" sub-agents,
+// each running on the user's OWN connected AI (so it costs nothing). They animate as drifting orbs in the
+// fullscreen click-through "agents" window; results roll back up into a spoken summary + a "See it" panel.
+type OwnAI = { provider: string; credential: string; accountId: string; isSub: boolean; model: string; effort: string };
+
+// Detect an agent-worthy job. Explicit ("use your team to…", "/agents …", ES "usa tus agentes…") or a
+// clear multi-step build/research command (2+ deliverables joined by and/then). Returns the job or null.
+function parseAgentJob(task: string): string | null {
+  const raw = task.trim();
+  const t = raw.toLowerCase();
+
+  // Explicit delegation wins: "/agents …", "use your team to …", "with the team …", ES "usa tus agentes …".
+  // The whole utterance is passed to the planner — it handles the "use your team to" preamble fine.
+  const slash = /^\s*\/agents?\b/i.test(raw);
+  const explicitDelegate = /\b(?:use|using|with|spin up|bring in|deploy|unleash|get|usa|utiliza|con|despliega)\b[\s\S]{0,20}\b(?:agents?|team|squad|equipo|agentes)\b/i.test(raw);
+  if (slash || explicitDelegate) {
+    const rest = raw.replace(/^\s*\/agents?\b[:,]?\s*/i, "").trim();
+    return rest.length >= 3 ? rest : raw;
+  }
+
+  // Not a pure question.
+  if (/^(?:what|why|how|when|who|which|where|is |are |can you (?:tell|explain))\b/.test(t)) return null;
+  const teamWord = /\b(agents?|team|squad|equipo|agentes)\b/.test(t);
+  const verbs = t.match(/\b(build|create|make|research|write|draft|design|plan|analys?e|analyze|summari[sz]e|compare|generate|investigate|outline|construye|crea|investiga|escribe|dise[nñ]a|planifica)\b/g) || [];
+  const joined = /\b(and|then|also|plus|y|luego|además)\b/.test(t) || raw.includes(",");
+  if (teamWord && verbs.length >= 1) return raw;                    // "team" + a task
+  if (verbs.length >= 2 && joined && raw.length > 24) return raw;   // multi-part build/research job
+  return null;
+}
+
+// "show me the agents", "make all the agents appear on screen", ES "muestra los agentes" — DISPLAY every
+// agent as an orb without giving them work. Distinct from a delegation job (which has a build/research verb).
+function parseShowAgents(task: string): boolean {
+  const t = task.trim().toLowerCase();
+  if (!/\b(agents?|team|equipo|agentes)\b/.test(t)) return false;
+  const wantsShow = /\bappear\b|\bon (?:the )?screen\b|\ball (?:the |of the )?agents\b|\bevery agent\b|\bwhole team\b|en la pantalla|todos los agentes|\b(show|see|display|reveal|bring up|pull up|muestra|mu[eé]strame|ens[eé]ñame|ver)\b/.test(t);
+  const isDelegation = /\buse your team\b|\busa tus agentes\b|\bhave (?:the )?(?:team|agents)\s+\w/.test(t);
+  const jobVerb = /\b(research|draft|analy|summari|compare|investigate|build (?:me|a|an)|create (?:me|a|an)|write (?:me|a|an)|investiga|escribe)\b/.test(t);
+  return wantsShow && !isDelegation && !jobVerb;
+}
+
+// Catch-all: is this an imperative that needs the real screen/computer or a tool (not a question)? Used as a
+// last resort before answering, so Keak DOES the thing (open YouTube, create a folder, book a slot) via screen
+// control instead of replying "I can't". Screen actions are still gated by Ask/Full/Off, so Ask asks first.
+function looksLikeAction(task: string): boolean {
+  const t = task.trim().toLowerCase().replace(/^(?:hey |ok )?keak[, ]*/i, "");
+  if (t.length < 4) return false;
+  if (/^(?:what|why|how|when|who|which|where|is |are |am |do |does |did |can you (?:tell|explain|say|list)|could you (?:tell|explain)|tell me|explain|summar|translate|define|who's|what's|whats|whos|give me a)\b/.test(t)) return false;
+  const webVerb = /\b(open|go to|navigate to|launch|play|download|upload|install|uninstall|sign in|log ?in|log ?out|book|reserve|schedule|order|buy|checkout|add to cart|send (?:an? )?(?:email|message|dm|text)|post|publish|look up)\b/.test(t);
+  const appNoun = /\b(youtube|gmail|calendar|spotify|chrome|browser|desktop|folder|file|pdf|document|spreadsheet|slides?|website|web ?site|app|project|account|playlist|tab|window)\b/.test(t);
+  const makeArtifact = /\b(create|make|build|generate|set up|start|draft|design|write|save)\b/.test(t) && appNoun;
+  return webVerb || makeArtifact;
+}
+
+// "read my inbox", "any new emails", ES "lee mis correos" → read Gmail aloud.
+function parseGmailRead(task: string): boolean {
+  const t = task.trim().toLowerCase();
+  const mail = /\b(email|emails|e-?mail|mail|inbox|correos?|bandeja)\b/.test(t);
+  const read = /\b(read|check|show|any|new|what|do i have|leer?|lee|revisa|mira|tengo|hay|nuevos?)\b/.test(t);
+  return mail && read;
+}
+// "send an email to a@b.com saying …", ES "envía un correo a a@b.com diciendo …" → send Gmail.
+function parseGmailSend(task: string): { to: string; subject: string; body: string } | null {
+  const t = task.trim();
+  if (!(/\bsend\b[\s\S]*\b(email|e-?mail|mail)\b/i.test(t) || /\benv[ií]a\b[\s\S]*\b(correo|email|mail)\b/i.test(t))) return null;
+  const email = (t.match(/[\w.+-]+@[\w-]+\.[\w.-]+/) || [])[0];
+  if (!email) return null; // need an address (name→email needs contacts, not built yet)
+  let body = "";
+  const bm = t.match(/\b(?:saying|that says|telling (?:him|her|them)|diciendo(?:le)?|que diga)\s+([\s\S]+)$/i);
+  if (bm) body = bm[1].trim();
+  let subject = "";
+  const sm = t.match(/\b(?:about|subject|regarding|asunto|sobre)\s+([^,.]+?)(?:\s+(?:saying|that says|diciendo|que diga)\b|[,.]|$)/i);
+  if (sm) subject = sm[1].trim();
+  if (!subject) subject = body ? body.split(/[.!?\n]/)[0].slice(0, 60) : "Message from Keak";
+  return { to: email, subject, body };
+}
+// "save this to my Drive", ES "guarda esto en Drive" → save the last thing made to Google Drive.
+function parseSaveToDrive(task: string): boolean {
+  const t = task.trim().toLowerCase();
+  return /\b(drive|google drive)\b/.test(t) && /\b(save|upload|put|store|guarda|sube|guardar)\b/.test(t);
+}
+// Broad "this is about a calendar event" intent (looser than parseCalendarEvent's strict date/time regex),
+// so when Google is connected we always create it via the API instead of falling through to screen control.
+function isCalendarIntent(task: string): boolean {
+  const t = task.trim().toLowerCase();
+  if (/^(?:what|when|which|is |are |do |does |how|why|tell me|show me my|list)\b/.test(t)) return false;
+  return /\b(calendar|event|meeting|appointment|schedule|book|remind me|reminder|calendario|evento|reuni[oó]n|cita|agenda|ag[eé]ndame|recu[eé]rdame|recordatorio)\b/.test(t);
+}
+
+// ---- Google (Calendar/Gmail/Drive) --------------------------------------------------------------------
+// A valid Google access token, refreshing it via the stored refresh token + client creds when it's expired.
+async function ensureGoogleToken(): Promise<string | null> {
+  const token = localStorage.getItem("keak_google_token") || "";
+  const refresh = localStorage.getItem("keak_google_refresh") || "";
+  const expiry = parseInt(localStorage.getItem("keak_google_expiry") || "0", 10);
+  if (!refresh) return token || null;
+  if (token && Date.now() < expiry - 60000) return token; // still valid (60s safety margin)
+  const clientId = localStorage.getItem("keak_google_client_id") || "";
+  const clientSecret = localStorage.getItem("keak_google_client_secret") || "";
+  if (!clientId || !clientSecret) return token || null;
+  try {
+    const raw = await invoke<string>("google_refresh", { args: { clientId, clientSecret, refreshToken: refresh } });
+    const t = JSON.parse(raw);
+    if (t.access_token) {
+      localStorage.setItem("keak_google_token", t.access_token);
+      localStorage.setItem("keak_google_expiry", String(Date.now() + (t.expires_in || 3600) * 1000));
+      return t.access_token;
+    }
+  } catch (e) { console.log("[KEAK] google refresh failed:", String(e)); }
+  return token || null;
+}
+// RFC3339 wall-clock time (no zone suffix) — paired with the user's IANA timezone so Google reads it right.
+function toLocalRfc3339(d: Date): string {
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}:00`;
+}
+// Create the event on the user's real Google Calendar. Returns the event link, or null if not connected/failed.
+async function createGoogleEvent(ev: { title: string; start: Date; end: Date }): Promise<string | null> {
+  const token = await ensureGoogleToken();
+  if (!token) return null;
+  const timezone = (() => { try { return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC"; } catch { return "UTC"; } })();
+  try {
+    const raw = await invoke<string>("google_calendar_create", { args: {
+      accessToken: token, summary: ev.title, description: "Created by Keak",
+      start: toLocalRfc3339(ev.start), end: toLocalRfc3339(ev.end), timezone,
+    } });
+    const r = JSON.parse(raw);
+    return r.htmlLink || "ok";
+  } catch (e) { console.log("[KEAK] gcal create failed:", String(e)); return null; }
+}
+
+// ---- Microsoft (Outlook Calendar / Mail / OneDrive) ---------------------------------------------------
+function msConnected(): boolean { return !!localStorage.getItem("keak_ms_refresh"); }
+// A valid Microsoft Graph access token, refreshed via the stored refresh token when expired.
+async function ensureMsToken(): Promise<string | null> {
+  const token = localStorage.getItem("keak_ms_token") || "";
+  const refresh = localStorage.getItem("keak_ms_refresh") || "";
+  const expiry = parseInt(localStorage.getItem("keak_ms_expiry") || "0", 10);
+  if (!refresh) return token || null;
+  if (token && Date.now() < expiry - 60000) return token;
+  const clientId = localStorage.getItem("keak_ms_client_id") || "";
+  const clientSecret = localStorage.getItem("keak_ms_client_secret") || "";
+  if (!clientId) return token || null;
+  try {
+    const raw = await invoke<string>("ms_refresh", { args: { clientId, clientSecret, refreshToken: refresh } });
+    const t = JSON.parse(raw);
+    if (t.access_token) {
+      localStorage.setItem("keak_ms_token", t.access_token);
+      if (t.refresh_token) localStorage.setItem("keak_ms_refresh", t.refresh_token);
+      localStorage.setItem("keak_ms_expiry", String(Date.now() + (t.expires_in || 3600) * 1000));
+      return t.access_token;
+    }
+  } catch (e) { console.log("[KEAK] ms refresh failed:", String(e)); }
+  return token || null;
+}
+// Create the event on the user's Outlook calendar. Returns the event link, or null if not connected/failed.
+async function createMsEvent(ev: { title: string; start: Date; end: Date }): Promise<string | null> {
+  const token = await ensureMsToken();
+  if (!token) return null;
+  const timezone = (() => { try { return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC"; } catch { return "UTC"; } })();
+  try {
+    const raw = await invoke<string>("ms_calendar_create", { args: {
+      accessToken: token, summary: ev.title, description: "Created by Keak",
+      start: toLocalRfc3339(ev.start), end: toLocalRfc3339(ev.end), timezone,
+    } });
+    const r = JSON.parse(raw);
+    return r.webLink || "ok";
+  } catch (e) { console.log("[KEAK] outlook create failed:", String(e)); return null; }
+}
+// Create a calendar event on whichever provider is connected — Google first, then Microsoft.
+async function createEventAnyProvider(ev: { title: string; start: Date; end: Date }): Promise<string | null> {
+  if (localStorage.getItem("keak_google_refresh")) { const l = await createGoogleEvent(ev); if (l) return l; }
+  if (msConnected()) { const l = await createMsEvent(ev); if (l) return l; }
+  return null;
+}
+
+// ---- Plug-in tools (Perplexity, Slack, …) -------------------------------------------------------------
+function toolKey(id: string): string { return localStorage.getItem(`keak_tool_${id}`) || ""; }
+// Live web research with citations via the user's own Perplexity key. Returns the answer text, or null.
+async function askPerplexity(query: string): Promise<string | null> {
+  const key = toolKey("perplexity");
+  if (!key) return null;
+  try { return await invoke<string>("perplexity_ask", { args: { apiKey: key, query, model: "" } }); }
+  catch (e) { console.log("[KEAK] perplexity failed:", String(e)); return null; }
+}
+// Post a message to Slack with the user's connected token. Returns true on success.
+async function postToSlack(channel: string, text: string): Promise<boolean> {
+  const token = localStorage.getItem("keak_slack_token") || "";
+  if (!token) return false;
+  try { await invoke("slack_post", { args: { token, channel, text } }); return true; }
+  catch (e) { console.log("[KEAK] slack post failed:", String(e)); return false; }
+}
+// ElevenLabs voiceover → returns the saved mp3 path, or null.
+async function makeVoiceover(text: string): Promise<string | null> {
+  const key = toolKey("elevenlabs"); if (!key) return null;
+  const voiceId = localStorage.getItem("keak_tool_elevenlabs_voice") || "";
+  try { return await invoke<string>("elevenlabs_tts", { args: { apiKey: key, text, voiceId } }); }
+  catch (e) { console.log("[KEAK] elevenlabs failed:", String(e)); return String(e); }
+}
+// Gamma deck → returns the gamma URL, or an error string.
+async function makeDeck(prompt: string): Promise<string | null> {
+  const key = toolKey("gamma"); if (!key) return null;
+  try { return await invoke<string>("gamma_generate", { args: { apiKey: key, prompt } }); }
+  catch (e) { console.log("[KEAK] gamma failed:", String(e)); return String(e); }
+}
+// HeyGen avatar video → returns the video URL, or an error string.
+async function makeVideo(script: string): Promise<string | null> {
+  const key = toolKey("heygen"); if (!key) return null;
+  const avatarId = localStorage.getItem("keak_tool_heygen_avatar") || "";
+  const voiceId = localStorage.getItem("keak_tool_heygen_voice") || "";
+  try { return await invoke<string>("heygen_video", { args: { apiKey: key, script, avatarId, voiceId } }); }
+  catch (e) { console.log("[KEAK] heygen failed:", String(e)); return String(e); }
+}
+// Fire an n8n / Zapier webhook. Returns true on success. Prefers n8n, then Zapier. (Both are Catch-Hook URLs.)
+async function fireAutomation(text: string): Promise<boolean> {
+  const url = toolKey("n8n") || toolKey("zapier");
+  if (!url) return false;
+  try { await invoke("webhook_post", { args: { url, text } }); return true; }
+  catch (e) { console.log("[KEAK] webhook failed:", String(e)); return false; }
+}
+function looksLikePath(s: string | null): boolean { return !!s && /^[a-zA-Z]:\\|^\/|\.mp3$/.test(s); }
+function looksLikeUrl(s: string | null): boolean { return !!s && /^https?:\/\//.test(s); }
+// Manus: hand off a whole task to the autonomous agent. Returns the task URL, or an error string.
+async function runManus(prompt: string): Promise<string | null> {
+  const key = toolKey("manus"); if (!key) return null;
+  try { return await invoke<string>("manus_task", { args: { apiKey: key, prompt } }); }
+  catch (e) { console.log("[KEAK] manus failed:", String(e)); return String(e); }
+}
+// Higgsfield: cinematic image/video from a prompt. Returns the asset URL, or an error string.
+async function runHiggsfield(prompt: string): Promise<string | null> {
+  const key = toolKey("higgsfield"); if (!key) return null;
+  try { return await invoke<string>("higgsfield_generate", { args: { apiKey: key, prompt } }); }
+  catch (e) { console.log("[KEAK] higgsfield failed:", String(e)); return String(e); }
+}
+// Resend: send an email with the user's Resend key. Returns true on success.
+async function sendViaResend(to: string, subject: string, body: string): Promise<boolean> {
+  const key = toolKey("resend"); if (!key) return false;
+  const from = localStorage.getItem("keak_tool_resend_from") || "";
+  try { await invoke("resend_send", { args: { apiKey: key, from, to, subject, body } }); return true; }
+  catch (e) { console.log("[KEAK] resend failed:", String(e)); return false; }
+}
+
+// One-time migration: drop retired model IDs saved in localStorage so a stale pick doesn't keep 404-ing
+// (e.g. gemini-2.5-pro / gemini-2.0-flash, which the UI can't show but the value was still being sent).
+const DEAD_GEMINI = /gemini-2\.5-flash\b|gemini-2\.0-flash\b|gemini-2\.5-pro\b|gemini-1\.5|^gemini-pro$/i;
+try {
+  const gm = localStorage.getItem("keak_cu_gemini_model") || "";
+  if (DEAD_GEMINI.test(gm)) localStorage.removeItem("keak_cu_gemini_model");
+} catch { /* ignore */ }
+// Map any retired model ID to "" (provider default) at read time, as a backstop for the migration above.
+function cleanModel(provider: string, model: string): string {
+  if (provider === "gemini" && DEAD_GEMINI.test(model)) return "";
+  return model;
+}
+
+// Resolve the user's connected AI into a credential bundle (shared by Keak AI answers + agents).
+function resolveOwnAI(): OwnAI | null {
+  const provider = localStorage.getItem("keak_cu_provider") || "";
+  if (!provider) return null;
+  let credential = "", accountId = "", isSub = false;
+  if (provider === "openai") {
+    const sub = localStorage.getItem("keak_cu_openai_token") || "";
+    if (sub) { credential = sub; accountId = localStorage.getItem("keak_cu_openai_account") || ""; isSub = true; }
+    else credential = localStorage.getItem("keak_cu_openai_key") || "";
+  } else if (provider === "gemini") credential = localStorage.getItem("keak_cu_gemini_key") || "";
+  else if (provider === "claude") credential = localStorage.getItem("keak_cu_claude_token") || "";
+  else if (provider === "ollama") credential = "local";
+  else if (provider === "copilot") credential = localStorage.getItem("keak_cu_copilot_token") || "";
+  else credential = localStorage.getItem(`keak_cu_${provider}_key`) || ""; // deepseek, mistral, xai
+  if (!credential) return null;
+  const model = cleanModel(provider, localStorage.getItem(`keak_cu_${provider}_model`) || "");
+  const effort = provider === "claude" ? (localStorage.getItem("keak_cu_claude_effort") || "") : "";
+  return { provider, credential, accountId, isSub, model, effort };
+}
+
+// Resolve a SPECIFIC provider + model into a credential bundle (for per-agent model choices, possibly a
+// different company than the main Keak AI). Returns null if that provider isn't connected.
+function resolveProviderAI(provider: string, model: string): OwnAI | null {
+  let credential = "", accountId = "", isSub = false, m = cleanModel(provider, model);
+  if (provider === "openai") {
+    const sub = localStorage.getItem("keak_cu_openai_token") || "";
+    if (sub) { credential = sub; accountId = localStorage.getItem("keak_cu_openai_account") || ""; isSub = true; }
+    else credential = localStorage.getItem("keak_cu_openai_key") || "";
+  } else if (provider === "gemini") credential = localStorage.getItem("keak_cu_gemini_key") || "";
+  else if (provider === "claude") credential = localStorage.getItem("keak_cu_claude_token") || "";
+  else if (provider === "ollama") { credential = "local"; if (!m) m = localStorage.getItem("keak_cu_ollama_model") || ""; }
+  else if (provider === "copilot") credential = localStorage.getItem("keak_cu_copilot_token") || "";
+  else credential = localStorage.getItem(`keak_cu_${provider}_key`) || ""; // deepseek, mistral, xai
+  if (!credential) return null;
+  const effort = provider === "claude" ? (localStorage.getItem("keak_cu_claude_effort") || "") : "";
+  return { provider, credential, accountId, isSub, model: m || "", effort };
+}
+
+// A model "choice" is stored as "provider|model" (e.g. "claude|claude-haiku-4-5"), or "" to mean "use the
+// fallback" (the main Keak AI). Falls back if the chosen provider isn't connected.
+function resolveChoice(choice: string, fallback: OwnAI): OwnAI {
+  if (!choice) return fallback;
+  const [provider, model] = choice.split("|");
+  return resolveProviderAI(provider, model || "") || fallback;
+}
+
+// One-shot call to the user's own model via the Rust cu_chat brain. Returns raw text (throws on error).
+async function askOwnAIRaw(ai: OwnAI, system: string, message: string): Promise<string> {
+  return await invoke<string>("cu_chat", { args: {
+    provider: ai.provider, credential: ai.credential, accountId: ai.accountId, isSubscription: ai.isSub,
+    model: ai.model, effort: ai.effort, system, history: [], message,
+  } });
+}
+
+// ---- "Change any setting by voice" ---------------------------------------------------------------
+// Keak AI can adjust the personality dials, the model/effort, the voice source, and create or edit agents
+// just by being asked. The fast regex parsers (adjustPersonaFromSpeech / parseModelSwitch) handle the common
+// dial + model cases instantly; this AI-backed handler catches everything else and any phrasing they miss.
+// Ctrl+Win dictation gate: paid plans (Pro/Team = unlimited) dictate freely; Free/lapsed plans get the free
+// minute taste, then dictation locks. The transcribe backend is the hard backstop (402); this just blocks up
+// front so we don't record a clip that will be rejected. Uses usage stored at sign-in (App.tsx fetchProfile).
+function dictationBlocked(): boolean {
+  const limit = parseInt(localStorage.getItem("keak_dictation_limit") || "-1", 10);
+  if (isNaN(limit) || limit < 0) return false; // unlimited (Pro/Team) or unknown -> allow
+  const used = parseInt(localStorage.getItem("keak_dictation_used") || "0", 10) || 0;
+  const extra = parseInt(localStorage.getItem("keak_dictation_extra") || "0", 10) || 0;
+  return used >= limit + extra;
+}
+function looksLikeSettingsCommand(t: string): boolean {
+  const s = t.toLowerCase();
+  const domain = /\b(humou?r|warmth|formal|formality|direct(?:ness)?|tone|personality|voice|sound|agent|agents|team|model|effort)\b/.test(s);
+  const verb = /\b(set|change|make|adjust|switch|swap|turn|raise|lower|increase|decrease|create|new|add|edit|rename|update|use|put|be|more|less|cambia|cambiar|crea|crear|nuevo|nueva|edita|editar|pon|poner|sube|subir|baja|bajar|ajusta|a[ñn]ade|agrega)\b/.test(s);
+  return domain && verb;
+}
+// "Message me on Telegram" — the user wants Keak to actually SEND them a one-off message now (not schedule a
+// routine). Requires a messaging channel word + a send verb.
+function looksLikeSendMessage(t: string): boolean {
+  const s = t.toLowerCase();
+  const channel = /\btelegram\b/.test(s);
+  const verb = /\b(send|message|text|write|shoot|ping|deliver|drop)\b/.test(s);
+  return channel && verb;
+}
+// Pull the first {...} JSON object out of a model reply (tolerates code fences / stray prose).
+function extractJsonObject(raw: string): Record<string, unknown> | null {
+  if (!raw) return null;
+  const s = raw.indexOf("{"); const e = raw.lastIndexOf("}");
+  if (s < 0 || e <= s) return null;
+  try { return JSON.parse(raw.slice(s, e + 1)); } catch { return null; }
+}
+const SETTINGS_SYSTEM = `You turn a spoken command into ONE settings action as strict minified JSON and nothing else.
+Actions:
+{"action":"dial","dial":"humor|warmth|formality|directness","value":<0-100 integer>}
+{"action":"model","provider":"claude|openai|gemini|copilot|xai|deepseek|mistral|ollama","model":"<model id or empty>"}
+{"action":"effort","value":"low|medium|high|max"}
+{"action":"voice","source":"auto|gemini|openai|elevenlabs|system|keak"}
+{"action":"createAgent","name":"<short name>","description":"<what it is good at>","personality":"<tone, optional>","color":"<#RRGGBB optional>","model":"<provider|model optional>"}
+{"action":"editAgent","name":"<existing agent name>","description":"<optional>","personality":"<optional>","color":"<#RRGGBB optional>","model":"<provider|model optional>"}
+{"action":"none"}
+Model ids: claude -> claude-opus-4-8 | claude-sonnet-5 | claude-haiku-4-5 | claude-fable-5; openai -> gpt-5 | gpt-4o; gemini -> gemini-3.5-flash; xai -> grok-4 | grok-3; deepseek -> deepseek-chat | deepseek-reasoner; mistral -> mistral-large-latest. For "model" action, set provider only (empty model) unless the user named a specific model. For agents, "model" is "provider|modelid" (e.g. "claude|claude-haiku-4-5") or empty for the default. If it is not a settings/config command, return {"action":"none"}. Return ONLY the JSON object.`;
+async function parseAndApplySettings(question: string): Promise<string | null> {
+  if (!looksLikeSettingsCommand(question)) return null;
+  const ai = resolveOwnAI();
+  if (!ai) return null;
+  const agents = allAgents().map((a) => a.name).join(", ");
+  let raw = "";
+  try { raw = await askOwnAIRaw(ai, `${SETTINGS_SYSTEM}\nExisting agents: ${agents}.`, question); }
+  catch { return null; }
+  const action = extractJsonObject(raw) as Record<string, string> | null;
+  if (!action || !action.action || action.action === "none") return null;
+  return applySettingsAction(action);
+}
+function applySettingsAction(a: Record<string, string>): string | null {
+  const clamp = (n: number) => Math.max(0, Math.min(100, Math.round(n)));
+  const isHex = (c: string) => /^#[0-9a-f]{6}$/i.test(c || "");
+  switch (a.action) {
+    case "dial": {
+      const map: Record<string, [string, string]> = { humor: ["keak_humor", "humor"], warmth: ["keak_warmth", "warmth"], formality: ["keak_formality", "formality"], directness: ["keak_directness", "directness"] };
+      const hit = map[String(a.dial)]; if (!hit) return null;
+      const v = clamp(Number(a.value)); localStorage.setItem(hit[0], String(v));
+      return `Done, ${hit[1]} is now ${v} out of 100.`;
+    }
+    case "model": {
+      const providers = ["claude", "openai", "gemini", "copilot", "xai", "deepseek", "mistral", "ollama"];
+      const p = String(a.provider || "").toLowerCase(); if (!providers.includes(p)) return null;
+      localStorage.setItem("keak_cu_provider", p);
+      if (a.model) localStorage.setItem(`keak_cu_${p}_model`, String(a.model));
+      const nice: Record<string, string> = { claude: "Claude", openai: "ChatGPT", gemini: "Gemini", copilot: "Copilot", xai: "Grok", deepseek: "DeepSeek", mistral: "Mistral", ollama: "your local model" };
+      return `Done, Keak now runs on ${nice[p]}${a.model ? `, ${a.model}` : ""}.`;
+    }
+    case "effort": {
+      const v = String(a.value || "").toLowerCase(); if (!["low", "medium", "high", "max"].includes(v)) return null;
+      localStorage.setItem("keak_cu_claude_effort", v);
+      return `Done, effort is set to ${v}.`;
+    }
+    case "voice": {
+      const s = String(a.source || "").toLowerCase(); if (!["auto", "gemini", "openai", "elevenlabs", "system", "keak"].includes(s)) return null;
+      localStorage.setItem("keak_voice_engine", s);
+      const nice: Record<string, string> = { auto: "automatic", gemini: "your Gemini voice", openai: "your OpenAI voice", elevenlabs: "your ElevenLabs voice", system: "a Windows voice", keak: "Keak's own voice" };
+      return `Done, the voice is now ${nice[s]}.`;
+    }
+    case "createAgent": {
+      const name = String(a.name || "").trim(); if (!name) return null;
+      const roster = readAgentRoster();
+      const palette = ["#D4A49A", "#C9A24A", "#8FA47D", "#B08A72", "#9A7060", "#C68B7E", "#D8B86A", "#6E8FA0"];
+      const color = isHex(String(a.color)) ? String(a.color) : palette[roster.length % palette.length];
+      roster.push({ name, description: String(a.description || ""), color, personality: String(a.personality || ""), choice: String(a.model || ""), tools: [] });
+      localStorage.setItem("keak_agents_roster", JSON.stringify(roster));
+      return `Done, I created a new agent called ${name}.`;
+    }
+    case "editAgent": {
+      const name = String(a.name || "").trim().toLowerCase(); if (!name) return null;
+      const patch: Partial<RosterAgent> = {};
+      if (a.description) patch.description = String(a.description);
+      if (a.personality) patch.personality = String(a.personality);
+      if (isHex(String(a.color))) patch.color = String(a.color);
+      if (a.model !== undefined) patch.choice = String(a.model || "");
+      const roster = readAgentRoster();
+      const idx = roster.findIndex((r) => r.name.toLowerCase() === name);
+      if (idx >= 0) { roster[idx] = { ...roster[idx], ...patch }; localStorage.setItem("keak_agents_roster", JSON.stringify(roster)); return `Done, I updated ${roster[idx].name}.`; }
+      const eff = effectiveDefaults().find((e) => e.name.toLowerCase() === name || e.base.toLowerCase() === name);
+      if (eff) { saveDefaultOverride(eff.base, patch); return `Done, I updated ${eff.name}.`; }
+      return `I couldn't find an agent called ${a.name}.`;
+    }
+  }
+  return null;
+}
+
+// Optional "know a lot about you" context: when the user turns it on, Keak loads a summary of their Second
+// Brain (folder map + README / CLAUDE / AGENTS) into every answer. Memoized per folder so it's read once.
+let _brainContextCache: { key: string; text: string } | null = null;
+async function getBrainContext(): Promise<string> {
+  const root = localStorage.getItem("keak_brain_path") || "";
+  if (!root || localStorage.getItem("keak_brain_autocontext") !== "1") return "";
+  if (_brainContextCache && _brainContextCache.key === root) return _brainContextCache.text;
+  let text = "";
+  try {
+    const tree = await invoke<string>("sb_tree", { args: { root, maxDepth: 2, maxEntries: 250 } });
+    const parts: string[] = [`Folder map (relative paths): ${tree}`];
+    for (const f of ["README.md", "CLAUDE.md", "AGENTS.md"]) {
+      try { const c = await invoke<string>("sb_read", { args: { root, path: f } }); if (c) parts.push(`${f}:\n${c.slice(0, 1500)}`); } catch { /* file may not exist */ }
+    }
+    text = parts.join("\n\n");
+  } catch { text = ""; }
+  _brainContextCache = { key: root, text };
+  return text;
+}
+
+// ---- Control the on-screen agent orbs by voice ("make the agents move in circles", "follow my mouse",
+//      "make them stay still", "gather them", "Sirius, follow my cursor", "hide the names") -------------
+function looksLikeVizCommand(t: string): boolean {
+  const s = t.toLowerCase();
+  const subj = /\b(agents?|orbs?|stars?|balls?|dots?|them|they|agentes?|orbes?|estrellas?|bolas?|ellos|los)\b/.test(s);
+  const verb = /\b(move|moving|movement|circle|circles|spin|spinning|still|stop|freeze|frozen|don'?t move|do ?n'?t move|follow|gather|together|come together|plane|fly|flying|dance|around|show (the )?names?|hide (the )?names?|c[ií]rculos?|mueve|muevan|mu[eé]vanse|quiet[oa]s?|par[ae]n?|det[eé]n|congela|sigue|sigan|junt[ae]n?|vuel[ae]|avi[oó]n|nombres?)\b/.test(s);
+  return subj && verb;
+}
+const VIZ_SYSTEM = `You control the on-screen AGENT ORBS. Turn the command into ONE JSON action and nothing else.
+{"action":"motion","mode":"drift|still|circle|plane|gather|follow","target":"all or an agent name"}
+{"action":"labels","on":true or false}
+{"action":"hide"}
+{"action":"none"}
+Modes: drift = wander freely (the default); still = stop and hold position; circle = move in circles; plane = fly across like a plane; gather = come together near the Keak orb; follow = follow the mouse cursor. If the user names ONE agent (e.g. Sirius), set target to that exact name, else "all". "show/hide the names" -> labels. "stop showing them / clear / hide the agents" -> hide. If it is not about the agent orbs, return {"action":"none"}. Return ONLY the JSON.`;
+async function parseVizCommand(question: string): Promise<string | null> {
+  if (!looksLikeVizCommand(question)) return null;
+  const ai = resolveOwnAI();
+  if (!ai) return null;
+  const names = allAgents().map((a) => a.name).join(", ");
+  let raw = "";
+  try { raw = await askOwnAIRaw(ai, `${VIZ_SYSTEM}\nAgent names: ${names}.`, question); } catch { return null; }
+  const a = extractJsonObject(raw) as Record<string, unknown> | null;
+  if (!a || !a.action || a.action === "none") return null;
+  if (a.action === "labels") {
+    const on = a.on === true || a.on === "true";
+    localStorage.setItem("keak_agent_labels", on ? "1" : "0");
+    return on ? "Okay, I'll show the agent names." : "Okay, I hid the agent names.";
+  }
+  if (a.action === "hide") {
+    try { await invoke("hide_agents"); } catch { /* ignore */ }
+    writeAgentState([]);
+    return "Okay, I cleared the agents.";
+  }
+  if (a.action === "motion") {
+    const mode = String(a.mode || "drift");
+    const target = a.target ? String(a.target) : "all";
+    localStorage.setItem("keak_agents_viz", JSON.stringify({ mode, target }));
+    // Make sure some orbs are on screen so the effect is visible.
+    let has = false;
+    try { const d = JSON.parse(localStorage.getItem("keak_agents") || "{}"); has = Array.isArray(d.agents) && d.agents.length > 0; } catch { /* ignore */ }
+    if (!has) {
+      const team = [...effectiveDefaults(), ...readAgentRoster()];
+      writeAgentState(team.map((x) => ({ name: x.name, status: "working", color: x.color })));
+    }
+    try { await invoke("show_agents"); } catch { /* ignore */ }
+    const desc: Record<string, string> = { drift: "drifting freely", still: "holding still", circle: "moving in circles", plane: "flying across like a plane", gather: "gathering together", follow: "following your mouse" };
+    const d = desc[mode] || "moving";
+    return target && target !== "all" ? `Okay, ${target} is now ${d}.` : `Okay, the agents are now ${d}.`;
+  }
+  return null;
+}
+
+// ---- Create a Routine by voice ("schedule a routine every day at 5am to…") -----------------------
+function looksLikeRoutineCommand(t: string): boolean {
+  const s = t.toLowerCase();
+  return /\b(routines?|schedule|scheduled|every day|each day|every morning|every week|every monday|every tuesday|every wednesday|every thursday|every friday|every saturday|every sunday|daily|weekly|remind me|tomorrow at|each morning|at \d{1,2}\s?(am|pm)|rutinas?|programa|cada d[íi]a|cada ma[ñn]ana|cada semana|recu[ée]rdame|ma[ñn]ana a las)\b/.test(s);
+}
+const ROUTINE_SYSTEM = `Convert the user's request into ONE scheduled routine as strict minified JSON and nothing else. Shape:
+{"name":"<short name>","freq":"once|daily|weekly","day":<0-6 Sun-Sat, only for weekly>,"hour":<0-23>,"minute":<0-59>,"onceDate":"<ISO datetime, only for freq once>","instructions":"<what to do on each run, self-contained>","output":"keak|telegram|email","outputTarget":"<email address if the output needs one, else empty>","tools":["perplexity"] if it needs live web research else []}
+Rules: default output "telegram" unless the user names keak/email. "5am" -> hour 5 minute 0; "5:30pm" -> hour 17 minute 30. "tomorrow at 3pm" or a specific date -> freq "once" with onceDate computed from the provided NOW. Repeats every day -> "daily"; a named weekday -> "weekly" + day (0=Sunday). Research / monitor / competitor / news / market tasks should include "perplexity" in tools. Return ONLY the JSON object.`;
+async function parseRoutineCommand(question: string): Promise<string | null> {
+  if (!looksLikeRoutineCommand(question)) return null;
+  const ai = resolveOwnAI();
+  if (!ai) return null;
+  let raw = "";
+  try { raw = await askOwnAIRaw(ai, `${ROUTINE_SYSTEM}\nNow is ${new Date().toString()}.`, question); }
+  catch { return null; }
+  const obj = extractJsonObject(raw) as Record<string, unknown> | null;
+  if (!obj || !obj.instructions || !obj.freq) return null;
+  const num = (v: unknown, d: number, max: number) => { const n = parseInt(String(v), 10); return isNaN(n) ? d : Math.max(0, Math.min(max, n)); };
+  const freq = ["once", "daily", "weekly"].includes(String(obj.freq)) ? (obj.freq as Routine["freq"]) : "daily";
+  const output = ["keak", "telegram", "email"].includes(String(obj.output)) ? (obj.output as Routine["output"]) : "telegram";
+  const r: Routine = {
+    id: newRoutineId(),
+    name: String(obj.name || "Routine").slice(0, 60),
+    freq,
+    day: typeof obj.day === "number" ? obj.day : undefined,
+    hour: num(obj.hour, 9, 23),
+    minute: num(obj.minute, 0, 59),
+    onceDate: obj.onceDate ? String(obj.onceDate) : undefined,
+    instructions: String(obj.instructions),
+    output,
+    outputTarget: obj.outputTarget ? String(obj.outputTarget) : undefined,
+    tools: Array.isArray(obj.tools) ? (obj.tools as unknown[]).filter((x) => typeof x === "string") as string[] : [],
+    enabled: true,
+  };
+  upsertRoutine(r);
+  return `Done. I scheduled "${r.name}", ${nextRunLabel(r)}.`;
+}
+
+// The user's custom agent roster: their own named agents with a description (specialty) and a colour.
+// Empty → the default star agents (Sirius…Naos) are used. Managed in the Connect window.
+type RosterAgent = { name: string; description: string; color: string; choice?: string; personality?: string; tools?: string[] };
+function readAgentRoster(): RosterAgent[] {
+  try {
+    const raw = localStorage.getItem("keak_agents_roster");
+    const arr = raw ? JSON.parse(raw) : [];
+    return Array.isArray(arr) ? arr.filter((a: RosterAgent) => a && a.name) : [];
+  } catch { return []; }
+}
+
+// Every agent the user can call by name: the (possibly edited) built-in stars + their custom roster.
+type NamedAgent = { name: string; description: string; color: string; choice?: string; personality?: string; tools?: string[] };
+function allAgents(): NamedAgent[] {
+  return [...effectiveDefaults().map((a) => ({ name: a.name, description: a.description, color: a.color, personality: a.personality, choice: a.choice || "", tools: a.tools })), ...readAgentRoster()];
+}
+
+// If the user addresses a specific agent by name ("Sirius, research X", "ask Rigel to write the copy"),
+// return that agent + the task so we run just that one orb. Star names are distinctive, so this is safe.
+function detectNamedAgent(task: string): { agent: { name: string; description: string; color: string; choice?: string; personality?: string; tools?: string[] }; task: string } | null {
+  const raw = task.trim();
+  for (const a of allAgents()) {
+    const name = a.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const m =
+      raw.match(new RegExp(`^\\s*${name}\\b[,:]?\\s*(?:to\\s+|please\\s+|can you\\s+)?(.*)$`, "i")) ||
+      raw.match(new RegExp(`\\b(?:ask|tell|use|get|have|send|let)\\s+${name}\\b[,:]?\\s*(?:to\\s+|please\\s+)?(.*)$`, "i"));
+    if (m) {
+      const rest = (m[1] || "").trim();
+      return { agent: a, task: rest.length >= 3 ? rest : raw };
+    }
+  }
+  return null;
+}
+
+// The agents window reads this key to know which orbs to draw, their status + colour. Shared localStorage is
+// the cross-window channel (no extra Tauri permissions needed).
+function writeAgentState(agents: { name: string; status: string; color?: string }[]) {
+  try { localStorage.setItem("keak_agents", JSON.stringify({ ts: Date.now(), agents })); } catch { /* ignore */ }
+}
+function updateAgentStatus(name: string, status: string) {
+  try {
+    const raw = localStorage.getItem("keak_agents");
+    const data = raw ? JSON.parse(raw) : { agents: [] };
+    const agents = (data.agents || []).map((a: { name: string; status: string }) => (a.name === name ? { ...a, status } : a));
+    localStorage.setItem("keak_agents", JSON.stringify({ ts: Date.now(), agents }));
+  } catch { /* ignore */ }
+}
+
+// True when an agent actually built something openable (a full HTML page).
+function isHtmlArtifact(s: string): boolean {
+  return /^\s*<!doctype html|^\s*<html[\s>]/i.test((s || "").trim());
+}
+
+// A soft, low-alpha version of a custom agent's colour, for the name chip in the results panel.
+function hexToSoft(hex: string, alpha = 0.2): string {
+  const m = /^#?([0-9a-f]{6})$/i.exec((hex || "").trim());
+  if (!m) return "rgba(212,164,154,0.22)";
+  const n = parseInt(m[1], 16);
+  return `rgba(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}, ${alpha})`;
+}
+
+// Render an agent's markdown-ish output as clean, readable lines (no raw ** or ### clutter on screen).
+function RichText({ text }: { text: string }) {
+  const strip = (s: string) => s.replace(/\*\*(.+?)\*\*/g, "$1").replace(/\*(.+?)\*/g, "$1").replace(/`(.+?)`/g, "$1");
+  const lines = (text || "").replace(/\r/g, "").split("\n");
+  return (
+    <div className="rich">
+      {lines.map((raw, i) => {
+        const line = strip(raw);
+        const h = line.match(/^\s*#{1,6}\s+(.*)$/);
+        if (h) return <div key={i} className="rich-h">{h[1]}</div>;
+        const b = line.match(/^\s*[-*]\s+(.*)$/);
+        if (b) return <div key={i} className="rich-li">{b[1]}</div>;
+        const num = line.match(/^\s*(\d+)[.)]\s+(.*)$/);
+        if (num) return <div key={i} className="rich-li">{num[1]}. {num[2]}</div>;
+        if (!line.trim()) return <div key={i} className="rich-gap" />;
+        return <div key={i} className="rich-p">{line}</div>;
+      })}
+    </div>
+  );
+}
+
+// "See it": save an agent's output to a temp file and open it (HTML in the browser, else as text).
+async function openArtifact(name: string, content: string) {
+  try {
+    const fname = (name || "artifact").replace(/[^a-z0-9]+/gi, "-").toLowerCase().slice(0, 40) + (isHtmlArtifact(content) ? ".html" : ".txt");
+    const path = await invoke<string>("save_artifact", { name: fname, content });
+    await invoke("open_url", { url: path });
+  } catch { /* ignore */ }
 }
 
 // The reply is spoken aloud and shown in a small pill, so it must be plain text — strip any markdown
@@ -120,6 +1050,17 @@ function cleanReply(s: string): string {
     .trim();
 }
 
+// Keep spoken text short so the high-quality keak-tts voice doesn't choke on long text (which drops us to
+// the robotic browser fallback). Cuts at a sentence boundary and points to the See it panel for the rest.
+function shortSpoken(text: string, max = 260): string {
+  const clean = cleanReply(text);
+  if (clean.length <= max) return clean;
+  const cut = clean.slice(0, max);
+  const stop = Math.max(cut.lastIndexOf(". "), cut.lastIndexOf("! "), cut.lastIndexOf("? "));
+  const head = stop > 90 ? cut.slice(0, stop + 1) : cut.trim() + ".";
+  return `${head} Tap See it for the full thing.`;
+}
+
 // Track whatever is currently speaking so a follow-up can interrupt it.
 let currentAudio: HTMLAudioElement | null = null;
 function stopSpeaking() {
@@ -132,36 +1073,142 @@ function stopSpeaking() {
   }
 }
 
-// Free, built-in fallback voice — now language-locked so it stops mixing ES/EN in one phrase.
-// Resolves when speaking finishes, so callers can time what happens next.
-function speak(text: string): Promise<void> {
+// The OS voice list is empty on the very first getVoices() call in some webviews; wait for it so pickVoice
+// can actually choose a good natural voice instead of falling back to the default robotic one.
+function voicesReady(): Promise<void> {
   return new Promise((resolve) => {
-    try {
-      window.speechSynthesis.cancel();
-      const u = new SpeechSynthesisUtterance(text);
-      const lang = replyLang(text);
-      u.lang = BCP47[lang] || "en-US";
-      const v = pickVoice(lang);
-      if (v) u.voice = v;
-      u.onend = () => resolve();
-      u.onerror = () => resolve();
-      window.speechSynthesis.speak(u);
-    } catch {
-      resolve(); // speech synthesis unavailable — the text is still shown on screen
-    }
+    const vs = window.speechSynthesis?.getVoices?.() || [];
+    if (vs.length) return resolve();
+    let done = false;
+    const finish = () => { if (done) return; done = true; resolve(); };
+    try { window.speechSynthesis.addEventListener("voiceschanged", finish, { once: true }); } catch { /* ignore */ }
+    setTimeout(finish, 400);
   });
 }
 
-// Best voice: try the high-quality backend TTS (keak-tts); fall back to the free built-in voice.
+// Free, built-in fallback voice — language-locked so it stops mixing ES/EN in one phrase.
+// Resolves when speaking finishes, so callers can time what happens next.
+function speak(text: string): Promise<void> {
+  return new Promise((resolve) => {
+    (async () => {
+      try {
+        await voicesReady();
+        window.speechSynthesis.cancel();
+        const u = new SpeechSynthesisUtterance(text);
+        const lang = replyLang(text);
+        u.lang = BCP47[lang] || "en-US";
+        const v = pickVoice(lang);
+        if (v) u.voice = v;
+        u.rate = 1.0;
+        u.pitch = 1.03;
+        u.onend = () => resolve();
+        u.onerror = () => resolve();
+        window.speechSynthesis.speak(u);
+      } catch {
+        resolve(); // speech synthesis unavailable — the text is still shown on screen
+      }
+    })();
+  });
+}
+
+// Play a base64 audio clip (given a data: URL mime). Returns true when it finishes playing, false on error.
+async function playClip(dataUrl: string, onStart?: () => void): Promise<boolean> {
+  try {
+    const audio = new Audio(dataUrl);
+    currentAudio = audio;
+    onStart?.();
+    return await new Promise<boolean>((resolve) => {
+      const done = (ok: boolean) => { if (currentAudio === audio) currentAudio = null; resolve(ok); };
+      audio.onended = () => done(true);
+      audio.onerror = () => done(false);
+      audio.play().catch(() => done(false));
+    });
+  } catch { return false; }
+}
+
+// Premium spoken voice on the user's OWN OpenAI API key (gpt-4o-mini-tts). Returns true if it played, so
+// speakReply can fall through to other engines on any failure. Costs Pep nothing — runs on the user's key.
+async function openaiSpeak(text: string, onStart?: () => void): Promise<boolean> {
+  const key = (localStorage.getItem("keak_cu_openai_key") || "").trim(); // needs a real sk- key, not the sub token
+  if (!key.startsWith("sk-")) return false;
+  const voice = localStorage.getItem("keak_openai_voice") || "nova";
+  try {
+    const b64 = await invoke<string>("openai_tts", { args: { credential: key, voice, model: "", text } });
+    if (!b64) return false;
+    return await playClip(`data:audio/mp3;base64,${b64}`, onStart);
+  } catch { return false; }
+}
+
+// Premium spoken voice on the user's OWN Gemini API key. Free to Pep (their key; Gemini has a free tier), so
+// this is the answer for Gemini users AND for Claude-only users who paste a free Gemini key just for voice.
+async function geminiSpeak(text: string, onStart?: () => void): Promise<boolean> {
+  const key = (localStorage.getItem("keak_cu_gemini_key") || "").trim();
+  if (!key) return false;
+  const voice = localStorage.getItem("keak_gemini_voice") || "Kore";
+  try {
+    const b64 = await invoke<string>("gemini_tts", { args: { credential: key, voice, model: "", text } });
+    if (!b64) return false;
+    return await playClip(`data:audio/wav;base64,${b64}`, onStart);
+  } catch { return false; }
+}
+
+// The user's own ElevenLabs voice (their key, from the AI tools). The most realistic option, costs the user
+// their ElevenLabs credits. Returns true if it played so speakReply can fall through on failure.
+async function elevenSpeak(text: string, onStart?: () => void): Promise<boolean> {
+  const key = (localStorage.getItem("keak_tool_elevenlabs") || "").trim();
+  if (!key) return false;
+  const voiceId = localStorage.getItem("keak_tool_elevenlabs_voice") || "";
+  try {
+    const b64 = await invoke<string>("elevenlabs_speak", { args: { apiKey: key, text, voiceId } });
+    if (!b64) return false;
+    return await playClip(`data:audio/mp3;base64,${b64}`, onStart);
+  } catch { return false; }
+}
+
+// Best voice, in the order the user chose in Settings (keak_voice_engine):
+//  - "openai" → their own OpenAI premium voice (best), falls through if it fails
+//  - "system" → a chosen natural Windows voice, no network
+//  - "keak" (default) → Keak's ElevenLabs voice, falling back to the built-in voice
 // `onStart` fires the instant the voice actually begins, so the caller can reveal the text at the same
 // moment (voice + text land together instead of text-then-silence). Resolves when playback ends.
 async function speakReply(text: string, token: string, onStart?: () => void): Promise<void> {
   const gender = localStorage.getItem("keak_voice_gender") || "female";
+  // Default is "auto": always use the user's OWN key for the voice (free to Pep), else a free Windows voice.
+  // Only the explicit "keak" engine uses Pep's paid backend voice.
+  const engine = localStorage.getItem("keak_voice_engine") || "auto";
+  // Cap what we send to keak-tts. Long text can make the premium voice error out, which drops us to the
+  // robotic built-in voice — the exact "the voice got bad" complaint. The full text still shows on screen.
+  const spoken = text.length > 650 ? shortSpoken(text, 620) : text;
+  // Automatic: their own Gemini voice → their own OpenAI voice → a free Windows voice. Never Pep's paid backend.
+  if (engine === "auto") {
+    if (await geminiSpeak(spoken, onStart)) return;
+    if (await openaiSpeak(spoken, onStart)) return;
+    onStart?.(); await speak(spoken); return;
+  }
+  // The user's own Gemini voice when selected (only if a Gemini key is set).
+  if (engine === "gemini") {
+    if (await geminiSpeak(spoken, onStart)) return;
+    // no key or it failed — fall through to the built-in voice
+    onStart?.(); await speak(spoken); return;
+  }
+  // The user's own OpenAI voice when selected (only if a real sk- key is set).
+  if (engine === "openai") {
+    if (await openaiSpeak(spoken, onStart)) return;
+    onStart?.(); await speak(spoken); return;
+  }
+  // The user's own ElevenLabs voice when selected (needs an ElevenLabs key under AI tools).
+  if (engine === "elevenlabs") {
+    if (await elevenSpeak(spoken, onStart)) return;
+    onStart?.(); await speak(spoken); return;
+  }
+  // A hand-picked Windows voice: skip the network entirely, use the chosen natural voice.
+  if (engine === "system") { onStart?.(); await speak(spoken); return; }
+  // "keak" engine only: Pep's paid backend voice, then the built-in voice as a fallback.
   try {
     const res = await fetch(`${SUPABASE_URL}/functions/v1/keak-tts`, {
       method: "POST",
       headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ text, language: replyLang(text), gender }),
+      body: JSON.stringify({ text: spoken, language: replyLang(spoken), gender }),
     });
     if (res.ok) {
       const buf = await res.arrayBuffer();
@@ -184,7 +1231,7 @@ async function speakReply(text: string, token: string, onStart?: () => void): Pr
     // fall through to the built-in voice
   }
   onStart?.(); // built-in voice starts effectively immediately
-  await speak(text);
+  await speak(spoken);
 }
 
 // "Thinking" filler: a tiny spoken acknowledgement ("Of course, Pep.") played the instant a Keak AI
@@ -345,6 +1392,7 @@ function Waveform({ active, streamRef }: { active: boolean; streamRef: React.Mut
 }
 
 export default function Overlay() {
+  const [, , t] = useUiLang();
   const isPaid = ["starter", "pro", "team"].includes(localStorage.getItem("keak_plan") ?? "free");
   const canSeeScreen = ["pro", "team"].includes(localStorage.getItem("keak_plan") ?? "free"); // screen vision: Pro + Team
   const [state, setState] = useState<OverlayState>("idle");
@@ -368,6 +1416,15 @@ export default function Overlay() {
   const [attachedScreen, setAttachedScreen] = useState(false); // a screenshot was actually sent this turn
   const [screenAllowed, setScreenAllowed] = useState(() => localStorage.getItem("keak_screen_vision_allowed") === "1");
   const historyRef = useRef<{ role: string; text: string }[]>([]); // Keak AI conversation memory
+  // Computer-use ("TARS") state: the agent loop drives the real mouse/keyboard.
+  const [cuActive, setCuActive] = useState(false);
+  const cuActiveRef = useRef(false);
+  const cuAbortRef = useRef(false);
+  const [cuConfirmGoal, setCuConfirmGoal] = useState<string | null>(null);
+  const cuConfirmResolveRef = useRef<((v: boolean) => void) | null>(null);
+  // Agents: results of the last delegated job + whether the "See it" panel is open.
+  const [agentResults, setAgentResults] = useState<{ name: string; title: string; output: string; color: string }[]>([]);
+  const [showAgentPanel, setShowAgentPanel] = useState(false);
   const closeTimerRef = useRef<number | null>(null); // pending auto-close of the assistant panel
   const assistantVisibleRef = useRef(false); // true while the assistant orb is on screen
   const mrRef = useRef<MediaRecorder | null>(null);
@@ -392,6 +1449,14 @@ export default function Overlay() {
   useEffect(() => {
     const startP = listen<boolean>("ptt-start", (e) => {
       if (stateRef.current === "idle") {
+        // Plan gate: dictation is the paid feature. If the plan's minutes are used up, don't record — show the
+        // upgrade message. Keak AI (Ctrl+Alt) still works because it runs on the user's own AI.
+        if (dictationBlocked()) {
+          modeRef.current = "dictate";
+          setStateSafe("error");
+          setErrorMsg("You've used all the dictation minutes on your plan. Upgrade or renew in Keak settings to keep dictating. Keak AI still works on your own AI.");
+          return;
+        }
         modeRef.current = "dictate";
         assistantVisibleRef.current = false;
         setAssistant(false); // leaving any open Keak AI conversation
@@ -767,6 +1832,7 @@ export default function Overlay() {
     setAiReply(announce);
     setStateSafe("idle");
 
+    let lastSnap: any = null;
     for (let i = 0; i < plan.length; i++) {
       const step = plan[i];
       setAiReply(`${announce} (${i + 1}/${plan.length})`);
@@ -780,11 +1846,41 @@ export default function Overlay() {
         scheduleAssistantClose(9000);
         return;
       }
-      // Wait for the page snapshot that confirms the step landed
-      await waitForBrowserResult(1500);
+      // Wait longer on the last step so the page has time to fully load
+      const snap = await waitForBrowserResult(i === plan.length - 1 ? 3000 : 1500);
+      if (snap) lastSnap = snap;
     }
 
-    const doneMsg = "Done.";
+    // For weather queries: call Open-Meteo directly — reliable, no page snapshot needed.
+    // For everything else: try to summarize from the page snapshot.
+    let doneMsg = "Done.";
+    const weatherCity = extractWeatherCity(task);
+    if (weatherCity) {
+      const weatherMsg = await fetchWeatherSpeech(weatherCity);
+      if (weatherMsg) doneMsg = weatherMsg;
+    } else if (lastSnap?.page) {
+      const pg = lastSnap.page;
+      const pageCtx = `URL: ${pg.url} | Title: "${pg.title}" | Content: ${(pg.text || "").slice(0, 1000)}`;
+      const assistantName = localStorage.getItem("keak_assistant_name") || "Keak";
+      const userName = localStorage.getItem("keak_user_name") || "there";
+      try {
+        const sumRes = await fetch(`${SUPABASE_URL}/functions/v1/keak-assistant`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+          body: JSON.stringify({
+            text: `[Task]: ${task}\n[Page result]: ${pageCtx}\n[Summarize the answer to the task in 1-2 natural spoken sentences. No browser actions needed. Reply only with the spoken answer.]`,
+            user_name: userName,
+            assistant_name: assistantName,
+            history: [],
+          }),
+        });
+        if (sumRes.ok) {
+          const sumData = await sumRes.json();
+          if (sumData.reply) doneMsg = cleanReply(sumData.reply);
+        }
+      } catch { /* fall through to "Done." */ }
+    }
+
     historyRef.current.push({ role: "user", text: task }, { role: "assistant", text: doneMsg });
     let revealed = false;
     const reveal = () => { if (revealed) return; revealed = true; setAiReply(doneMsg); setStateSafe("idle"); };
@@ -881,11 +1977,448 @@ export default function Overlay() {
     scheduleAssistantClose(9000);
   }
 
+  // Local "reply to this email" handler: read the open email from the page, ask Keak AI to WRITE the
+  // reply body (text only), then click Reply and TYPE it in. Deterministic DOM work — the model is
+  // only used to write the text, so it actually writes the reply instead of describing how to.
+  async function replyToEmailLocally(question: string, token: string): Promise<void> {
+    const userName = localStorage.getItem("keak_user_name") || "there";
+    const assistantName = localStorage.getItem("keak_assistant_name") || "Keak";
+    // 1. Grab the open email's text via the extension.
+    try {
+      await invoke("send_browser_command", { command: JSON.stringify({ id: Date.now(), type: "get_page_info" }) });
+    } catch {
+      setAiReply("Keak Browser Bridge isn't connected. Reload the Chrome extension.");
+      setStateSafe("idle"); scheduleAssistantClose(9000); return;
+    }
+    const snap = await waitForBrowserResult(2500);
+    const pageText = (snap?.page?.text || "").slice(0, 2200);
+    // 2. Ask Keak AI to write the reply BODY only.
+    let body = "";
+    try {
+      const r = await fetch(`${SUPABASE_URL}/functions/v1/keak-assistant`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          text: `Write a reply to this email as if I wrote it. Output ONLY the reply body as plain text, ready to send, no subject line and no commentary. My instruction: "${question}". The email on my screen:\n${pageText}`,
+          user_name: userName, assistant_name: assistantName, history: [],
+        }),
+      });
+      if (r.ok) { const d = await r.json(); body = cleanReply(d.reply || ""); }
+    } catch { /* fall through */ }
+    if (!body) { setAiReply("I couldn't draft that reply. Try again."); setStateSafe("idle"); scheduleAssistantClose(9000); return; }
+    // 3. Click Reply, then type the drafted body into the compose box.
+    const steps = [{ type: "click", text: "Reply" }, { type: "type", text: body, append: false }];
+    for (let i = 0; i < steps.length; i++) {
+      try { await invoke("send_browser_command", { command: JSON.stringify({ id: Date.now(), ...steps[i] }) }); }
+      catch { setAiReply("Keak Browser Bridge isn't connected. Reload the Chrome extension."); setStateSafe("idle"); scheduleAssistantClose(9000); return; }
+      await waitForBrowserResult(i === 0 ? 1300 : 700);
+    }
+    // Full access = also hit Send for you (Gmail "Send" / Spanish "Enviar"). Ask mode leaves it to you.
+    let sent = false;
+    if (actionMode() === "full") {
+      await new Promise((r) => setTimeout(r, 500));
+      for (const label of ["Send", "Enviar"]) {
+        try { await invoke("send_browser_command", { command: JSON.stringify({ id: Date.now(), type: "click", text: label }) }); }
+        catch { break; }
+        const rr = await waitForBrowserResult(1500);
+        if (rr?.success) { sent = true; break; }
+      }
+    }
+    const spoken = sent
+      ? "Done, I wrote the reply and sent it for you."
+      : "Done, I wrote the reply. Check it and hit send when you're happy.";
+    historyRef.current.push({ role: "user", text: question }, { role: "assistant", text: spoken });
+    let shown = false; const show = () => { if (shown) return; shown = true; setAiReply(spoken); setStateSafe("idle"); };
+    const safety = window.setTimeout(show, 15000);
+    try { await speakReply(spoken, token, () => { clearTimeout(safety); show(); }); }
+    finally { clearTimeout(safety); show(); if (stateRef.current === "idle") scheduleAssistantClose(11000); }
+  }
+
   async function runAssistant(question: string, token: string, image?: string) {
     cancelAssistantClose();
     const assistantName = localStorage.getItem("keak_assistant_name") || "Keak";
     const userName = localStorage.getItem("keak_user_name") || "there";
     try {
+      // [KEAK-DEBUG v1.2] confirms the new local handlers are running + shows what was heard.
+      console.log("[KEAK v1.2] heard:", JSON.stringify(question));
+      // Computer-use: an explicit "take control and do X" command runs the screen agent (TARS) instead
+      // of answering. Only fires when a provider is connected and the phrasing is clearly a command.
+      // "Show me the agents" / "make all the agents appear" → just display the whole team, no work.
+      if (parseShowAgents(question)) { await showAllAgents(token); return; }
+
+      // Post to Slack when connected: "post to Slack #team saying …", "send it to slack".
+      if (localStorage.getItem("keak_slack_token") && /\b(post|send|share|message)\b[\s\S]*\bslack\b|\bslack\b[\s\S]*\b(saying|message)\b/i.test(question)) {
+        const chMatch = question.match(/#([a-z0-9_-]+)/i) || question.match(/\b(?:to|on|in)\s+(?:the\s+)?([a-z0-9_-]+)\s+channel/i);
+        const channel = chMatch ? (chMatch[1].startsWith("#") ? chMatch[1] : `#${chMatch[1]}`) : "#general";
+        const sayMatch = question.match(/\b(?:saying|that says?|message[:]?|:)\s*([\s\S]+)$/i);
+        let text = sayMatch ? sayMatch[1].trim() : "";
+        if (!text) { const hist = JSON.parse(localStorage.getItem("keak_agent_history") || "[]"); text = hist?.[0]?.results?.[0]?.output?.slice(0, 900) || question; }
+        setAssistant(true); assistantVisibleRef.current = true; cancelAssistantClose();
+        setStateSafe("responding"); setAiReply(`Posting to Slack ${channel}...`);
+        const ok = await postToSlack(channel, text);
+        await sayAndClose(ok ? `Posted it to Slack ${channel}.` : "I couldn't post to Slack. Check the token and that the app is in that channel.", token);
+        return;
+      }
+
+      // Direct research via Perplexity when connected: "research X", "look up Y", "investiga Z", or naming it.
+      if (toolKey("perplexity") && (/^\s*(research|look up|find out|search for|investiga|busca|averigua)\b/i.test(question) || /\bperplexity\b/i.test(question))) {
+        setAssistant(true); assistantVisibleRef.current = true; cancelAssistantClose();
+        setStateSafe("responding"); setAiReply("Researching that live...");
+        const r = await askPerplexity(question);
+        if (r) {
+          try {
+            const prev = JSON.parse(localStorage.getItem("keak_agent_history") || "[]");
+            const hist = Array.isArray(prev) ? prev : [];
+            hist.unshift({ ts: Date.now(), job: question, results: [{ name: "Perplexity", title: "Research", output: r, color: "#D4A49A" }] });
+            localStorage.setItem("keak_agent_history", JSON.stringify(hist.slice(0, 20)));
+          } catch { /* ignore */ }
+          setAgentResults([{ name: "Perplexity", title: "Research", output: r, color: "#D4A49A" }]);
+          setShowAgentPanel(false);
+          historyRef.current.push({ role: "user", text: question }, { role: "assistant", text: r });
+          await sayAndClose(shortSpoken(r), token, 16000);
+        } else {
+          await sayAndClose("I couldn't reach Perplexity. Check your key in settings.", token);
+        }
+        return;
+      }
+
+      // ---- Plug-in tool actions (ElevenLabs voiceover, Gamma deck, HeyGen video, n8n/Zapier automation) ----
+      // The topic/text after a leading command verb + "about/of/on/that says" (or the whole thing).
+      const subjectOf = (q: string) => {
+        const m = q.match(/\b(?:about|of|on|that says?|saying|sobre|de|del|acerca de)\s+([\s\S]+)$/i);
+        if (m && m[1].trim().length > 1) return m[1].trim();
+        return q.replace(/^\s*(?:please\s+|por favor\s+)?(?:make|create|generate|build|write|record|hazme|haz|cr[eé]a|gener[ao]|graba|escr[ií]beme|dame)\s+(?:me\s+)?(?:a|an|una|un|el|la|los|las)?\s*/i, "").trim() || q;
+      };
+      const lastOutput = (): string => { try { const h = JSON.parse(localStorage.getItem("keak_agent_history") || "[]"); return h?.[0]?.results?.[0]?.output || ""; } catch { return ""; } };
+
+      // ElevenLabs voiceover: "make a voiceover of X", "read this out loud", "grábame una voz diciendo…".
+      if (toolKey("elevenlabs") && /\b(voice ?over|voiceover|narration|read (?:this|it|that) (?:out loud|aloud)|voz|l[eé]elo|n[aá]rralo|eleven ?labs)\b/i.test(question)) {
+        setAssistant(true); assistantVisibleRef.current = true; cancelAssistantClose();
+        setStateSafe("responding"); setAiReply("Recording the voiceover...");
+        const say = subjectOf(question) || lastOutput();
+        const out = await makeVoiceover(say.slice(0, 2500));
+        if (looksLikePath(out)) { try { await invoke("open_url", { url: out! }); } catch { /* ignore */ } await sayAndClose("Done, I made the voiceover and opened it.", token); }
+        else await sayAndClose(`I couldn't make the voiceover. ${(out || "").slice(0, 120)}`, token);
+        return;
+      }
+
+      // Gamma deck: "make a deck about X", "create a presentation on Y", "hazme unas diapositivas de Z".
+      if (toolKey("gamma") && /\b(deck|slide deck|slides|presentation|pitch deck|diapositivas?|presentaci[oó]n|gamma)\b/i.test(question)) {
+        setAssistant(true); assistantVisibleRef.current = true; cancelAssistantClose();
+        setStateSafe("responding"); setAiReply("Building your deck in Gamma...");
+        const out = await makeDeck(subjectOf(question).slice(0, 1500));
+        if (looksLikeUrl(out)) { try { await invoke("open_url", { url: out! }); } catch { /* ignore */ } await sayAndClose("Your deck is ready, I opened it in Gamma.", token); }
+        else await sayAndClose(`I couldn't build the deck. ${(out || "").slice(0, 120)}`, token);
+        return;
+      }
+
+      // Higgsfield cinematic image/video: "make a cinematic shot of X", "higgsfield a video of Y".
+      if (toolKey("higgsfield") && /\b(higgsfield|cinematic)\b/i.test(question)) {
+        setAssistant(true); assistantVisibleRef.current = true; cancelAssistantClose();
+        setStateSafe("responding"); setAiReply("Generating it with Higgsfield...");
+        const out = await runHiggsfield(subjectOf(question.replace(/\bhiggsfield\b/i, "")).slice(0, 1200));
+        if (looksLikeUrl(out)) { try { await invoke("open_url", { url: out! }); } catch { /* ignore */ } await sayAndClose("Done, I opened what Higgsfield made.", token); }
+        else await sayAndClose(`${(out || "I couldn't generate that.").slice(0, 150)}`, token);
+        return;
+      }
+
+      // HeyGen avatar video: "make a video about X", "crea un vídeo sobre Y". Write a short script first.
+      if (toolKey("heygen") && (/\bhey ?gen\b/i.test(question) || (/\b(video|v[ií]deo|avatar)\b/i.test(question) && /\b(make|create|generate|record|hazme|haz|cr[eé]a|gener[ao]|graba)\b/i.test(question)))) {
+        setAssistant(true); assistantVisibleRef.current = true; cancelAssistantClose();
+        setStateSafe("responding"); setAiReply("Creating your video (this takes a couple of minutes)...");
+        let script = subjectOf(question);
+        const ownAI = resolveOwnAI();
+        if (ownAI) {
+          try { script = await askOwnAIRaw(ownAI, "Write a short spoken video script, 40 to 70 words, plain text, no headings, that an on-camera avatar will read. Topic follows.", subjectOf(question)) || script; }
+          catch { /* keep the raw subject */ }
+        }
+        const out = await makeVideo(script.slice(0, 1500));
+        if (looksLikeUrl(out)) { try { await invoke("open_url", { url: out! }); } catch { /* ignore */ } await sayAndClose("Your video is ready, I opened it.", token); }
+        else await sayAndClose(`${(out || "I couldn't make the video.").slice(0, 150)}`, token);
+        return;
+      }
+
+      // n8n / Zapier automation: "trigger my automation", "run my zap", "dispara mi automatización".
+      if ((toolKey("n8n") || toolKey("zapier")) && /\b(trigger|run|fire|start|dispara|lanza|ejecuta)\b[\s\S]*\b(automation|workflow|zap|webhook|n8n|zapier|automatizaci[oó]n|flujo)\b|\b(automation|workflow|zap|webhook)\b[\s\S]*\b(trigger|run|fire)\b/i.test(question)) {
+        setAssistant(true); assistantVisibleRef.current = true; cancelAssistantClose();
+        setStateSafe("responding"); setAiReply("Firing your automation...");
+        const ok = await fireAutomation(subjectOf(question) || question);
+        await sayAndClose(ok ? "Done, I triggered your automation." : "I couldn't reach that webhook. Check the URL in settings.", token);
+        return;
+      }
+
+      // Resend: send an email through Resend when the user names it ("send an email via Resend to …").
+      if (toolKey("resend") && /\bresend\b/i.test(question) && /\b(email|e-?mail|correo|mensaje)\b/i.test(question)) {
+        setAssistant(true); assistantVisibleRef.current = true; cancelAssistantClose();
+        setStateSafe("responding"); setAiReply("Sending it via Resend...");
+        let parsed = parseGmailSend(question);
+        if (!parsed || !parsed.to) {
+          const ai = resolveOwnAI();
+          if (ai) {
+            try {
+              const raw = await askOwnAIRaw(ai, "Extract an email from the request. Reply ONLY with JSON {\"to\":\"email\",\"subject\":\"short subject\",\"body\":\"the message\"}. No prose, no code fences.", question);
+              const m = raw.match(/\{[\s\S]*\}/); if (m) parsed = JSON.parse(m[0]);
+            } catch { /* ignore */ }
+          }
+        }
+        if (parsed && parsed.to) {
+          const ok = await sendViaResend(parsed.to, parsed.subject || "(no subject)", parsed.body || "");
+          await sayAndClose(ok ? `Sent it via Resend to ${parsed.to}.` : "I couldn't send it via Resend. Check the key, and verify a domain in Resend to email other people.", token);
+        } else await sayAndClose("Tell me who to email and what to say.", token);
+        return;
+      }
+
+      // Supabase "do anything": run a query/insert/update/delete on the user's database.
+      if (localStorage.getItem("keak_supabase_url") && (/\bsupabase\b/i.test(question) || /\b(database|my db|table|row|record|query|insert into|delete from|update .*(set|row))\b/i.test(question))) {
+        await supabaseDo(question, token); return;
+      }
+
+      // Figma "do anything the API allows": read files, export frames, comments.
+      if (localStorage.getItem("keak_figma_token") && /\bfigma\b/i.test(question)) {
+        await figmaDo(question, token); return;
+      }
+
+      // GitHub "do anything": repos, issues, PRs, gists.
+      if (localStorage.getItem("keak_github_token") && (/\bgithub\b/i.test(question) || /\b(repo|repository|issue|pull request|\bpr\b|commit|gist)\b/i.test(question))) {
+        await githubDo(question, token); return;
+      }
+
+      // Shopify "do anything": products, orders, customers.
+      if (localStorage.getItem("keak_shopify_token") && (/\bshopify\b/i.test(question) || /\b(store|order|product|inventory|customer)\b/i.test(question))) {
+        await shopifyDo(question, token); return;
+      }
+
+      // YouTube (read): channel stats, my videos, search — via the Google account's YouTube Data API scope.
+      if (localStorage.getItem("keak_google_refresh") && /\byoutube\b/i.test(question)) {
+        await youtubeDo(question, token); return;
+      }
+
+      // Gumloop: trigger the saved flow.
+      if (localStorage.getItem("keak_gumloop_key") && /\bgumloop\b|\b(run|start|trigger|fire) (my )?(flow|pipeline)\b/i.test(question)) {
+        await runGumloop(question, token); return;
+      }
+
+      // Second Brain OS "do anything": read/list/search your folders, or create/edit/delete files, folders and
+      // skills inside the connected folder. Gated on being connected. Skip it for routine/schedule requests so
+      // "create a routine…" makes a real routine instead of a file in the brain.
+      if (localStorage.getItem("keak_brain_path") && !looksLikeRoutineCommand(question) && (
+        /\b(second brain|my brain|my notes|my os)\b/i.test(question) ||
+        /\bskills?\b/i.test(question) ||
+        /\bmy (files?|folders?|projects?|notes?|documents?)\b/i.test(question) ||
+        /\b(create|make|new|write|edit|update|delete|remove|read|open|look at|list|show|find|search)\b[\s\S]*\b(file|folder|note|skill|project|document|doc|readme)\b/i.test(question) ||
+        /\bin (my|the) (folder|projects?|second brain|brain|os)\b/i.test(question)
+      )) {
+        await brainDo(question, token); return;
+      }
+
+      // Manus: hand a whole task to the autonomous agent ("Manus, plan my launch", "use Manus to…").
+      if (toolKey("manus") && /\bmanus\b/i.test(question)) {
+        setAssistant(true); assistantVisibleRef.current = true; cancelAssistantClose();
+        setStateSafe("responding"); setAiReply("Handing it to Manus...");
+        const task = question.replace(/\b(hey\s+)?manus\b[,:]?\s*/i, "").trim() || question;
+        const out = await runManus(task);
+        if (looksLikeUrl(out)) { try { await invoke("open_url", { url: out! }); } catch { /* ignore */ } await sayAndClose("Manus is on it. I opened the task so you can watch it work.", token); }
+        else await sayAndClose(`I couldn't start the Manus task. ${(out || "").slice(0, 120)}`, token);
+        return;
+      }
+
+      // A specific agent called by name ("Sirius, research X", "ask Rigel to write it") → run just that orb.
+      const namedAgent = detectNamedAgent(question);
+      if (namedAgent && localStorage.getItem("keak_cu_provider")) {
+        await runAgents(namedAgent.task, token, namedAgent.agent);
+        return;
+      }
+
+      // Agents FIRST: a "use your team to…" / multi-part "research X and build Y" job → delegate to named
+      // star agents on the user's own AI. Checked before the screen agent so "search … and …" phrasing
+      // isn't stolen by computer-use. Agents always run on the connected provider, never Keak's credits.
+      const agentJob = parseAgentJob(question);
+      console.log("[KEAK] agentJob:", JSON.stringify(agentJob), "provider:", localStorage.getItem("keak_cu_provider"));
+      if (agentJob && localStorage.getItem("keak_cu_provider")) {
+        await runAgents(agentJob, token);
+        return;
+      }
+
+      // Google Calendar via the API wins over screen control when Google is connected — do it invisibly.
+      if (await tryGoogleCalendar(question, token)) return;
+
+      const cuGoal = parseComputerTask(question);
+      if (cuGoal && localStorage.getItem("keak_cu_provider")) {
+        await runComputerTask(cuGoal);
+        return;
+      }
+
+      // Voice model switch: "change the model to Sonnet", "switch to ChatGPT", "set effort to high" —
+      // flip the connected AI's provider/model, confirm out loud. Same keys the Connect picker writes.
+      const modelMsg = parseModelSwitch(question);
+      if (modelMsg) {
+        historyRef.current.push({ role: "user", text: question }, { role: "assistant", text: modelMsg });
+        let shown = false; const show = () => { if (shown) return; shown = true; setAiReply(modelMsg); setStateSafe("idle"); };
+        const safety = window.setTimeout(show, 12000);
+        try { await speakReply(modelMsg, token, () => { clearTimeout(safety); show(); }); }
+        finally { clearTimeout(safety); show(); if (stateRef.current === "idle") scheduleAssistantClose(8000); }
+        return;
+      }
+
+      // Voice personality tuning: "be funnier", "less formal", "set humor to 80" — move the dial + confirm.
+      const personaMsg = adjustPersonaFromSpeech(question);
+      if (personaMsg) {
+        historyRef.current.push({ role: "user", text: question }, { role: "assistant", text: personaMsg });
+        let shown = false; const show = () => { if (shown) return; shown = true; setAiReply(personaMsg); setStateSafe("idle"); };
+        const safety = window.setTimeout(show, 12000);
+        try { await speakReply(personaMsg, token, () => { clearTimeout(safety); show(); }); }
+        finally { clearTimeout(safety); show(); if (stateRef.current === "idle") scheduleAssistantClose(8000); }
+        return;
+      }
+
+      // Control the agent orbs by voice ("make them move in circles", "follow my mouse", "stay still",
+      // "gather", "Sirius follow my cursor", "hide the names"). Checked before settings because these mention
+      // "agents". The orbs keep animating until the user dismisses Keak AI, so we don't auto-close here.
+      const vizMsg = localStorage.getItem("keak_cu_provider") ? await parseVizCommand(question) : null;
+      if (vizMsg) {
+        historyRef.current.push({ role: "user", text: question }, { role: "assistant", text: vizMsg });
+        setAssistant(true); assistantVisibleRef.current = true; cancelAssistantClose();
+        let shown = false; const show = () => { if (shown) return; shown = true; setAiReply(vizMsg); setStateSafe("idle"); };
+        const safety = window.setTimeout(show, 12000);
+        try { await speakReply(vizMsg, token, () => { clearTimeout(safety); show(); }); }
+        finally { clearTimeout(safety); show(); }
+        return;
+      }
+
+      // Any other settings command by voice: change the voice source, create a new agent, edit an existing
+      // one, or any dial/model phrasing the fast parsers above missed. The connected AI turns it into one
+      // structured action and Keak applies it deterministically, then confirms out loud.
+      const settingsMsg = localStorage.getItem("keak_cu_provider") ? await parseAndApplySettings(question) : null;
+      if (settingsMsg) {
+        historyRef.current.push({ role: "user", text: question }, { role: "assistant", text: settingsMsg });
+        let shown = false; const show = () => { if (shown) return; shown = true; setAiReply(settingsMsg); setStateSafe("idle"); };
+        const safety = window.setTimeout(show, 12000);
+        try { await speakReply(settingsMsg, token, () => { clearTimeout(safety); show(); }); }
+        finally { clearTimeout(safety); show(); if (stateRef.current === "idle") scheduleAssistantClose(8000); }
+        return;
+      }
+
+      // Schedule a routine by voice: "every day at 5am research my competitors and email me a summary",
+      // "remind me tomorrow at 9am to…". Keak turns it into a saved routine that fires at its time.
+      const routineMsg = localStorage.getItem("keak_cu_provider") ? await parseRoutineCommand(question) : null;
+      if (routineMsg) {
+        historyRef.current.push({ role: "user", text: question }, { role: "assistant", text: routineMsg });
+        let shown = false; const show = () => { if (shown) return; shown = true; setAiReply(routineMsg); setStateSafe("idle"); };
+        const safety = window.setTimeout(show, 12000);
+        try { await speakReply(routineMsg, token, () => { clearTimeout(safety); show(); }); }
+        finally { clearTimeout(safety); show(); if (stateRef.current === "idle") scheduleAssistantClose(8000); }
+        return;
+      }
+
+      // "Message me on Telegram" right now. After the routine handler so "every day message me…"
+      // still becomes a scheduled routine; this catches the one-off "send me a telegram saying hi".
+      if (!looksLikeRoutineCommand(question) && looksLikeSendMessage(question)) {
+        if (await sendMessageMe(question, token)) return;
+      }
+      // Local calendar handler: open a PREFILLED Google Calendar event (title + day always filled) via
+      // the Browser Bridge. Deterministic, so it never opens a blank calendar link.
+      const mode = actionMode();
+      const calEv = mode === "off" ? null : parseCalendarEvent(question);
+      console.log("[KEAK v1.2] calendar match:", calEv, "mode:", mode);
+      if (calEv) {
+        // Google or Microsoft connected → create it directly on the real calendar, no browser tab, no Save click.
+        if (localStorage.getItem("keak_google_refresh") || msConnected()) {
+          const whenG = calEv.start.toLocaleString(undefined, { weekday: "long", hour: "numeric", minute: "2-digit" });
+          const link = await createEventAnyProvider(calEv);
+          if (link) {
+            const spoken = cleanReply(`Done, I added ${calEv.title} to your calendar for ${whenG}.`);
+            historyRef.current.push({ role: "user", text: question }, { role: "assistant", text: spoken });
+            let shownG = false; const showG = () => { if (shownG) return; shownG = true; setAiReply(spoken); setStateSafe("idle"); };
+            const safetyG = window.setTimeout(showG, 15000);
+            try { await speakReply(spoken, token, () => { clearTimeout(safetyG); showG(); }); }
+            finally { clearTimeout(safetyG); showG(); if (stateRef.current === "idle") scheduleAssistantClose(10000); }
+            return;
+          }
+          // couldn't create via API → fall back to the prefilled browser link below
+        }
+        const url = buildCalendarUrl(calEv);
+        const when = calEv.start.toLocaleString(undefined, { weekday: "long", hour: "numeric", minute: "2-digit" });
+        // open_url opens the prefilled event in the default browser (new tab), so it works even if the
+        // Browser Bridge extension isn't connected and doesn't hijack the tab the user is on.
+        try {
+          await invoke("open_url", { url });
+        } catch {
+          setAiReply("Couldn't open the calendar. Try again.");
+          setStateSafe("idle"); scheduleAssistantClose(9000); return;
+        }
+        // Full access = finish the job: give the prefilled page time to render, then click Save
+        // in the browser via the Bridge (Spanish "Guardar" or English "Save").
+        let saved = false;
+        if (mode === "full") {
+          await new Promise((r) => setTimeout(r, 2600));
+          for (const label of ["Guardar", "Save"]) {
+            try { await invoke("send_browser_command", { command: JSON.stringify({ id: Date.now(), type: "click", text: label }) }); }
+            catch { break; }
+            const rr = await waitForBrowserResult(1400);
+            if (rr?.success) { saved = true; break; }
+          }
+        }
+        const spoken = cleanReply(
+          saved
+            ? `Done, I saved a calendar event, ${calEv.title}, for ${when}.`
+            : `Opening a calendar event, ${calEv.title}, for ${when}. Just hit save.`
+        );
+        historyRef.current.push({ role: "user", text: question }, { role: "assistant", text: spoken });
+        let shown = false; const show = () => { if (shown) return; shown = true; setAiReply(spoken); setStateSafe("idle"); };
+        const safety = window.setTimeout(show, 15000);
+        try { await speakReply(spoken, token, () => { clearTimeout(safety); show(); }); }
+        finally { clearTimeout(safety); show(); if (stateRef.current === "idle") scheduleAssistantClose(10000); }
+        return;
+      }
+
+      // Gmail / Drive (Google) or Outlook Mail / OneDrive (Microsoft) via the API when connected.
+      // Reading the inbox is Google-only (Microsoft is send-only via Mail.Send). Send + save work on either.
+      if (localStorage.getItem("keak_google_refresh")) {
+        if (parseGmailRead(question)) { await readGmail(token); return; }
+      }
+      if (localStorage.getItem("keak_google_refresh") || msConnected()) {
+        const gsend = parseGmailSend(question);
+        if (gsend) { await sendGmail(gsend, token); return; }
+        if (parseSaveToDrive(question)) { await saveLastToDrive(token); return; }
+      }
+
+      // Local "reply to this email/message" handler.
+      const wantsReply = mode !== "off" && (/\b(reply|respond)\b/i.test(question) || /\b(responde|contesta|responder)\b/i.test(question));
+      const emailish = /\b(email|e-?mail|message|correo|mensaje|this|that|it|esto|eso)\b/i.test(question);
+      console.log("[KEAK v1.2] reply match:", wantsReply && emailish);
+      if (wantsReply && emailish) { await replyToEmailLocally(question, token); return; }
+
+      // Action catch-all: if it's clearly an imperative that needs the screen or a tool (open YouTube, create
+      // a folder, book a slot, make a doc) and we didn't already route it, DO it via screen control instead of
+      // answering "I can't". Ask/Full/Off still applies (Ask asks first). Vision questions are left to answer.
+      if (!image && localStorage.getItem("keak_cu_provider") && mode !== "off" && looksLikeAction(question)) {
+        await runComputerTask(question);
+        return;
+      }
+
+      // Keak AI answers on the user's OWN connected AI. If their AI errors, SHOW it (don't silently burn
+      // Keak's Gemini). Screen-vision questions still use the hosted path for now.
+      if (!image && localStorage.getItem("keak_cu_provider") && localStorage.getItem("keak_ai_use_own") !== "0") {
+        const r = await answerWithOwnAI(question, token);
+        if (r.answered) return;
+        if (r.error) {
+          const friendly = /\b429\b|rate.?limit/i.test(r.error)
+            ? "Your AI is rate-limited right now. Give it a minute and try again."
+            : /\b401\b|unauthor|invalid/i.test(r.error)
+            ? "Your AI login expired. Reconnect it in Connect your AI."
+            : `Your AI couldn't answer: ${r.error}`;
+          setAiReply(friendly);
+          setStateSafe("idle"); scheduleAssistantClose(13000); return;
+        }
+        // no credential resolved → fall through to the plan gate below
+      }
+      // Hosted Keak AI (our Gemini) is ONLY for paid plans — free users must connect their own AI so
+      // they never spend Keak's credits.
+      if (!["starter", "pro", "team"].includes(localStorage.getItem("keak_plan") || "free")) {
+        setAiReply("Connect your own AI in Keak settings to use Keak AI, or upgrade to Pro.");
+        setStateSafe("idle"); scheduleAssistantClose(12000); return;
+      }
+
       const aRes = await fetch(`${SUPABASE_URL}/functions/v1/keak-assistant`, {
         method: "POST",
         headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
@@ -896,6 +2429,13 @@ export default function Overlay() {
           // Short conversation memory for follow-ups. The backend expects { role, content }, so map
           // our internal { role, text } turns onto that shape (this is why follow-ups had no memory).
           history: historyRef.current.slice(-10).map((h) => ({ role: h.role, content: h.text })),
+          // Personality dials (0-100) so the hosted keak-assistant function can match the same tone.
+          persona: {
+            humor: parseInt(localStorage.getItem("keak_humor") || "20", 10),
+            warmth: parseInt(localStorage.getItem("keak_warmth") || "50", 10),
+            formality: parseInt(localStorage.getItem("keak_formality") || "30", 10),
+            directness: parseInt(localStorage.getItem("keak_directness") || "50", 10),
+          },
           ...(image ? { image } : {}), // screen-vision screenshot (base64 JPEG), when enabled
         }),
       });
@@ -992,6 +2532,862 @@ export default function Overlay() {
   }
 
   // User tapped Confirm on a proposed action: run it through keak-actions, then speak the outcome.
+  // Ask-mode start confirmation for the screen agent (resolves when the user taps Start/Cancel).
+  function askCuStart(goal: string): Promise<boolean> {
+    setCuConfirmGoal(goal);
+    return new Promise((res) => { cuConfirmResolveRef.current = res; });
+  }
+  function resolveCuStart(v: boolean) {
+    setCuConfirmGoal(null);
+    const r = cuConfirmResolveRef.current;
+    cuConfirmResolveRef.current = null;
+    r?.(v);
+  }
+
+  // Global Esc = panic-stop the screen agent (works whenever the overlay has focus, e.g. between steps).
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape" && cuActiveRef.current) { cuAbortRef.current = true; }
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  // Telegram bridge: poll the bot when a token is set, answer each message, reply to the phone. The first
+  // chat to message the bot gets bound as the owner, so strangers can't drive the computer.
+  useEffect(() => {
+    let alive = true; let offset = 0; let timer: number | undefined;
+    async function loop() {
+      const tk = localStorage.getItem("keak_telegram_token") || "";
+      if (tk) {
+        try {
+          const raw = await invoke<string>("telegram_poll", { args: { token: tk, offset } });
+          const data = JSON.parse(raw);
+          if (data.ok && Array.isArray(data.result)) {
+            for (const upd of data.result) {
+              offset = Math.max(offset, (upd.update_id || 0) + 1);
+              const msg = upd.message; const chatId = msg?.chat?.id; const textIn = msg?.text;
+              if (!chatId || !textIn) continue;
+              let owner = localStorage.getItem("keak_telegram_chat") || "";
+              if (!owner) { owner = String(chatId); localStorage.setItem("keak_telegram_chat", owner); }
+              if (String(chatId) !== owner) continue; // only the linked phone
+              let reply = "";
+              try { reply = await answerForTelegram(textIn); } catch (e) { reply = `Error: ${String(e).slice(0, 140)}`; }
+              try { await invoke("telegram_send", { args: { token: tk, chatId: String(chatId), text: (reply || "Done.").slice(0, 3900) } }); } catch { /* ignore */ }
+            }
+          }
+        } catch { /* transient network — keep polling */ }
+      }
+      if (alive) timer = window.setTimeout(loop, tk ? 2500 : 8000);
+    }
+    loop();
+    return () => { alive = false; if (timer) clearTimeout(timer); };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Routine scheduler: every ~30s, fire any routine whose time has come. Runs while Keak is alive (it stays in
+  // the tray when the window is closed). The first pass also catches up a one-time routine whose moment passed
+  // while Keak was shut. We mark lastRun BEFORE running so a routine can't double-fire within its minute.
+  useEffect(() => {
+    let alive = true; let timer: number | undefined; let firstPass = true;
+    const tick = async () => {
+      try {
+        // "Run now" from the Connect window: it drops a routine id here for us to fire immediately.
+        const runNow = localStorage.getItem("keak_routine_run_now");
+        if (runNow) {
+          localStorage.removeItem("keak_routine_run_now");
+          const r = readRoutines().find((x) => x.id === runNow);
+          if (r) await runRoutine(r);
+        }
+        const now = new Date();
+        for (const r of readRoutines()) {
+          if (!r.enabled) continue;
+          let due = isRoutineDue(r, now);
+          if (!due && firstPass && r.freq === "once" && !r.lastRun && r.onceDate && now.getTime() >= new Date(r.onceDate).getTime()) due = true;
+          if (!due) continue;
+          setRoutineRun(r.id, Date.now(), undefined, r.freq === "once" ? false : undefined);
+          await runRoutine(r);
+        }
+      } catch { /* ignore a bad tick, keep scheduling */ }
+      firstPass = false;
+      if (alive) timer = window.setTimeout(tick, 30000);
+    };
+    tick();
+    return () => { alive = false; if (timer) clearTimeout(timer); };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // The screen-agent loop: screenshot -> ask the connected AI for the next action -> do it natively -> repeat.
+  async function runComputerTask(goal: string) {
+    cancelAssistantClose();
+    const provider = localStorage.getItem("keak_cu_provider") || "";
+    let credential = "", accountId = "", isSub = false;
+    if (provider === "openai") {
+      const sub = localStorage.getItem("keak_cu_openai_token") || "";
+      if (sub) { credential = sub; accountId = localStorage.getItem("keak_cu_openai_account") || ""; isSub = true; }
+      else credential = localStorage.getItem("keak_cu_openai_key") || "";
+    } else if (provider === "gemini") {
+      credential = localStorage.getItem("keak_cu_gemini_key") || "";
+    } else if (provider === "claude") {
+      credential = localStorage.getItem("keak_cu_claude_token") || "";
+    } else if (provider === "ollama") {
+      credential = "local"; // no key; the model name carries the config
+    }
+    // The user's chosen model for this provider (e.g. claude-opus-4-8). Empty = provider default.
+    const cuModel = cleanModel(provider, localStorage.getItem(`keak_cu_${provider}_model`) || "");
+    const cuEffort = provider === "claude" ? (localStorage.getItem("keak_cu_claude_effort") || "") : "";
+    if (!provider || !credential) {
+      setAiReply("Connect your AI first — open Keak settings and set up Connect your AI.");
+      setStateSafe("idle"); scheduleAssistantClose(10000); return;
+    }
+    const mode = actionMode();
+    if (mode === "off") {
+      setAiReply("Screen actions are off. Turn them on in settings to let me do this.");
+      setStateSafe("idle"); scheduleAssistantClose(10000); return;
+    }
+    if (mode === "ask") {
+      const ok = await askCuStart(goal);
+      if (!ok) { setAiReply("Okay, I won't touch your screen."); setStateSafe("idle"); scheduleAssistantClose(8000); return; }
+    }
+
+    cuAbortRef.current = false;
+    cuActiveRef.current = true; setCuActive(true);
+    setStateSafe("responding");
+    const history: string[] = [];
+    const MAX_STEPS = 10;
+    let finished = false;
+    try {
+      for (let step = 0; step < MAX_STEPS; step++) {
+        if (cuAbortRef.current) break;
+        let shot: { b64: string; shot_w: number; shot_h: number; real_w: number; real_h: number; off_x: number; off_y: number };
+        try { shot = JSON.parse(await invoke<string>("capture_screen_full")); }
+        catch { setAiReply("I couldn't capture your screen."); break; }
+        if (cuAbortRef.current) break;
+        let actionRaw: string;
+        try {
+          actionRaw = await invoke<string>("cu_step", { args: {
+            provider, credential, accountId, isSubscription: isSub, model: cuModel, effort: cuEffort,
+            goal, screenshotB64: shot.b64, shotW: shot.shot_w, shotH: shot.shot_h,
+            history: history.slice(-8).join(" -> "),
+          } });
+        } catch (e) { setAiReply(`Screen agent stopped: ${String(e).slice(0, 140)}`); break; }
+        if (cuAbortRef.current) break;
+        let act: { action?: string; x?: number; y?: number; text?: string; key?: string; amount?: number; say?: string };
+        try { act = JSON.parse(actionRaw); } catch { setAiReply("I got a confusing response and stopped."); break; }
+        const say = act.say || "";
+        if (say && localStorage.getItem("keak_show_captions") !== "0") setAiReply(say);
+        if (act.action === "done") { finished = true; break; }
+
+        // Map model coordinates (in the downscaled screenshot) back to real screen pixels.
+        const sx = shot.real_w / Math.max(1, shot.shot_w);
+        const sy = shot.real_h / Math.max(1, shot.shot_h);
+        const rx = Math.round((act.x || 0) * sx) + shot.off_x;
+        const ry = Math.round((act.y || 0) * sy) + shot.off_y;
+        try {
+          if (act.action === "click") await invoke("mouse_click", { x: rx, y: ry });
+          else if (act.action === "double_click") await invoke("mouse_click", { x: rx, y: ry, double: true });
+          else if (act.action === "right_click") await invoke("mouse_click", { x: rx, y: ry, button: "right" });
+          else if (act.action === "type") await invoke("type_text", { text: act.text || "" });
+          else if (act.action === "key") await invoke("press_key", { combo: act.key || "enter" });
+          else if (act.action === "scroll") await invoke("mouse_scroll", { amount: act.amount || 5 });
+          else if (act.action === "wait") await new Promise((r) => setTimeout(r, 800));
+        } catch (e) { setAiReply(`That action failed: ${String(e).slice(0, 100)}`); break; }
+        history.push(`${act.action}${act.x != null ? `(${act.x},${act.y})` : ""}`);
+        await new Promise((r) => setTimeout(r, 750)); // let the screen settle before the next shot
+      }
+    } finally {
+      cuActiveRef.current = false; setCuActive(false);
+    }
+    const done = cuAbortRef.current ? "Stopped." : finished ? "Done." : "I did what I could — take a look at the screen.";
+    historyRef.current.push({ role: "user", text: goal }, { role: "assistant", text: done });
+    if (localStorage.getItem("keak_show_captions") !== "0") setAiReply(done);
+    setStateSafe("idle"); scheduleAssistantClose(9000);
+  }
+
+  // Answer a normal Keak AI question using the user's OWN connected model (via the Rust cu_chat brain).
+  // Returns true if it answered, false to fall back to the hosted keak-assistant path.
+  async function answerWithOwnAI(question: string, token: string): Promise<{ answered: boolean; error?: string }> {
+    const provider = localStorage.getItem("keak_cu_provider") || "";
+    let credential = "", accountId = "", isSub = false;
+    if (provider === "openai") {
+      const sub = localStorage.getItem("keak_cu_openai_token") || "";
+      if (sub) { credential = sub; accountId = localStorage.getItem("keak_cu_openai_account") || ""; isSub = true; }
+      else credential = localStorage.getItem("keak_cu_openai_key") || "";
+    } else if (provider === "gemini") {
+      credential = localStorage.getItem("keak_cu_gemini_key") || "";
+    } else if (provider === "claude") {
+      credential = localStorage.getItem("keak_cu_claude_token") || "";
+    } else if (provider === "ollama") {
+      credential = "local";
+    } else if (provider === "copilot") {
+      credential = localStorage.getItem("keak_cu_copilot_token") || "";
+    } else {
+      credential = localStorage.getItem(`keak_cu_${provider}_key`) || ""; // deepseek, mistral, xai
+    }
+    if (!credential) return { answered: false, error: `no ${provider} token found — reconnect in Connect your AI` };
+    const chatModel = cleanModel(provider, localStorage.getItem(`keak_cu_${provider}_model`) || "");
+    // Spoken chat doesn't need deep thinking — default Claude to low effort so it replies much faster (the
+    // user can still raise it in Settings or by voice). This is the biggest speed win for Claude answers.
+    const chatEffort = provider === "claude" ? (localStorage.getItem("keak_cu_claude_effort") || "low") : "";
+
+    const assistantName = localStorage.getItem("keak_assistant_name") || "Keak";
+    const userName = localStorage.getItem("keak_user_name") || "there";
+    // Tell Keak about its own agent team so it can answer "how many agents do I have / their names + roles".
+    const team = [...effectiveDefaults(), ...readAgentRoster()];
+    const teamInfo = team.map((a) => `${a.name} (${a.description || "general help"})`).join("; ");
+    const brainCtx = await getBrainContext();
+    // Follow the interface language: reply in the chosen UI language by default, but still mirror the user if
+    // they clearly write in another language.
+    const UILN: Record<string, string> = { es: "Spanish", fr: "French", de: "German", pt: "Portuguese", it: "Italian", en: "English" };
+    const uiCode = localStorage.getItem("keak_ui_lang") || "en";
+    const langLine = uiCode !== "en" && UILN[uiCode] ? ` Always reply in ${UILN[uiCode]} unless the user clearly writes to you in another language, then reply in that language.` : "";
+    const system = `You are ${assistantName}, a friendly voice assistant talking to ${userName}. Your reply is read ALOUD, so keep it concise and spoken, usually 1 to 3 sentences. Plain text only, no markdown. When the user explicitly asks you to list something (like your agents), you may give a short plain list. You have a team of ${team.length} agents the user can call on: ${teamInfo}. If asked about your agents or team, tell them how many there are and their names and roles from that list, do NOT say you have no access. To put them to work, the user says "use your team to..." or calls one by name, like "Sirius, research X".${langLine} ${personaLines()}${brainCtx ? `\n\nContext about ${userName} from their Second Brain (use it to be accurate and personal; never read it aloud verbatim):\n${brainCtx}` : ""}`;
+    // Claude requires messages that start with "user" and strictly alternate. Trim any leading assistant
+    // turn and trailing user turn from recent history before we append the new question, or Claude 400s.
+    let hist = historyRef.current.slice(-4); // fewer turns = fewer tokens = it starts answering sooner
+    while (hist.length && hist[0].role === "assistant") hist = hist.slice(1);
+    while (hist.length && hist[hist.length - 1].role === "user") hist = hist.slice(0, -1);
+    const history = hist.map((h) => ({ role: h.role === "assistant" ? "assistant" : "user", content: h.text }));
+    let reply = "";
+    const callChat = (m: string) => invoke<string>("cu_chat", { args: { provider, credential, accountId, isSubscription: isSub, model: m, effort: chatEffort, system, history, message: question } });
+    try {
+      reply = await callChat(chatModel);
+    } catch (e) {
+      const msg = String(e);
+      // Claude's subscription throttles Opus/Sonnet far harder than Haiku. On a rate-limit, auto-retry on
+      // Haiku so even a basic question still gets answered instead of failing.
+      if (/\b429\b|rate.?limit/i.test(msg) && provider === "claude" && !chatModel.includes("haiku")) {
+        try { reply = await callChat("claude-haiku-4-5"); }
+        catch (e2) { return { answered: false, error: String(e2).slice(0, 180) }; }
+      } else {
+        return { answered: false, error: msg.slice(0, 180) };
+      }
+    }
+    reply = cleanReply(reply || "");
+    if (!reply) return { answered: false, error: "your AI returned an empty reply" };
+    historyRef.current.push({ role: "user", text: question }, { role: "assistant", text: reply });
+    // Substantial answers Keak AI makes also land in the Work log (not just agent runs).
+    if (reply.length > 160) {
+      try {
+        const prev = JSON.parse(localStorage.getItem("keak_agent_history") || "[]");
+        const h = Array.isArray(prev) ? prev : [];
+        h.unshift({ ts: Date.now(), job: question, results: [{ name: "Keak AI", title: "Answer", output: reply, color: "#C68B7E" }] });
+        localStorage.setItem("keak_agent_history", JSON.stringify(h.slice(0, 20)));
+      } catch { /* ignore */ }
+    }
+    let shown = false;
+    const show = () => { if (shown) return; shown = true; setAiReply(reply); setStateSafe("idle"); };
+    const safety = window.setTimeout(show, 15000);
+    try { await speakReply(reply, token, () => { clearTimeout(safety); show(); }); }
+    finally { clearTimeout(safety); show(); if (stateRef.current === "idle") scheduleAssistantClose(12000); }
+    return { answered: true };
+  }
+
+  // Just SHOW the whole team on screen (no work). Lights up an orb for every agent, names them out loud.
+  async function showAllAgents(token: string) {
+    const all = allAgents();
+    setAssistant(true); assistantVisibleRef.current = true; cancelAssistantClose();
+    setShowAgentPanel(false); setAgentResults([]);
+    setStateSafe("responding");
+    writeAgentState(all.map((a) => ({ name: a.name, status: "working", color: a.color })));
+    try { await invoke("show_agents"); } catch (e) { console.log("[KEAK] show_agents failed:", String(e)); }
+    // Settle them after a beat so they drift calmly, and keep them on screen a while.
+    window.setTimeout(() => all.forEach((a) => updateAgentStatus(a.name, "done")), 1600);
+    window.setTimeout(() => { try { invoke("hide_agents"); } catch { /* ignore */ } writeAgentState([]); }, 9000);
+    const names = all.map((a) => a.name);
+    const who = names.length > 1 ? `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}` : names[0] || "no one yet";
+    const summary = cleanReply(`Here's the whole team: ${who}. ${all.length} agents ready.`);
+    historyRef.current.push({ role: "user", text: "show me the agents" }, { role: "assistant", text: summary });
+    let shown = false;
+    const show = () => { if (shown) return; shown = true; setAiReply(summary); setStateSafe("idle"); };
+    const safety = window.setTimeout(show, 12000);
+    try { await speakReply(summary, token, () => { clearTimeout(safety); show(); }); }
+    finally { clearTimeout(safety); show(); scheduleAssistantClose(11000); }
+  }
+
+  // Speak a short reply + close (shared by the Gmail/Drive handlers).
+  async function sayAndClose(spoken: string, token: string, closeMs = 11000) {
+    const line = cleanReply(spoken);
+    historyRef.current.push({ role: "assistant", text: line });
+    setAssistant(true); assistantVisibleRef.current = true; cancelAssistantClose();
+    let shown = false; const show = () => { if (shown) return; shown = true; setAiReply(line); setStateSafe("idle"); };
+    const safety = window.setTimeout(show, 15000);
+    try { await speakReply(line, token, () => { clearTimeout(safety); show(); }); }
+    finally { clearTimeout(safety); show(); if (stateRef.current === "idle") scheduleAssistantClose(closeMs); }
+  }
+
+  // Read the user's Gmail out loud (unread inbox, top few).
+  async function readGmail(token: string) {
+    setStateSafe("responding"); setAiReply("Checking your inbox...");
+    const gtoken = await ensureGoogleToken();
+    if (!gtoken) { await sayAndClose("Connect Google first in Keak settings to read your email.", token); return; }
+    try {
+      const raw = await invoke<string>("gmail_list", { args: { accessToken: gtoken, query: "in:inbox is:unread", max: 5 } });
+      const msgs = JSON.parse(raw) as { from: string; subject: string; snippet: string }[];
+      if (!Array.isArray(msgs) || msgs.length === 0) { await sayAndClose("Your inbox is clear, no unread emails.", token); return; }
+      const nameOf = (from: string) => (from.match(/^\s*"?([^"<]+?)"?\s*</) || [])[1]?.trim() || from.replace(/<.*>/, "").trim() || from;
+      const lines = msgs.slice(0, 4).map((m) => `From ${nameOf(m.from)}: ${m.subject || "(no subject)"}.`);
+      const spoken = `You have ${msgs.length} unread. ${lines.join(" ")}`;
+      await sayAndClose(spoken, token, 16000);
+    } catch (e) { await sayAndClose(`Couldn't read Gmail: ${String(e).slice(0, 120)}`, token); }
+  }
+
+  // Send an email via Gmail, or Outlook (Microsoft) when Google isn't connected.
+  async function sendGmail(parsed: { to: string; subject: string; body: string }, token: string) {
+    setStateSafe("responding"); setAiReply(`Sending an email to ${parsed.to}...`);
+    const gtoken = localStorage.getItem("keak_google_refresh") ? await ensureGoogleToken() : null;
+    if (gtoken) {
+      try {
+        await invoke("gmail_send", { args: { accessToken: gtoken, to: parsed.to, subject: parsed.subject, body: parsed.body, threadId: "" } });
+        await sayAndClose(`Sent your email to ${parsed.to}.`, token);
+      } catch (e) { await sayAndClose(`Couldn't send it: ${String(e).slice(0, 120)}`, token); }
+      return;
+    }
+    if (msConnected()) {
+      const mtoken = await ensureMsToken();
+      if (!mtoken) { await sayAndClose("Connect Microsoft first to send email.", token); return; }
+      try {
+        await invoke("ms_mail_send", { args: { accessToken: mtoken, to: parsed.to, subject: parsed.subject, body: parsed.body } });
+        await sayAndClose(`Sent your email to ${parsed.to}.`, token);
+      } catch (e) { await sayAndClose(`Couldn't send it: ${String(e).slice(0, 120)}`, token); }
+      return;
+    }
+    await sayAndClose("Connect Google or Microsoft first to send email.", token);
+  }
+
+  // Save the last thing Keak/its agents made to Google Drive, or OneDrive when Google isn't connected.
+  async function saveLastToDrive(token: string) {
+    setStateSafe("responding"); setAiReply("Saving to your Drive...");
+    const useGoogle = !!localStorage.getItem("keak_google_refresh");
+    const dtoken = useGoogle ? await ensureGoogleToken() : (msConnected() ? await ensureMsToken() : null);
+    if (!dtoken) { await sayAndClose("Connect Google or Microsoft first to save your files.", token); return; }
+    try {
+      const hist = JSON.parse(localStorage.getItem("keak_agent_history") || "[]");
+      const run = Array.isArray(hist) ? hist[0] : null;
+      const res = run?.results?.[0];
+      if (!res?.output) { await sayAndClose("There's nothing to save yet. Ask the team to make something first.", token); return; }
+      const isHtml = /^\s*<!doctype html|^\s*<html[\s>]/i.test(String(res.output).trim());
+      const base = (res.title || run.job || "keak").replace(/[^a-z0-9]+/gi, "-").toLowerCase().slice(0, 40);
+      const name = `${base}.${isHtml ? "html" : "txt"}`;
+      const mime = isHtml ? "text/html" : "text/plain";
+      if (useGoogle) {
+        const raw = await invoke<string>("drive_create", { args: { accessToken: dtoken, name, mime, content: res.output } });
+        const r = JSON.parse(raw);
+        if (r.webViewLink) { try { await invoke("open_url", { url: r.webViewLink }); } catch { /* ignore */ } }
+        await sayAndClose(`Saved ${res.title || "it"} to your Google Drive.`, token);
+      } else {
+        const raw = await invoke<string>("ms_drive_create", { args: { accessToken: dtoken, name, mime, content: res.output } });
+        const r = JSON.parse(raw);
+        if (r.webUrl) { try { await invoke("open_url", { url: r.webUrl }); } catch { /* ignore */ } }
+        await sayAndClose(`Saved ${res.title || "it"} to your OneDrive.`, token);
+      }
+    } catch (e) { await sayAndClose(`Couldn't save your file: ${String(e).slice(0, 120)}`, token); }
+  }
+
+  // Supabase "do anything": the user's own AI turns the request into a PostgREST call, then we run it with
+  // the stored service key. Covers query / insert / update / delete on the user's own tables.
+  // Run one routine: do its instructions on the user's own AI (with research first if it's allowed Perplexity),
+  // log it to Work, and deliver the result to the chosen channel.
+  async function runRoutine(r: Routine) {
+    const fallback = resolveOwnAI();
+    if (!fallback) return; // no AI connected — skip quietly, it'll run next time
+    // Run on the specific model the user chose for this routine (e.g. "claude|claude-haiku-4-5"), else default AI.
+    const ai = r.modelChoice ? resolveChoice(r.modelChoice, fallback) : fallback;
+    const tools = r.tools || [];
+    let research = "";
+    if (tools.includes("perplexity")) {
+      const rr = await askPerplexity(r.instructions);
+      if (rr) research = rr;
+    }
+    const sys = "You are running a scheduled routine for the user. Do exactly what the instructions ask and return ONLY the finished result as clean, useful text ready to read or send. Be well structured and concise. If given live research findings, use them.";
+    const msg = research ? `${r.instructions}\n\nLive research findings:\n${research}` : r.instructions;
+    let out = "";
+    try { out = await askOwnAIRaw(ai, sys, msg); } catch (e) { out = `This routine hit an error: ${String(e).slice(0, 160)}`; }
+    out = cleanReply(out || "").trim() || "(no output)";
+    setRoutineRun(r.id, Date.now(), out);
+    try {
+      const prev = JSON.parse(localStorage.getItem("keak_agent_history") || "[]");
+      const h = Array.isArray(prev) ? prev : [];
+      h.unshift({ ts: Date.now(), job: r.name, results: [{ name: "Routine", title: r.name, output: out, color: "#B8955A" }] });
+      localStorage.setItem("keak_agent_history", JSON.stringify(h.slice(0, 20)));
+    } catch { /* ignore */ }
+    await deliverRoutine(r, out);
+  }
+  async function deliverRoutine(r: Routine, out: string) {
+    const body = `${r.name}\n\n${out}`;
+    if (r.output === "telegram") {
+      const tk = localStorage.getItem("keak_telegram_token") || "";
+      const chatId = localStorage.getItem("keak_telegram_chat") || "";
+      if (tk && chatId) { try { await invoke("telegram_send", { args: { token: tk, chatId, text: body.slice(0, 3900) } }); } catch { /* ignore */ } }
+    } else if (r.output === "email") {
+      const to = (r.outputTarget || "").trim();
+      if (to) { await sendViaResend(to, `Keak routine: ${r.name}`, out); }
+    } else {
+      // "keak": pop the orb with the result (it's also in the Work log).
+      setAssistant(true); assistantVisibleRef.current = true; cancelAssistantClose();
+      setAgentResults([{ name: "Routine", title: r.name, output: out.slice(0, 4000), color: "#B8955A" }]);
+      setAiReply(`${r.name}: ${out}`.slice(0, 400));
+      setStateSafe("idle"); scheduleAssistantClose(20000);
+    }
+  }
+
+  // Send the user a one-off message on Telegram right now. Returns true if it handled the request.
+  async function sendMessageMe(question: string, token: string): Promise<boolean> {
+    // Work out the message body: use the words after "saying/that says/message …", else have the AI compose one.
+    let body = "";
+    const m = question.match(/\b(?:saying|that says?|which says?|with the message|message[:]?|:)\s*([\s\S]+)$/i);
+    if (m && m[1].trim().length > 1) body = m[1].trim();
+    if (!body) {
+      const ai = resolveOwnAI();
+      if (ai) { try { body = cleanReply(await askOwnAIRaw(ai, "The user wants to send THEMSELVES a short message on a chat app. Reply with ONLY the message text to send — no quotes, no preamble, no explanation. If they specified the wording, use it exactly; otherwise write a short friendly message that matches the request.", question)).trim(); } catch { /* ignore */ } }
+    }
+    if (!body) body = "Hello from Keak!";
+
+    const tk = localStorage.getItem("keak_telegram_token") || "";
+    const chatId = localStorage.getItem("keak_telegram_chat") || "";
+    if (!tk || !chatId) { await sayAndClose("Connect Telegram first, then I can message you there.", token); return true; }
+    try { await invoke("telegram_send", { args: { token: tk, chatId, text: body.slice(0, 3900) } }); await sayAndClose("Sent it to your Telegram.", token); }
+    catch (e) { await sayAndClose(`Telegram didn't accept it. ${String(e).slice(0, 120)}`, token); }
+    return true;
+  }
+
+  // Answer a YouTube question using the connected Google account's YouTube Data API (read-only). The AI turns
+  // the question into an endpoint+params, Keak fetches, then the AI reads the JSON back as a short spoken answer.
+  async function youtubeDo(question: string, token: string) {
+    const ai = resolveOwnAI();
+    if (!ai) { await sayAndClose("Connect your own AI first so I can answer about YouTube.", token); return; }
+    const gtoken = await ensureGoogleToken();
+    if (!gtoken) { await sayAndClose("Connect your Google account first so I can reach YouTube.", token); return; }
+    setAssistant(true); assistantVisibleRef.current = true; cancelAssistantClose(); setStateSafe("responding");
+    const sys = `Turn the user's YouTube question into ONE YouTube Data API v3 GET call as strict minified JSON: {"path":"<endpoint>","query":"<url-encoded query string>"}. Endpoints: channels, search, videos, playlists, playlistItems, commentThreads. For the user's OWN channel use channels with mine=true. URL-encode values (spaces as %20). Examples: my channel stats -> {"path":"channels","query":"part=snippet,statistics&mine=true"}; my latest videos -> {"path":"search","query":"part=snippet&forMine=true&type=video&order=date&maxResults=5"}; search youtube for cats -> {"path":"search","query":"part=snippet&type=video&maxResults=5&q=cats"}. Return ONLY the JSON.`;
+    let spec: { path?: string; query?: string } | null = null;
+    try { const raw = await askOwnAIRaw(ai, sys, question); const m = raw.match(/\{[\s\S]*\}/); if (m) spec = JSON.parse(m[0]); } catch { /* ignore */ }
+    if (!spec || !spec.path) { await sayAndClose("I couldn't work out that YouTube request.", token); return; }
+    let data = "";
+    try { data = await invoke<string>("youtube_get", { args: { accessToken: gtoken, path: String(spec.path), query: String(spec.query || "") } }); }
+    catch (e) { await sayAndClose(`YouTube said: ${String(e).slice(0, 150)}`, token); return; }
+    let answer = "";
+    try { answer = cleanReply(await askOwnAIRaw(ai, "You are Keak, answering a YouTube question ALOUD. Given the raw YouTube API JSON, answer the user's question in 1 to 3 short spoken sentences with the real numbers/titles. Plain text, no markdown.", `Question: ${question}\n\nYouTube API result:\n${data.slice(0, 4500)}`)).trim(); } catch { /* ignore */ }
+    if (!answer) answer = "I got the YouTube data but couldn't summarize it.";
+    await sayAndClose(answer, token);
+  }
+
+  async function supabaseDo(question: string, token: string) {
+    const url = localStorage.getItem("keak_supabase_url") || "";
+    const key = localStorage.getItem("keak_supabase_key") || "";
+    const ai = resolveOwnAI();
+    if (!ai) { await sayAndClose("Connect your own AI first so I can build the query.", token); return; }
+    setAssistant(true); assistantVisibleRef.current = true; cancelAssistantClose();
+    setStateSafe("responding"); setAiReply("Working with your Supabase...");
+    let schema = "{}";
+    try { schema = await invoke<string>("supabase_schema", { args: { url, key } }); } catch { /* ignore */ }
+    const sys = `You turn a request into ONE Supabase PostgREST REST call. Tables and columns (JSON): ${schema}. Reply ONLY JSON {"method":"GET|POST|PATCH|DELETE","path":"relative to /rest/v1/, e.g. users?select=*&status=eq.active","body":"JSON string for POST/PATCH else empty","summary":"one short sentence of what it does"}. Use PostgREST syntax: filters like id=eq.3, name=ilike.*bob*, order=created_at.desc, limit=5. For insert use POST with path=table name and body a JSON object. No prose, no code fences.`;
+    let action: any;
+    try { const raw = await askOwnAIRaw(ai, sys, question); const m = raw.match(/\{[\s\S]*\}/); if (m) action = JSON.parse(m[0]); } catch { /* ignore */ }
+    if (!action || !action.method || !action.path) { await sayAndClose("I couldn't turn that into a database action.", token); return; }
+    // Destructive ops (delete / update) always ask first — the service key bypasses row-level security.
+    const method = String(action.method).toUpperCase();
+    if (method === "DELETE" || method === "PATCH") {
+      const label = action.summary || `${method} on ${action.path}`;
+      const ok = await askCuStart(`Confirm this change to your database: ${label}`);
+      if (!ok) { await sayAndClose("Okay, I left your database untouched.", token); return; }
+    }
+    try {
+      const res = await invoke<string>("supabase_rest", { args: { url, key, method: action.method, path: action.path, body: action.body || "" } });
+      let note = action.summary || "Done.";
+      try { const parsed = JSON.parse(res); if (Array.isArray(parsed)) note = `${action.summary || "Done"}. ${parsed.length} row${parsed.length === 1 ? "" : "s"}.`; } catch { /* ignore */ }
+      setAgentResults([{ name: "Supabase", title: action.summary || "Query", output: res.slice(0, 4000), color: "#8FA47D" }]);
+      await sayAndClose(cleanReply(note), token, 14000);
+    } catch (e) { await sayAndClose(`Supabase error: ${String(e).slice(0, 140)}`, token); }
+  }
+
+  // Second Brain OS "do anything": the user's own AI turns the request into ONE filesystem action inside the
+  // connected folder (list, read, write, mkdir, delete, search). Permission level is enforced in Rust too, and
+  // any write/delete asks first. This is what lets Keak read all your folders, create skills/files, edit, etc.
+  async function brainDo(question: string, token: string) {
+    const root = localStorage.getItem("keak_brain_path") || "";
+    const perm = localStorage.getItem("keak_brain_perm") || "full";
+    const ai = resolveOwnAI();
+    if (!ai) { await sayAndClose("Connect your own AI first so I can work with your Second Brain.", token); return; }
+    setAssistant(true); assistantVisibleRef.current = true; cancelAssistantClose();
+    setStateSafe("responding"); setAiReply("Working in your Second Brain...");
+    let tree = "[]";
+    try { tree = await invoke<string>("sb_tree", { args: { root, maxDepth: 2, maxEntries: 400 } }); } catch { /* ignore */ }
+    const sys = `You turn a request into ONE action on the user's Second Brain folder (a local files/folders "operating system"). Its structure, relative paths (folders end with /): ${tree}. Reply ONLY JSON {"op":"list|read|write|mkdir|delete|search","path":"relative path from the root","content":"full file content for write, else empty","query":"for search, else empty","summary":"one short sentence of what it does"}. Rules: to CREATE A SKILL, write to AI/skills/<kebab-name>/SKILL.md. Put new projects under PROJECTS/, automations under AUTOMATIONS/. For write, "content" must be the COMPLETE file. Use "read" to look at a file, "list" to see a folder (path = folder or "" for the root), "search" to find things by keyword. No prose, no code fences.`;
+    let action: any;
+    try { const raw = await askOwnAIRaw(ai, sys, question); const m = raw.match(/\{[\s\S]*\}/); if (m) action = JSON.parse(m[0]); } catch { /* ignore */ }
+    if (!action || !action.op) { await sayAndClose("I couldn't turn that into a Second Brain action.", token); return; }
+    const op = String(action.op).toLowerCase();
+    const path = String(action.path || "");
+    const label = action.summary || `${op} ${path}`;
+    try {
+      if (op === "list") {
+        const res = await invoke<string>("sb_tree", { args: { root, maxDepth: path ? 3 : 2, maxEntries: 500 } });
+        const items = JSON.parse(res) as string[];
+        const shown = path ? items.filter((x) => x.startsWith(path.replace(/^\/+|\/+$/g, "") + "/")) : items;
+        setAgentResults([{ name: "Second Brain", title: label, output: shown.join("\n").slice(0, 4000), color: "#B8955A" }]);
+        await sayAndClose(cleanReply(`${action.summary || "Here's what I found"}. ${shown.length} item${shown.length === 1 ? "" : "s"}.`), token, 14000);
+        return;
+      }
+      if (op === "search") {
+        const res = await invoke<string>("sb_search", { args: { root, query: String(action.query || question), maxResults: 25 } });
+        const hits = JSON.parse(res) as { path: string; snippet: string }[];
+        setAgentResults([{ name: "Second Brain", title: label, output: hits.map((h) => `${h.path}${h.snippet ? `\n  ${h.snippet}` : ""}`).join("\n").slice(0, 4000), color: "#B8955A" }]);
+        await sayAndClose(cleanReply(`Found ${hits.length} match${hits.length === 1 ? "" : "es"} in your Second Brain.`), token, 14000);
+        return;
+      }
+      if (op === "read") {
+        const res = await invoke<string>("sb_read", { args: { root, path } });
+        setAgentResults([{ name: "Second Brain", title: path || label, output: res.slice(0, 6000), color: "#B8955A" }]);
+        await sayAndClose(cleanReply(action.summary || `Opened ${path}.`), token, 16000);
+        return;
+      }
+      // Writes / deletes: check permission intent locally, then always confirm before touching the disk.
+      if (op === "write" || op === "mkdir" || op === "delete") {
+        if (perm === "read") { await sayAndClose("Your Second Brain is set to read-only, so I didn't change anything.", token); return; }
+        const verb = op === "delete" ? "delete" : op === "mkdir" ? "create the folder" : "write";
+        const ok = await askCuStart(`Confirm: ${verb} ${path} in your Second Brain? (${label})`);
+        if (!ok) { await sayAndClose("Okay, I left your Second Brain untouched.", token); return; }
+        if (op === "write") {
+          const full = await invoke<string>("sb_write", { args: { root, path, content: String(action.content || ""), perm } });
+          setAgentResults([{ name: "Second Brain", title: label, output: `Saved:\n${full}`, color: "#B8955A" }]);
+          await sayAndClose(cleanReply(action.summary || `Saved ${path}.`), token, 12000);
+        } else if (op === "mkdir") {
+          await invoke<string>("sb_mkdir", { args: { root, path, perm } });
+          await sayAndClose(cleanReply(action.summary || `Created the folder ${path}.`), token, 10000);
+        } else {
+          const res = await invoke<string>("sb_delete", { args: { root, path, perm } });
+          await sayAndClose(cleanReply(res), token, 10000);
+        }
+        return;
+      }
+      await sayAndClose("I couldn't tell what to do in your Second Brain.", token);
+    } catch (e) { await sayAndClose(`Second Brain error: ${String(e).slice(0, 160)}`, token); }
+  }
+
+  // Figma "do anything the API allows": the user's own AI turns the request into a Figma REST call (read files,
+  // export frames, read/post comments). Editing designs isn't possible via Figma's public REST API.
+  async function figmaDo(question: string, token: string) {
+    const ftoken = localStorage.getItem("keak_figma_token") || "";
+    const ai = resolveOwnAI();
+    if (!ai) { await sayAndClose("Connect your own AI first.", token); return; }
+    setAssistant(true); assistantVisibleRef.current = true; cancelAssistantClose();
+    setStateSafe("responding"); setAiReply("Working with your Figma...");
+    const sys = `You turn a request into ONE Figma REST API call. Base https://api.figma.com. Useful: GET /v1/me; GET /v1/files/:key; GET /v1/files/:key/nodes?ids=1:2; GET /v1/images/:key?ids=1:2&format=png; GET /v1/files/:key/comments; POST /v1/files/:key/comments with body {"message":"..."}. A file key is the token in a Figma URL after /file/ or /design/. The API is mostly read-only, you cannot edit designs. Reply ONLY JSON {"method":"GET|POST","path":"/v1/...","body":"JSON string or empty","summary":"one short sentence"}. No prose, no code fences.`;
+    let action: any;
+    try { const raw = await askOwnAIRaw(ai, sys, question); const m = raw.match(/\{[\s\S]*\}/); if (m) action = JSON.parse(m[0]); } catch { /* ignore */ }
+    if (!action || !action.path) { await sayAndClose("I couldn't turn that into a Figma action.", token); return; }
+    try {
+      const res = await invoke<string>("figma_api", { args: { token: ftoken, method: action.method || "GET", path: action.path, body: action.body || "" } });
+      let opened = false;
+      try {
+        const p: any = JSON.parse(res);
+        if (p.images && typeof p.images === "object") {
+          const first = Object.values(p.images).find((u) => typeof u === "string" && (u as string).startsWith("http"));
+          if (first) { await invoke("open_url", { url: first as string }); opened = true; }
+        }
+      } catch { /* ignore */ }
+      setAgentResults([{ name: "Figma", title: action.summary || "Figma", output: res.slice(0, 4000), color: "#C68B7E" }]);
+      await sayAndClose(cleanReply((action.summary || "Done") + (opened ? ", I opened the export." : ".")), token, 14000);
+    } catch (e) { await sayAndClose(`Figma error: ${String(e).slice(0, 140)}`, token); }
+  }
+
+  // GitHub "do anything": the user's own AI turns the request into a GitHub REST call, Keak runs it.
+  async function githubDo(question: string, token: string) {
+    const ghtoken = localStorage.getItem("keak_github_token") || "";
+    const ai = resolveOwnAI();
+    if (!ai) { await sayAndClose("Connect your own AI first.", token); return; }
+    setAssistant(true); assistantVisibleRef.current = true; cancelAssistantClose();
+    setStateSafe("responding"); setAiReply("Working with your GitHub...");
+    const sys = `You turn a request into ONE GitHub REST API call. Base https://api.github.com. Examples: GET /user/repos?sort=updated&per_page=5; GET /repos/:owner/:repo/issues; POST /repos/:owner/:repo/issues with body {"title":"...","body":"..."}; GET /search/issues?q=...; POST /gists with body {"files":{"note.txt":{"content":"..."}},"public":false}. Reply ONLY JSON {"method":"GET|POST|PATCH|PUT|DELETE","path":"/...","body":"JSON string or empty","summary":"one short sentence"}. No prose, no code fences.`;
+    let action: any;
+    try { const raw = await askOwnAIRaw(ai, sys, question); const m = raw.match(/\{[\s\S]*\}/); if (m) action = JSON.parse(m[0]); } catch { /* ignore */ }
+    if (!action || !action.path) { await sayAndClose("I couldn't turn that into a GitHub action.", token); return; }
+    const method = String(action.method || "GET").toUpperCase();
+    if (["POST", "PATCH", "PUT", "DELETE"].includes(method) && actionMode() !== "off") {
+      const ok = await askCuStart(`Confirm on GitHub: ${action.summary || `${method} ${action.path}`}`);
+      if (!ok) { await sayAndClose("Okay, I didn't touch GitHub.", token); return; }
+    }
+    try {
+      const res = await invoke<string>("github_api", { args: { token: ghtoken, method, path: action.path, body: action.body || "" } });
+      setAgentResults([{ name: "GitHub", title: action.summary || "GitHub", output: res.slice(0, 4000), color: "#6E8FA0" }]);
+      await sayAndClose(cleanReply(action.summary || "Done."), token, 14000);
+    } catch (e) { await sayAndClose(`GitHub error: ${String(e).slice(0, 140)}`, token); }
+  }
+
+  // Shopify "do anything": AI turns the request into an Admin API call, Keak runs it.
+  async function shopifyDo(question: string, token: string) {
+    const shop = localStorage.getItem("keak_shopify_shop") || "";
+    const stoken = localStorage.getItem("keak_shopify_token") || "";
+    const ai = resolveOwnAI();
+    if (!ai) { await sayAndClose("Connect your own AI first.", token); return; }
+    setAssistant(true); assistantVisibleRef.current = true; cancelAssistantClose();
+    setStateSafe("responding"); setAiReply("Working with your Shopify store...");
+    const sys = `You turn a request into ONE Shopify Admin REST API call (version 2024-10). path is relative, e.g. "products.json?limit=5", "orders.json?status=any&limit=5", "customers/search.json?query=email:x@y.com". For create/update use POST/PUT with the documented JSON body (e.g. POST products.json with {"product":{"title":"..."}}). Reply ONLY JSON {"method":"GET|POST|PUT|DELETE","path":"...","body":"JSON string or empty","summary":"one short sentence"}. No prose, no code fences.`;
+    let action: any;
+    try { const raw = await askOwnAIRaw(ai, sys, question); const m = raw.match(/\{[\s\S]*\}/); if (m) action = JSON.parse(m[0]); } catch { /* ignore */ }
+    if (!action || !action.path) { await sayAndClose("I couldn't turn that into a Shopify action.", token); return; }
+    const method = String(action.method || "GET").toUpperCase();
+    if (["POST", "PUT", "DELETE"].includes(method) && actionMode() !== "off") {
+      const ok = await askCuStart(`Confirm on your store: ${action.summary || `${method} ${action.path}`}`);
+      if (!ok) { await sayAndClose("Okay, I left your store as it was.", token); return; }
+    }
+    try {
+      const res = await invoke<string>("shopify_api", { args: { shop, token: stoken, method, path: action.path, body: action.body || "" } });
+      setAgentResults([{ name: "Shopify", title: action.summary || "Shopify", output: res.slice(0, 4000), color: "#5E8C4A" }]);
+      await sayAndClose(cleanReply(action.summary || "Done."), token, 14000);
+    } catch (e) { await sayAndClose(`Shopify error: ${String(e).slice(0, 140)}`, token); }
+  }
+
+  // Gumloop: trigger the user's saved flow.
+  async function runGumloop(question: string, token: string) {
+    const key = localStorage.getItem("keak_gumloop_key") || "";
+    const userId = localStorage.getItem("keak_gumloop_user") || "";
+    const flow = localStorage.getItem("keak_gumloop_flow") || "";
+    if (!flow || !userId) { await sayAndClose("Add your Gumloop user ID and flow ID in settings first.", token); return; }
+    setAssistant(true); assistantVisibleRef.current = true; cancelAssistantClose();
+    setStateSafe("responding"); setAiReply("Starting your Gumloop flow...");
+    try {
+      await invoke("gumloop_start", { args: { apiKey: key, userId, savedItemId: flow, inputs: JSON.stringify({ request: question }) } });
+      await sayAndClose("Started your Gumloop flow.", token);
+    } catch (e) { await sayAndClose(`Gumloop error: ${String(e).slice(0, 140)}`, token); }
+  }
+
+  // Answer a Telegram message from the phone. Uses the API tools (which return URLs/text) when named, else
+  // answers with the connected AI. Returns the text to send back. (Screen control + agents stay desktop-only.)
+  async function answerForTelegram(text: string): Promise<string> {
+    const ai = resolveOwnAI();
+    if (toolKey("perplexity") && (/^\s*(research|look up|investiga|busca)/i.test(text) || /\bperplexity\b/i.test(text))) {
+      const r = await askPerplexity(text); return r || "Couldn't reach Perplexity.";
+    }
+    if (toolKey("gamma") && /\b(deck|slides?|presentation|gamma)\b/i.test(text)) {
+      const u = await makeDeck(text.slice(0, 1500)); return looksLikeUrl(u) ? `Deck ready: ${u}` : `Couldn't build the deck. ${u || ""}`;
+    }
+    if (toolKey("heygen") && (/\bhey ?gen\b/i.test(text) || /\bvideo\b/i.test(text))) {
+      let s = text; if (ai) { try { s = await askOwnAIRaw(ai, "Write a 40-70 word spoken video script. Topic follows.", text) || text; } catch { /* keep */ } }
+      const u = await makeVideo(s.slice(0, 1200)); return looksLikeUrl(u) ? `Video ready: ${u}` : `Couldn't make the video. ${u || ""}`;
+    }
+    if (toolKey("higgsfield") && /\b(higgsfield|cinematic)\b/i.test(text)) {
+      const u = await runHiggsfield(text.slice(0, 1000)); return looksLikeUrl(u) ? u! : `Couldn't generate. ${u || ""}`;
+    }
+    if (toolKey("manus") && /\bmanus\b/i.test(text)) {
+      const u = await runManus(text.replace(/\bmanus\b/i, "").trim() || text); return looksLikeUrl(u) ? `Manus is on it: ${u}` : `Couldn't start Manus. ${u || ""}`;
+    }
+    if ((toolKey("n8n") || toolKey("zapier")) && /\b(automation|workflow|zap|webhook)\b/i.test(text)) {
+      const ok = await fireAutomation(text); return ok ? "Triggered your automation." : "Couldn't reach the webhook.";
+    }
+    if (ai) {
+      try { return await askOwnAIRaw(ai, "You are Keak, answering the user over Telegram from their computer. Be concise and helpful.", text); }
+      catch (e) { return `Error: ${String(e).slice(0, 140)}`; }
+    }
+    return "Connect your own AI in Keak first so I can answer from your phone.";
+  }
+
+  // Calendar via the Google API when connected. Tries the quick regex, then asks the AI to extract the event
+  // (title + start/end) so vague phrasing still works — and it NEVER falls through to screen control.
+  async function tryGoogleCalendar(question: string, token: string): Promise<boolean> {
+    if (!localStorage.getItem("keak_google_refresh") && !msConnected()) return false;
+    if (!isCalendarIntent(question)) return false;
+    let ev = parseCalendarEvent(question);
+    if (!ev) {
+      const ai = resolveOwnAI();
+      if (ai) {
+        const now = new Date();
+        const sys = `Extract a calendar event from the user's request. "Now" is ${now.toString()}. Reply ONLY with JSON: {"title":"short title","start":"YYYY-MM-DDTHH:MM:SS","end":"YYYY-MM-DDTHH:MM:SS"} in the user's local time. If no end is given, make it one hour after start. If no time is given, use 09:00. No prose, no code fences.`;
+        try {
+          const raw = await askOwnAIRaw(ai, sys, question);
+          const m = raw.match(/\{[\s\S]*\}/);
+          if (m) {
+            const j = JSON.parse(m[0]);
+            const start = new Date(j.start);
+            if (!isNaN(start.getTime())) {
+              let end = j.end ? new Date(j.end) : new Date(start.getTime() + 3600000);
+              if (isNaN(end.getTime())) end = new Date(start.getTime() + 3600000);
+              ev = { title: String(j.title || "Event"), start, end };
+            }
+          }
+        } catch { /* ignore */ }
+      }
+    }
+    if (!ev) return false;
+    setAssistant(true); assistantVisibleRef.current = true; cancelAssistantClose();
+    setStateSafe("responding"); setAiReply("Adding it to your calendar...");
+    const link = await createEventAnyProvider(ev);
+    const when = ev.start.toLocaleString(undefined, { weekday: "long", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+    if (link) await sayAndClose(`Done, I added ${ev.title} to your calendar for ${when}.`, token);
+    else await sayAndClose("I couldn't add it to your calendar. Try reconnecting it in settings.", token);
+    return true;
+  }
+
+  // Delegate a big job to named star agents running on the user's own AI: plan → parallel work → synthesize.
+  async function runAgents(job: string, token: string, single?: { name: string; description: string; color: string; choice?: string; personality?: string; tools?: string[] }) {
+    const ai = resolveOwnAI();
+    if (!ai) { setAiReply("Connect your own AI first to use agents."); setStateSafe("idle"); scheduleAssistantClose(10000); return; }
+    setAssistant(true); assistantVisibleRef.current = true;
+    setShowAgentPanel(false); setAgentResults([]);
+    cancelAssistantClose();
+    setStateSafe("responding");
+    setAiReply(single ? `${single.name} is on it...` : "Planning it with the team...");
+    console.log("[KEAK] runAgents start:", JSON.stringify(job), single ? `(single: ${single.name})` : "");
+
+    try {
+      const teamDefault = localStorage.getItem("keak_agents_model_choice") || "";
+      let named: { name: string; color: string; desc: string; personality: string; choice: string; title: string; task: string; tools: string[] }[];
+      if (single) {
+        // The user called ONE agent by name — no decomposition, that agent does the whole job.
+        named = [{ name: single.name, color: single.color, desc: single.description, personality: single.personality || "", choice: single.choice || teamDefault, title: single.description || "Task", task: job, tools: single.tools || [] }];
+      } else {
+        // 1) Decompose the goal into 2 to 5 independent sub-tasks.
+        let subtasks: { title: string; task: string }[] = [];
+        try {
+          const planRaw = await askOwnAIRaw(ai,
+            "You are a project planner. Break the user's goal into 2 to 5 concrete, independent sub-tasks different specialists can each do alone. Reply with ONLY a JSON array like [{\"title\":\"short label\",\"task\":\"what to do\"}]. No prose, no code fences.",
+            job);
+          console.log("[KEAK] plan raw:", planRaw.slice(0, 300));
+          const m = planRaw.match(/\[[\s\S]*\]/);
+          if (m) subtasks = JSON.parse(m[0]);
+        } catch (e) { console.log("[KEAK] plan failed:", String(e)); }
+        if (!Array.isArray(subtasks) || subtasks.length === 0) subtasks = [{ title: "The task", task: job }];
+        // Use the user's own agent roster if they made one (their names, colours, specialities); otherwise
+        // the default star agents. Cap the number of sub-tasks to the team size so names stay unique.
+        const roster = readAgentRoster();
+        const defs = effectiveDefaults();
+        const cap = roster.length ? Math.min(roster.length, 6) : 4;
+        named = subtasks.slice(0, cap).map((s, i) => {
+          const custom = roster.length ? roster[i % roster.length] : null;
+          const def = defs[i % defs.length];
+          return {
+            name: custom ? custom.name : def.name,
+            color: custom ? custom.color : def.color,
+            desc: custom ? custom.description : def.description,
+            personality: (custom ? custom.personality : def.personality) || "",
+            // Which model this agent runs on: a custom agent's own pick, else this default agent's own pick,
+            // else the team default, else the main Keak AI.
+            choice: (custom && custom.choice) ? custom.choice : (def.choice || teamDefault),
+            title: String(s.title || `Part ${i + 1}`),
+            task: String(s.task || job),
+            tools: (custom ? custom.tools : def.tools) || [],
+          };
+        });
+      }
+
+      // 2) Light up the constellation (the fullscreen click-through orb window).
+      writeAgentState(named.map((n) => ({ name: n.name, status: "working", color: n.color })));
+      try { await invoke("show_agents"); } catch (e) { console.log("[KEAK] show_agents failed:", String(e)); }
+      setAiReply(named.length > 1 ? `${named.length} agents on it...` : "On it...");
+
+      // 3) Each agent does its sub-task on the user's own AI, ONE AT A TIME with a small gap. Subscription
+      // tokens rate-limit hard on bursts, so serial + backoff is far more reliable than firing all at once.
+      const results: { name: string; title: string; output: string; color: string }[] = [];
+      for (let i = 0; i < named.length; i++) {
+        const n = named[i];
+        const persona = (n.desc
+          ? `You are ${n.name}. Your speciality: ${n.desc}.`
+          : `You are ${n.name}, an expert agent on a team.`)
+          + (n.personality ? ` Personality and tone: ${n.personality}.` : "");
+        // Each agent runs on its own chosen model (possibly a different company), falling back to Keak AI's.
+        const workerAI = resolveChoice(n.choice, ai);
+        const workerPrompt = `${persona} Do your assigned sub-task fully and return only the finished result as clean, usable text. If it is something to build (a web page, a document), return the actual content ready to use. Be high quality and concise.`;
+        // If this agent is allowed to use Perplexity AND the request calls for research, pull live web
+        // research first and hand it the findings. (Only when asked, not on every run.)
+        let research = "";
+        if ((n.tools || []).includes("perplexity") && /\b(research|find|compare|best|latest|current|sources?|investiga|busca|compara|mejores|perplexity)\b/i.test(`${job} ${n.task}`)) {
+          setAiReply(`${n.name} is researching...`);
+          const r = await askPerplexity(`${job}\n\nSpecifically: ${n.task}`);
+          if (r) research = r;
+        }
+        const workerMsg = research
+          ? `Overall goal: ${job}\n\nYour sub-task (${n.title}): ${n.task}\n\nLive web research (from Perplexity — use it and keep the facts/links):\n${research}`
+          : `Overall goal: ${job}\n\nYour sub-task (${n.title}): ${n.task}`;
+        try {
+          let out = "";
+          try {
+            out = await askOwnAIRaw(workerAI, workerPrompt, workerMsg);
+          } catch (e) {
+            const em = String(e);
+            if (/\b429\b|rate.?limit/i.test(em) && workerAI.provider === "claude" && !workerAI.model.includes("haiku")) {
+              out = await askOwnAIRaw({ ...workerAI, model: "claude-haiku-4-5" }, workerPrompt, workerMsg);
+            } else throw e;
+          }
+          // An agent MAY use its assigned tools, but only when the request actually asks for that kind of
+          // output (not on every run). We gate each tool on a keyword in the overall job + this sub-task.
+          let produced = (out || "").trim();
+          const at = n.tools || [];
+          const ask = `${job} ${n.task}`.toLowerCase();
+          try {
+            if (at.includes("gamma") && /\b(deck|slides?|presentation|pitch|diapositiv|presentaci|gamma)\b/.test(ask)) { const u = await makeDeck(produced.slice(0, 1500)); if (looksLikeUrl(u)) produced += `\n\nDeck: ${u}`; }
+            else if (at.includes("heygen") && /\b(video|v[ií]deo|avatar|hey ?gen)\b/.test(ask)) { const u = await makeVideo(produced.slice(0, 1200)); if (looksLikeUrl(u)) produced += `\n\nVideo: ${u}`; }
+            else if (at.includes("higgsfield") && /\b(higgsfield|cinematic|image|imagen|visual|photo|foto)\b/.test(ask)) { const u = await runHiggsfield(produced.slice(0, 1000)); if (looksLikeUrl(u)) produced += `\n\nVisual: ${u}`; }
+            else if (at.includes("elevenlabs") && /\b(voice ?over|voiceover|narrat|voz|audio|read (?:it|this) aloud)\b/.test(ask)) { const p = await makeVoiceover(produced.slice(0, 2000)); if (looksLikePath(p)) produced += `\n\nVoiceover: ${p}`; }
+            else if (at.includes("manus") && /\bmanus\b/.test(ask)) { const u = await runManus(n.task); if (looksLikeUrl(u)) produced += `\n\nManus task: ${u}`; }
+            if (at.includes("slack") && /\bslack\b/.test(ask)) await postToSlack("#general", produced.slice(0, 1500));
+            if ((at.includes("n8n") || at.includes("zapier")) && /\b(automation|workflow|zap|webhook|n8n|zapier|automatizaci)\b/.test(ask)) await fireAutomation(produced.slice(0, 1500));
+          } catch { /* tools are best-effort */ }
+          results.push({ name: n.name, title: n.title, output: produced, color: n.color });
+        } catch (e) {
+          results.push({ name: n.name, title: n.title, output: `(couldn't finish: ${String(e).slice(0, 100)})`, color: n.color });
+        }
+        updateAgentStatus(n.name, "done");
+        setAgentResults([...results]);
+        if (i < named.length - 1) await new Promise((r) => setTimeout(r, 300)); // small breathe between calls
+      }
+
+      // Save this run to the persistent work log (shown in the Connect window's Work section).
+      try {
+        const prev = JSON.parse(localStorage.getItem("keak_agent_history") || "[]");
+        const hist = Array.isArray(prev) ? prev : [];
+        hist.unshift({ ts: Date.now(), job, results });
+        localStorage.setItem("keak_agent_history", JSON.stringify(hist.slice(0, 20)));
+      } catch { /* ignore */ }
+
+      // 4) Summary. Single agent → use its output directly (one less Claude call = fewer 429s). If every
+      // agent got rate-limited, say so plainly instead of a hollow "all done".
+      const anyOk = results.some((r) => !r.output.startsWith("(couldn't finish"));
+      let summary = "";
+      if (!anyOk) {
+        summary = "Your Claude is rate-limiting right now. Give it a minute, or switch to Haiku or a Gemini key, then try again.";
+      } else if (results.length === 1) {
+        // One agent: speak a short taste, the full result lives in the See it panel (keeps the good voice).
+        summary = shortSpoken(results[0].output);
+      } else {
+        // Multiple agents: Keak AI gives a real spoken summary of the team's work (Pep likes this). Keep it
+        // FAST — run the synthesis on a light model (Haiku / GPT-4o / Flash) at low effort, and no pre-pause,
+        // so it talks back quickly once the result is ready.
+        const fastAI: OwnAI = {
+          ...ai,
+          model: ai.provider === "claude" ? "claude-haiku-4-5" : ai.provider === "openai" ? "gpt-4o" : ai.model,
+          effort: "low",
+        };
+        // A local one-liner ready to speak instantly if the summary call fails or comes back empty.
+        const names = results.map((r) => r.name);
+        const uniq = names.filter((v, i) => names.indexOf(v) === i);
+        const who = uniq.length > 1 ? `${uniq.slice(0, -1).join(", ")} and ${uniq[uniq.length - 1]}` : uniq[0];
+        const fallback = `Done. ${who} finished. Tap See it to read everything they made.`;
+        try {
+          const s = await askOwnAIRaw(fastAI,
+            "You are the team lead. Given the sub-results, give the user a very short spoken summary: 2 to 3 sentences, under 50 words, plain text, no markdown. End by saying they can tap See it to read it all.",
+            results.map((r) => `${r.name} — ${r.title}:\n${r.output}`).join("\n\n"));
+          summary = shortSpoken(s) || fallback;
+        } catch { summary = fallback; }
+      }
+      summary = cleanReply(summary || "The team finished. Tap See it to read what they produced.");
+      historyRef.current.push({ role: "user", text: job }, { role: "assistant", text: summary });
+
+      // 5) Let the orbs shine a moment, then clear the constellation.
+      window.setTimeout(() => { try { invoke("hide_agents"); } catch { /* ignore */ } writeAgentState([]); }, 4200);
+
+      let shown = false;
+      const show = () => { if (shown) return; shown = true; setAiReply(summary); setStateSafe("idle"); };
+      const safety = window.setTimeout(show, 16000);
+      try { await speakReply(summary, token, () => { clearTimeout(safety); show(); }); }
+      finally { clearTimeout(safety); show(); scheduleAssistantClose(22000); }
+    } catch (e) {
+      console.log("[KEAK] runAgents error:", String(e));
+      try { await invoke("hide_agents"); } catch { /* ignore */ }
+      writeAgentState([]);
+      setAiReply(`The agents hit a snag: ${String(e).slice(0, 140)}`);
+      setStateSafe("idle"); scheduleAssistantClose(14000);
+    }
+  }
+
   async function confirmAction() {
     const pa = pendingAction;
     if (!pa) return;
@@ -1119,6 +3515,9 @@ export default function Overlay() {
     }
     streamRef.current?.getTracks().forEach((t) => t.stop());
     streamRef.current = null;
+    // Dismissing Keak AI also clears any agent orbs still on screen (don't leave them floating).
+    try { await invoke("hide_agents"); } catch { /* ignore */ }
+    writeAgentState([]);
     await invoke("hide_overlay");
     reset();
   }
@@ -1150,12 +3549,28 @@ export default function Overlay() {
 
   return (
     <div className="overlay-root">
+      {cuActive && (
+        <div
+          onClick={() => { cuAbortRef.current = true; }}
+          title="Click or press Esc to stop"
+          style={{
+            position: "absolute", top: 8, left: "50%", transform: "translateX(-50%)",
+            background: "#2C1508", color: "#F5EDD8", padding: "8px 14px", borderRadius: 10,
+            fontSize: 13, fontWeight: 600, whiteSpace: "nowrap", zIndex: 99999, cursor: "pointer",
+            border: "1px solid #D4A49A", boxShadow: "0 6px 20px rgba(44,21,8,0.35)",
+          }}
+        >
+          Keak is controlling your screen · press Esc or click to stop
+        </div>
+      )}
       {assistant && (
         <div className="assistant-orb-wrap" onClick={doClose} title="Click to dismiss">
           <div className={`orb orb--${state}`} />
           {state === "error" ? (
             <p className="ai-reply">{errorMsg}</p>
-          ) : aiReply ? (
+          ) : aiReply && localStorage.getItem("keak_show_captions") !== "0" ? (
+            // Captions can be turned off in settings; when off Keak still speaks, it just doesn't print
+            // the words. Errors above always show regardless (they aren't captions).
             <p className="ai-reply">{aiReply}</p>
           ) : (
             <span className="status-word">{statusWord}</span>
@@ -1169,8 +3584,51 @@ export default function Overlay() {
               </div>
             </div>
           )}
-          {state === "idle" && aiReply && !pendingAction && (
+          {cuConfirmGoal && (
+            <div className="action-confirm" onClick={(e) => e.stopPropagation()}>
+              <p className="action-summary">Let Keak control your screen to: {cuConfirmGoal}?</p>
+              <div className="action-buttons">
+                <button className="btn-confirm" onClick={(e) => { e.stopPropagation(); resolveCuStart(true); }}>Start</button>
+                <button className="btn-cancel" onClick={(e) => { e.stopPropagation(); resolveCuStart(false); }}>Cancel</button>
+              </div>
+            </div>
+          )}
+          {state === "idle" && aiReply && !pendingAction && !showAgentPanel && agentResults.length === 0 && (
             <span className="ai-hint">Hold Ctrl + Alt to reply</span>
+          )}
+          {agentResults.length > 0 && !showAgentPanel && (
+            <button className="see-it-btn" onClick={(e) => { e.stopPropagation(); cancelAssistantClose(); setShowAgentPanel(true); }}>
+              See it
+            </button>
+          )}
+          {showAgentPanel && (
+            <div className="agent-panel" onClick={(e) => e.stopPropagation()}>
+              <div className="agent-panel-head">
+                <span>What the team made</span>
+                <button className="agent-panel-close" onClick={() => { setShowAgentPanel(false); scheduleAssistantClose(12000); }}>Close</button>
+              </div>
+              <div className="agent-panel-body">
+                {agentResults.map((r, idx) => {
+                  const built = isHtmlArtifact(r.output);
+                  return (
+                    <div className="agent-result" key={r.name + idx}>
+                      <div className="agent-result-head">
+                        <span className="agent-result-name" style={r.color ? { color: "#3a2a12", background: hexToSoft(r.color) } : undefined}>{r.name}</span>
+                        <span className="agent-result-title">{r.title}</span>
+                        <span className="agent-result-done">✓ done</span>
+                      </div>
+                      <div className="agent-result-out"><RichText text={r.output} /></div>
+                      <button
+                        className={`agent-result-open${built ? " agent-result-open--go" : ""}`}
+                        onClick={() => openArtifact(`${r.name}-${r.title}`, r.output)}
+                      >
+                        {built ? "Open the result" : "Save & open as a file"}
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
           )}
           {attachedScreen && <span className="screen-sent">📸 screen sent</span>}
           {canSeeScreen && screenAllowed && (
@@ -1198,12 +3656,12 @@ export default function Overlay() {
           {state === "recording" ? (
             <div className="pill-live">
               <Waveform active streamRef={streamRef} />
-              <span className="pill-label">{rewriting ? "Rewrite" : thoughtDump ? "Thought Dump" : "Listening"}</span>
+              <span className="pill-label">{rewriting ? t("Rewrite") : thoughtDump ? t("Thought Dump") : t("Listening")}</span>
             </div>
           ) : state === "processing" ? (
             <div className="pill-live">
               <span className="thinking-dots"><i /><i /><i /></span>
-              <span className="pill-label">{rewriting ? "Rewriting" : "Thinking"}</span>
+              <span className="pill-label">{rewriting ? t("Rewriting") : t("Thinking")}</span>
             </div>
           ) : (
             <span className="pill-hint">{thoughtDump ? "Thought Dump on · click mic" : "Click mic to speak"}</span>
