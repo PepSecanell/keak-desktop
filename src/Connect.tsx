@@ -1322,7 +1322,7 @@ export default function Connect() {
     setTelegramToken(""); setTelegramConnected(false); setConnectMsg(t("Telegram disconnected."));
   }
 
-  // API-key tools (Perplexity, HeyGen, ElevenLabs, Gamma, Higgsfield, Zapier, n8n, Manus).
+  // API-key tools (Perplexity, HeyGen, ElevenLabs, Gamma, Higgsfield, Make, n8n, Manus).
   const [toolKeys, setToolKeys] = useState<Record<string, string>>(() => {
     const o: Record<string, string> = {}; AI_TOOLS.forEach((t) => { o[t.id] = getToolKey(t.id); }); return o;
   });

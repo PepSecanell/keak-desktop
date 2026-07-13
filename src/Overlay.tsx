@@ -625,9 +625,9 @@ async function makeVideo(script: string): Promise<string | null> {
   try { return await invoke<string>("heygen_video", { args: { apiKey: key, script, avatarId, voiceId } }); }
   catch (e) { console.log("[KEAK] heygen failed:", String(e)); return String(e); }
 }
-// Fire an n8n / Zapier webhook. Returns true on success. Prefers n8n, then Zapier. (Both are Catch-Hook URLs.)
+// Fire an n8n / Make webhook. Returns true on success. (Both are Catch-Hook / Custom-webhook URLs.)
 async function fireAutomation(text: string): Promise<boolean> {
-  const url = toolKey("n8n") || toolKey("zapier");
+  const url = toolKey("n8n") || toolKey("make");
   if (!url) return false;
   try { await invoke("webhook_post", { args: { url, text } }); return true; }
   catch (e) { console.log("[KEAK] webhook failed:", String(e)); return false; }
@@ -2082,7 +2082,7 @@ export default function Overlay() {
         return;
       }
 
-      // ---- Plug-in tool actions (ElevenLabs voiceover, Gamma deck, HeyGen video, n8n/Zapier automation) ----
+      // ---- Plug-in tool actions (ElevenLabs voiceover, Gamma deck, HeyGen video, n8n/Make automation) ----
       // The topic/text after a leading command verb + "about/of/on/that says" (or the whole thing).
       const subjectOf = (q: string) => {
         const m = q.match(/\b(?:about|of|on|that says?|saying|sobre|de|del|acerca de)\s+([\s\S]+)$/i);
@@ -2138,8 +2138,8 @@ export default function Overlay() {
         return;
       }
 
-      // n8n / Zapier automation: "trigger my automation", "run my zap", "dispara mi automatización".
-      if ((toolKey("n8n") || toolKey("zapier")) && /\b(trigger|run|fire|start|dispara|lanza|ejecuta)\b[\s\S]*\b(automation|workflow|zap|webhook|n8n|zapier|automatizaci[oó]n|flujo)\b|\b(automation|workflow|zap|webhook)\b[\s\S]*\b(trigger|run|fire)\b/i.test(question)) {
+      // n8n / Make automation: "trigger my automation", "run my scenario", "dispara mi automatización".
+      if ((toolKey("n8n") || toolKey("make")) && /\b(trigger|run|fire|start|dispara|lanza|ejecuta)\b[\s\S]*\b(automation|workflow|scenario|webhook|n8n|make|automatizaci[oó]n|flujo|escenario)\b|\b(automation|workflow|scenario|webhook)\b[\s\S]*\b(trigger|run|fire)\b/i.test(question)) {
         setAssistant(true); assistantVisibleRef.current = true; cancelAssistantClose();
         setStateSafe("responding"); setAiReply("Firing your automation...");
         const ok = await fireAutomation(subjectOf(question) || question);
@@ -3171,7 +3171,7 @@ export default function Overlay() {
     if (toolKey("manus") && /\bmanus\b/i.test(text)) {
       const u = await runManus(text.replace(/\bmanus\b/i, "").trim() || text); return looksLikeUrl(u) ? `Manus is on it: ${u}` : `Couldn't start Manus. ${u || ""}`;
     }
-    if ((toolKey("n8n") || toolKey("zapier")) && /\b(automation|workflow|zap|webhook)\b/i.test(text)) {
+    if ((toolKey("n8n") || toolKey("make")) && /\b(automation|workflow|scenario|webhook)\b/i.test(text)) {
       const ok = await fireAutomation(text); return ok ? "Triggered your automation." : "Couldn't reach the webhook.";
     }
     if (ai) {
@@ -3319,7 +3319,7 @@ export default function Overlay() {
             else if (at.includes("elevenlabs") && /\b(voice ?over|voiceover|narrat|voz|audio|read (?:it|this) aloud)\b/.test(ask)) { const p = await makeVoiceover(produced.slice(0, 2000)); if (looksLikePath(p)) produced += `\n\nVoiceover: ${p}`; }
             else if (at.includes("manus") && /\bmanus\b/.test(ask)) { const u = await runManus(n.task); if (looksLikeUrl(u)) produced += `\n\nManus task: ${u}`; }
             if (at.includes("slack") && /\bslack\b/.test(ask)) await postToSlack("#general", produced.slice(0, 1500));
-            if ((at.includes("n8n") || at.includes("zapier")) && /\b(automation|workflow|zap|webhook|n8n|zapier|automatizaci)\b/.test(ask)) await fireAutomation(produced.slice(0, 1500));
+            if ((at.includes("n8n") || at.includes("make")) && /\b(automation|workflow|scenario|webhook|n8n|make|automatizaci)\b/.test(ask)) await fireAutomation(produced.slice(0, 1500));
           } catch { /* tools are best-effort */ }
           results.push({ name: n.name, title: n.title, output: produced, color: n.color });
         } catch (e) {

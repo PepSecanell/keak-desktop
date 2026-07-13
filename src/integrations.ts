@@ -4,7 +4,7 @@
 //  1. OAuth "connections" (Google, Microsoft, Notion) — a real sign-in, tokens stored under their own keys.
 //     Slack is here too but connects by pasting a bot/user token, because Slack refuses the http://localhost
 //     redirect a desktop loopback flow needs (would require our own hosted https redirect).
-//  2. API-key "tools" (Perplexity, HeyGen, ElevenLabs, Gamma, Higgsfield, Zapier, n8n, Manus) — these only
+//  2. API-key "tools" (Perplexity, HeyGen, ElevenLabs, Gamma, Higgsfield, Make, n8n, Manus) — these only
 //     ever issue API keys (no consumer-subscription OAuth for programmatic use), so the user pastes a key.
 //
 // Per-agent access: an agent's `tools` array lists the tool ids it's allowed to use, so a research agent can
@@ -41,12 +41,12 @@ export const AI_TOOLS: ToolDef[] = [
   { id: "higgsfield", name: "Higgsfield", category: "Video", auth: "apikey",
     keyLabel: "Higgsfield API key", getUrl: "https://platform.higgsfield.ai",
     hint: "Cinematic AI image and video from a prompt.", icon: "", brand: "#111111" },
-  { id: "zapier", name: "Zapier", category: "Automation", auth: "token",
-    keyLabel: "Zapier Catch Hook webhook URL", getUrl: "https://zapier.com/apps/webhook/integrations",
-    hint: "Trigger a Zap (8,000+ apps) via its webhook.", icon: "zapier", brand: "#FF4F00" },
   { id: "n8n", name: "n8n", category: "Automation", auth: "token",
     keyLabel: "n8n webhook URL", getUrl: "https://n8n.io",
     hint: "Trigger your own n8n workflows by URL.", icon: "n8n", brand: "#EA4B71" },
+  { id: "make", name: "Make", category: "Automation", auth: "token",
+    keyLabel: "Make webhook URL", getUrl: "https://www.make.com",
+    hint: "In Make add a 'Custom webhook' trigger to a scenario and paste its URL here to fire it (2,000+ apps). For full two-way access, add your Make MCP URL under MCP instead.", icon: "", brand: "#6D00CC" },
   { id: "manus", name: "Manus", category: "Research", auth: "apikey",
     keyLabel: "Manus API key", getUrl: "https://open.manus.ai",
     hint: "Hand a whole task to an autonomous agent.", icon: "", brand: "#111111" },
