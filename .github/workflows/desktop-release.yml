@@ -62,11 +62,11 @@ jobs:
           - platform: windows-latest
             args: ""
             rust_targets: ""
-          # Mac is temporarily disabled so we can confirm the release-permission fix on cheap Windows minutes
-          # first (macOS runners cost ~10x). Re-enable this block once a Windows run publishes green.
-          # - platform: macos-14
-          #   args: "--target universal-apple-darwin"
-          #   rust_targets: "aarch64-apple-darwin,x86_64-apple-darwin"
+          # Mac build (universal binary, Apple Silicon + Intel). Shipped UNSIGNED for now, so Mac users
+          # right-click the app > Open the first time to bypass Gatekeeper. Add notarization later.
+          - platform: macos-14
+            args: "--target universal-apple-darwin"
+            rust_targets: "aarch64-apple-darwin,x86_64-apple-darwin"
 
     runs-on: ${{ matrix.platform }}
 
