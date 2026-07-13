@@ -14,7 +14,47 @@ permissions:
   contents: write
 
 jobs:
+  # PREFLIGHT (cheap, ~30s on a free Linux runner). Proves the RELEASE_TOKEN can actually create a
+  # release on THIS repo BEFORE we spend a 10-minute Windows build. It prints the real repo name CI
+  # is using and the token account, then creates + deletes a draft release. If the token/repo is
+  # wrong it fails HERE in seconds (no wasted Windows minutes). The Windows build only runs if this
+  # passes — and if it passes, the real release below is guaranteed to work (identical token, repo,
+  # and API call).
+  preflight:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify RELEASE_TOKEN can create a release on this repo
+        env:
+          RT: ${{ secrets.RELEASE_TOKEN }}
+        run: |
+          set -e
+          echo "Target repo (GITHUB_REPOSITORY): $GITHUB_REPOSITORY"
+          if [ -z "$RT" ]; then
+            echo "::error::RELEASE_TOKEN secret is EMPTY. Add it in Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+          who=$(curl -s -H "Authorization: Bearer $RT" -H "User-Agent: keak" https://api.github.com/user | grep '"login"' | head -1 | sed 's/[",]//g' | xargs)
+          echo "Token $who"
+          code=$(curl -s -o /tmp/rel.json -w "%{http_code}" -X POST \
+            -H "Authorization: Bearer $RT" -H "User-Agent: keak" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/releases" \
+            -d '{"tag_name":"preflight-delete-me","name":"preflight","draft":true}')
+          echo "Create-release HTTP status: $code"
+          if [ "$code" != "201" ]; then
+            echo "::error::RELEASE_TOKEN cannot create a release on $GITHUB_REPOSITORY (HTTP $code). Details below."
+            cat /tmp/rel.json
+            echo ""
+            echo "FIX: the RELEASE_TOKEN secret must be a CLASSIC token (github.com/settings/tokens/new)"
+            echo "with the 'repo' scope, created by the account that owns $GITHUB_REPOSITORY."
+            exit 1
+          fi
+          rid=$(grep '"id"' /tmp/rel.json | head -1 | tr -dc '0-9')
+          curl -s -X DELETE -H "Authorization: Bearer $RT" -H "User-Agent: keak" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/$rid" > /dev/null
+          echo "OK: token created and cleaned up a draft release on $GITHUB_REPOSITORY. Safe to build."
+
   build:
+    needs: preflight
     strategy:
       fail-fast: false
       matrix:
@@ -74,7 +114,8 @@ jobs:
       # Use a Personal Access Token (secret RELEASE_TOKEN) to create the Release, NOT the built-in
       # GITHUB_TOKEN. On this repo (transferred from keolyapp) the built-in token is denied the
       # release-create call ("Resource not accessible by integration") even with Read and write
-      # permissions set. A PAT with Contents: write bypasses that entirely.
+      # permissions set. A classic PAT with the 'repo' scope bypasses that entirely. The preflight
+      # job above has already proven this exact token works on this repo.
       - name: Build and release
         uses: tauri-apps/tauri-action@v0
         env:
