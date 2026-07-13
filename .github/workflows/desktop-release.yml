@@ -71,10 +71,14 @@ jobs:
           echo "VITE_KEAK_SLACK_CLIENT_SECRET=${{ secrets.VITE_KEAK_SLACK_CLIENT_SECRET }}" >> .env
           echo "VITE_KEAK_GITHUB_CLIENT_ID=${{ secrets.VITE_KEAK_GITHUB_CLIENT_ID }}" >> .env
 
+      # Use a Personal Access Token (secret RELEASE_TOKEN) to create the Release, NOT the built-in
+      # GITHUB_TOKEN. On this repo (transferred from keolyapp) the built-in token is denied the
+      # release-create call ("Resource not accessible by integration") even with Read and write
+      # permissions set. A PAT with Contents: write bypasses that entirely.
       - name: Build and release
         uses: tauri-apps/tauri-action@v0
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
         with:
           tagName: ${{ github.ref_type == 'tag' && github.ref_name || 'v0.0.0-dev' }}
           releaseName: "Keak ${{ github.ref_type == 'tag' && github.ref_name || 'dev build' }}"
