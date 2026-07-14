@@ -1251,13 +1251,29 @@ let fillerKey = "";
 let fillerGenerating = false;
 let fillerDone: Promise<void> = Promise.resolve();
 
+// Guess the language of a transcript so the spoken filler + reply match what the user actually said. Rough
+// but enough to pick a filler set; stored as keak_last_lang and used when the language setting is "auto".
+function detectLang(text: string): string {
+  const s = " " + (text || "").toLowerCase() + " ";
+  if (/[ñ¿¡]/.test(s) || /\b(que|de|el|la|los|las|una|para|con|por|pero|hola|gracias|c[oó]mo|qu[eé]|est[aá]|soy|quiero|hacer|porque|tambi[eé]n)\b/.test(s)) return "es";
+  if (/[àâçéèêëîïôûù]/.test(s) && /\b(le|les|une|des|pour|avec|bonjour|merci|comment|est|je|vous|c'est)\b/.test(s)) return "fr";
+  if (/[äöüß]/.test(s) || /\b(der|die|das|und|ich|nicht|mit|f[üu]r|eine|hallo|danke|wie|kannst)\b/.test(s)) return "de";
+  if (/[ãõ]/.test(s) || /\b(um|uma|n[ãa]o|obrigad[oa]|voc[eê]|como|est[aá]|fazer|com|ol[aá]|porque)\b/.test(s)) return "pt";
+  if (/\b(che|di|il|una|per|con|ciao|grazie|come|sono|voglio|fare|perch[eé]|anche)\b/.test(s)) return "it";
+  return "en";
+}
+
 // A handful of short, natural acknowledgements so the filler varies. Some use the name, some don't.
 function fillerPhrases(name: string, lang: string): string[] {
   const n = name && name !== "there" ? name : "";
-  if (lang === "es") {
-    return [n ? `Claro, ${n}.` : "Claro.", "Por supuesto.", "Vamos a ver.", "Un momento.", n ? `Muy bien, ${n}.` : "Muy bien.", "Déjame ver."];
+  switch (lang) {
+    case "es": return [n ? `Claro, ${n}.` : "Claro.", "Por supuesto.", "Vamos a ver.", "Un momento.", n ? `Muy bien, ${n}.` : "Muy bien.", "Déjame ver."];
+    case "fr": return [n ? `Bien sûr, ${n}.` : "Bien sûr.", "D'accord.", "Voyons voir.", "Un instant.", n ? `Très bien, ${n}.` : "Très bien.", "Je regarde."];
+    case "de": return [n ? `Klar, ${n}.` : "Klar.", "Natürlich.", "Mal sehen.", "Einen Moment.", n ? `Alles klar, ${n}.` : "Alles klar.", "Ich schaue."];
+    case "pt": return [n ? `Claro, ${n}.` : "Claro.", "Com certeza.", "Vamos ver.", "Um momento.", n ? `Muito bem, ${n}.` : "Muito bem.", "Deixa ver."];
+    case "it": return [n ? `Certo, ${n}.` : "Certo.", "Senz'altro.", "Vediamo.", "Un momento.", n ? `Benissimo, ${n}.` : "Benissimo.", "Fammi vedere."];
+    default:   return [n ? `Of course, ${n}.` : "Of course.", "Sure thing.", "Let me see.", "One moment.", n ? `Alright, ${n}.` : "Alright.", "Got it."];
   }
-  return [n ? `Of course, ${n}.` : "Of course.", "Sure thing.", "Let me see.", "One moment.", n ? `Alright, ${n}.` : "Alright.", "Got it."];
 }
 
 async function genClip(token: string, text: string, lang: string, gender: string): Promise<string | null> {
@@ -1283,8 +1299,12 @@ async function genClip(token: string, text: string, lang: string, gender: string
 async function ensureFillers(token: string): Promise<void> {
   const name = (localStorage.getItem("keak_user_name") || "").trim();
   const gender = localStorage.getItem("keak_voice_gender") || "female";
-  let lang = localStorage.getItem("keak_language") || "en";
-  if (lang === "auto" || lang === "bi") lang = "en";
+  let lang = localStorage.getItem("keak_language") || "auto";
+  // "auto" means detect-from-speech: follow the language of the last thing the user actually said, so the
+  // spoken filler matches (e.g. Spanish), instead of always defaulting to English.
+  if (lang === "auto" || lang === "bi") {
+    lang = localStorage.getItem("keak_last_lang") || (navigator.language || "en").slice(0, 2).toLowerCase() || "en";
+  }
   const key = `${name}|${gender}|${lang}`;
   if (key === fillerKey && fillerUrls.length > 0) return;
   if (fillerGenerating) return;
@@ -1712,6 +1732,10 @@ export default function Overlay() {
         }
         return;
       }
+
+      // Remember the language of what was actually said, so fillers + auto-detect replies match it (Spanish
+      // question -> Spanish acknowledgement), even when the language setting is left on "auto".
+      localStorage.setItem("keak_last_lang", detectLang(String(tData.text)));
 
       // Keak AI branch: ask the assistant and speak the answer, instead of injecting text.
       if (modeRef.current === "assistant") {
