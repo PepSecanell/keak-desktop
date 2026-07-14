@@ -1181,6 +1181,189 @@ async fn sb_search(args: SbSearchArgs) -> Result<String, String> {
 }
 struct SearchBudget { files: usize, bytes: usize }
 
+// ---- Second Brain graph: turn the connected folder into nodes + links for a visual (2D/3D) map ----
+// Nodes = folders and files. Links = folder containment (parent->child) PLUS knowledge links parsed from
+// markdown/text: Obsidian-style [[wikilinks]] (matched by file stem) and [label](relative/path.md) links.
+// Everything is budget-capped so a huge folder never freezes the app.
+fn sb_is_texty(name: &str) -> bool {
+    let n = name.to_lowercase();
+    n.ends_with(".md") || n.ends_with(".markdown") || n.ends_with(".mdx") || n.ends_with(".txt")
+}
+fn sb_node_type(name: &str, is_dir: bool) -> &'static str {
+    if is_dir { return "dir"; }
+    let n = name.to_lowercase();
+    if n.ends_with(".md") || n.ends_with(".markdown") || n.ends_with(".mdx") { "md" }
+    else if n.ends_with(".txt") { "text" }
+    else if n.ends_with(".png") || n.ends_with(".jpg") || n.ends_with(".jpeg") || n.ends_with(".gif")
+         || n.ends_with(".webp") || n.ends_with(".svg") || n.ends_with(".mp4") || n.ends_with(".mov")
+         || n.ends_with(".mp3") || n.ends_with(".wav") || n.ends_with(".pdf") { "media" }
+    else if n.ends_with(".ts") || n.ends_with(".tsx") || n.ends_with(".js") || n.ends_with(".jsx")
+         || n.ends_with(".py") || n.ends_with(".rs") || n.ends_with(".html") || n.ends_with(".css")
+         || n.ends_with(".json") || n.ends_with(".toml") || n.ends_with(".sh") { "code" }
+    else { "file" }
+}
+// Resolve a markdown link target (relative to the file's dir) into a posix path from the root.
+fn sb_resolve_rel(base_dir: &str, target: &str) -> String {
+    let t = target.split('#').next().unwrap_or(target).trim();
+    let mut parts: Vec<&str> = if base_dir.is_empty() { Vec::new() } else { base_dir.split('/').collect() };
+    for seg in t.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => { parts.pop(); }
+            s => parts.push(s),
+        }
+    }
+    parts.join("/")
+}
+// Breadth-first so the shallow structure (the main folders and their contents) is guaranteed to appear
+// before the node cap — deep leaves get truncated, never the top-level regions. Skips dot-folders
+// (.git, .claude, …) and heavy build dirs so a real user's brain shows its actual folders, not tooling noise.
+fn sb_graph_walk(root: &std::path::Path, max_depth: u32, max_nodes: usize)
+    -> Vec<(String, String, &'static str)> {
+    use std::collections::VecDeque;
+    let mut nodes: Vec<(String, String, &'static str)> = Vec::new();
+    let mut queue: VecDeque<(std::path::PathBuf, u32)> = VecDeque::new();
+    queue.push_back((root.to_path_buf(), 1));
+    while let Some((dir, depth)) = queue.pop_front() {
+        if depth > max_depth || nodes.len() >= max_nodes { continue; }
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue; };
+        let mut entries: Vec<_> = rd.filter_map(|e| e.ok()).collect();
+        entries.sort_by_key(|e| e.file_name());
+        for e in entries {
+            if nodes.len() >= max_nodes { break; }
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') { continue; } // hide dot-folders/files (.git, .claude, .env…)
+            let path = e.path();
+            let is_dir = path.is_dir();
+            if is_dir && sb_skip_dir(&name) { continue; }
+            let rel = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().replace('\\', "/");
+            let ty = sb_node_type(&name, is_dir);
+            nodes.push((rel, name, ty));
+            if is_dir { queue.push_back((path, depth + 1)); }
+        }
+    }
+    nodes
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SbGraphArgs { root: String, #[serde(default)] max_depth: u32, #[serde(default)] max_nodes: u32 }
+#[tauri::command]
+async fn sb_graph(args: SbGraphArgs) -> Result<String, String> {
+    let root = std::path::Path::new(args.root.trim());
+    if !root.is_dir() { return Err("Second Brain folder not found. Check the path.".into()); }
+    let max_depth = if args.max_depth == 0 { 6 } else { args.max_depth };
+    let max_nodes = if args.max_nodes == 0 { 2500 } else { args.max_nodes } as usize;
+
+    // Pass 1: collect every node (folders + files), breadth-first.
+    let mut raw = sb_graph_walk(root, max_depth, max_nodes);
+    // The centre of the map: one hub node all the top-level folders hang off of.
+    raw.insert(0, ("__root__".to_string(), "Second Brain".to_string(), "root"));
+
+    // Fast lookups for link resolution.
+    use std::collections::{HashMap, HashSet};
+    let node_set: HashSet<String> = raw.iter().map(|(id, _, _)| id.clone()).collect();
+    // stem (lowercased basename without extension) -> node id, for [[wikilinks]]. First writer wins.
+    let mut stem_map: HashMap<String, String> = HashMap::new();
+    for (id, name, ty) in &raw {
+        if *ty == "md" || *ty == "text" {
+            let stem = name.rsplit_once('.').map(|(s, _)| s).unwrap_or(name).to_lowercase();
+            stem_map.entry(stem).or_insert_with(|| id.clone());
+        }
+    }
+
+    let mut links: Vec<serde_json::Value> = Vec::new();
+    let mut seen_links: HashSet<(String, String)> = HashSet::new();
+    let push_link = |links: &mut Vec<serde_json::Value>, seen: &mut HashSet<(String, String)>,
+                     s: &str, tgt: &str, kind: &str| {
+        if s == tgt { return; }
+        let key = (s.to_string(), tgt.to_string());
+        if seen.contains(&key) { return; }
+        seen.insert(key);
+        links.push(serde_json::json!({ "source": s, "target": tgt, "kind": kind }));
+    };
+
+    // Containment links: each node -> its parent folder. Top-level nodes hang off the "Second Brain" hub.
+    for (id, _, ty) in &raw {
+        if *ty == "root" { continue; }
+        if let Some(pos) = id.rfind('/') {
+            let parent = &id[..pos];
+            if node_set.contains(parent) {
+                push_link(&mut links, &mut seen_links, parent, id, "tree");
+            }
+        } else {
+            push_link(&mut links, &mut seen_links, "__root__", id, "tree");
+        }
+    }
+
+    // Pass 2: parse knowledge links out of markdown/text files (budget-capped).
+    let mut bytes_read: usize = 0;
+    for (id, name, ty) in &raw {
+        if bytes_read >= 6_000_000 { break; }
+        if !(*ty == "md" || *ty == "text") || !sb_is_texty(name) { continue; }
+        let full = root.join(id); // Path::join accepts posix separators on Windows too
+        let Ok(meta) = std::fs::metadata(&full) else { continue; };
+        if meta.len() > 300_000 { continue; }
+        let Ok(txt) = std::fs::read_to_string(&full) else { continue; };
+        bytes_read += txt.len();
+        let base_dir = id.rfind('/').map(|p| &id[..p]).unwrap_or("");
+        let bytes = txt.as_bytes();
+        let mut i = 0usize;
+        while i + 1 < bytes.len() {
+            // [[wikilink]] (Obsidian) — resolve by file stem.
+            if bytes[i] == b'[' && bytes[i + 1] == b'[' {
+                if let Some(end) = txt[i + 2..].find("]]") {
+                    let inner = &txt[i + 2..i + 2 + end];
+                    let target = inner.split('|').next().unwrap_or(inner)
+                        .split('#').next().unwrap_or(inner).trim().to_lowercase();
+                    if let Some(tid) = stem_map.get(&target) {
+                        push_link(&mut links, &mut seen_links, id, tid, "link");
+                    }
+                    i += 4 + end;
+                    continue;
+                }
+            }
+            // [label](target) — markdown link to a file inside the folder.
+            if bytes[i] == b']' && i + 1 < bytes.len() && bytes[i + 1] == b'(' {
+                if let Some(end) = txt[i + 2..].find(')') {
+                    let target = &txt[i + 2..i + 2 + end];
+                    let low = target.trim().to_lowercase();
+                    if !low.is_empty() && !low.contains("://") && !low.starts_with("mailto:")
+                        && !low.starts_with('#') {
+                        let resolved = sb_resolve_rel(base_dir, target.trim());
+                        if node_set.contains(&resolved) {
+                            push_link(&mut links, &mut seen_links, id, &resolved, "link");
+                        } else {
+                            let with_md = format!("{}.md", resolved);
+                            if node_set.contains(&with_md) {
+                                push_link(&mut links, &mut seen_links, id, &with_md, "link");
+                            }
+                        }
+                    }
+                    i += 2 + end;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+    }
+
+    // Degree per node (link count) so the view can size hubs bigger.
+    let mut deg: HashMap<&str, u32> = HashMap::new();
+    for l in &links {
+        if let (Some(s), Some(t)) = (l["source"].as_str(), l["target"].as_str()) {
+            *deg.entry(s).or_insert(0) += 1;
+            *deg.entry(t).or_insert(0) += 1;
+        }
+    }
+    let nodes: Vec<serde_json::Value> = raw.iter().map(|(id, name, ty)| {
+        let depth = id.matches('/').count();
+        serde_json::json!({ "id": id, "name": name, "type": ty, "deg": deg.get(id.as_str()).copied().unwrap_or(0), "depth": depth })
+    }).collect();
+
+    serde_json::to_string(&serde_json::json!({ "nodes": nodes, "links": links })).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 async fn cu_chat(args: ChatArgs) -> Result<String, String> {
     match args.provider.as_str() {
@@ -2992,7 +3175,7 @@ pub fn run() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![open_url, inject_text, hide_overlay, show_main, show_agents, hide_agents, save_artifact, restore_clipboard, capture_selection, capture_screen, send_browser_command, capture_screen_full, mouse_click, mouse_move, cursor_pos, type_text, mouse_scroll, press_key, openai_login_start, openai_login_poll, cu_step, cu_chat, copilot_read_cli_token, ollama_list_models, pick_folder, set_autostart, get_autostart, whatsapp_send, sb_tree, sb_read, sb_write, sb_mkdir, sb_delete, sb_search, openai_tts, gemini_tts, google_connect, google_refresh, google_calendar_create, youtube_get, gmail_list, gmail_send, drive_create, ms_connect, ms_refresh, ms_calendar_create, ms_mail_send, ms_drive_create, notion_connect, notion_create_page, slack_connect, slack_test, slack_post, perplexity_ask, elevenlabs_tts, elevenlabs_speak, gamma_generate, heygen_video, webhook_post, manus_task, higgsfield_generate, heygen_assets, figma_connect, resend_send, supabase_rest, supabase_schema, figma_api, github_device_start, github_device_poll, github_api, shopify_api, gumloop_start, telegram_poll, telegram_send, mcp_rpc, claude_verify, claude_read_cli_token, make_scenarios, make_run])
+        .invoke_handler(tauri::generate_handler![open_url, inject_text, hide_overlay, show_main, show_agents, hide_agents, save_artifact, restore_clipboard, capture_selection, capture_screen, send_browser_command, capture_screen_full, mouse_click, mouse_move, cursor_pos, type_text, mouse_scroll, press_key, openai_login_start, openai_login_poll, cu_step, cu_chat, copilot_read_cli_token, ollama_list_models, pick_folder, set_autostart, get_autostart, whatsapp_send, sb_tree, sb_read, sb_write, sb_mkdir, sb_delete, sb_search, sb_graph, openai_tts, gemini_tts, google_connect, google_refresh, google_calendar_create, youtube_get, gmail_list, gmail_send, drive_create, ms_connect, ms_refresh, ms_calendar_create, ms_mail_send, ms_drive_create, notion_connect, notion_create_page, slack_connect, slack_test, slack_post, perplexity_ask, elevenlabs_tts, elevenlabs_speak, gamma_generate, heygen_video, webhook_post, manus_task, higgsfield_generate, heygen_assets, figma_connect, resend_send, supabase_rest, supabase_schema, figma_api, github_device_start, github_device_poll, github_api, shopify_api, gumloop_start, telegram_poll, telegram_send, mcp_rpc, claude_verify, claude_read_cli_token, make_scenarios, make_run])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

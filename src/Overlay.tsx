@@ -811,7 +811,8 @@ function applySettingsAction(a: Record<string, string>): string | null {
     case "voice": {
       const s = String(a.source || "").toLowerCase(); if (!["auto", "gemini", "openai", "elevenlabs", "system", "keak"].includes(s)) return null;
       localStorage.setItem("keak_voice_engine", s);
-      const nice: Record<string, string> = { auto: "automatic", gemini: "your Gemini voice", openai: "your OpenAI voice", elevenlabs: "your ElevenLabs voice", system: "a Windows voice", keak: "Keak's own voice" };
+      const sysVoiceName = (typeof navigator !== "undefined" && /Mac/i.test(navigator.platform || navigator.userAgent || "")) ? "a Mac voice" : "a Windows voice";
+      const nice: Record<string, string> = { auto: "automatic", gemini: "your Gemini voice", openai: "your OpenAI voice", elevenlabs: "your ElevenLabs voice", system: sysVoiceName, keak: "Keak's own voice" };
       return `Done, the voice is now ${nice[s]}.`;
     }
     case "createAgent": {

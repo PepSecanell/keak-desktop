@@ -7,6 +7,7 @@ import { AI_TOOLS, getToolKey, setToolKey, toolConnected, assignableForAgents, C
 import { readRoutines, upsertRoutine, removeRoutine, newRoutineId, nextRunLabel, type Routine } from "./routines";
 import { readMcpServers, writeMcpServers, newMcpId, mcpListTools, mcpCallTool, type McpServer } from "./mcp";
 import { useUiLang, UI_LANGS, UI_LANG_AI_NAME, getUiLang, tr } from "./i18n";
+import BrainGraph from "./BrainGraph";
 import "./App.css";
 import "./Connect.css";
 
@@ -16,6 +17,10 @@ import "./Connect.css";
 // per Google, so it's safe to ship. Until these are filled, the window falls back to manual (paste-your-own).
 // Values come from build-time env vars (VITE_*), so no secret lives in the repo. Set them in a local .env for
 // dev and as GitHub Actions secrets for release builds. See .env.example.
+// The built-in "system" voice runs on the browser Speech API (window.speechSynthesis), which is
+// cross-platform — on a Mac it uses the Mac's own voices. Only the LABEL needs to be OS-aware.
+const IS_MAC = typeof navigator !== "undefined" && (/Mac/i.test(navigator.platform || "") || /Macintosh|Mac OS X/i.test(navigator.userAgent || ""));
+
 const KEAK_GOOGLE_CLIENT_ID = import.meta.env.VITE_KEAK_GOOGLE_CLIENT_ID || "";
 const KEAK_GOOGLE_CLIENT_SECRET = import.meta.env.VITE_KEAK_GOOGLE_CLIENT_SECRET || "";
 const HAS_SHARED_GOOGLE = KEAK_GOOGLE_CLIENT_ID.trim().length > 0;
@@ -1208,6 +1213,7 @@ export default function Connect() {
   const [brainAutoContext, setBrainAutoContext] = useState<boolean>(() => localStorage.getItem("keak_brain_autocontext") === "1");
   const [brainTree, setBrainTree] = useState<string[]>([]);
   const [brainBusy, setBrainBusy] = useState<boolean>(false);
+  const [showGraph, setShowGraph] = useState<boolean>(false); // the visual 2D/3D map of the connected folder
   async function connectBrain() {
     const p = brainPath.trim();
     if (!p) { setConnectMsg(t("Paste the folder path of your Second Brain first.")); return; }
@@ -1995,13 +2001,13 @@ export default function Connect() {
               <option value="gemini">{t("My Gemini voice")}</option>
               <option value="openai">{t("My OpenAI voice")}</option>
               <option value="elevenlabs">{t("My ElevenLabs voice")}</option>
-              <option value="system">{t("A Windows voice")}</option>
+              <option value="system">{t(IS_MAC ? "A Mac voice" : "A Windows voice")}</option>
               <option value="keak">{t("Keak's own voice")}</option>
             </select>
           </div>
 
           {voiceEngine === "auto" && (
-            <p className="cx-help" style={{ marginTop: 6 }}>{t("Uses your own Gemini voice, then your own OpenAI voice, then a Windows voice, whichever you have. Free, and works with Claude too. Just add a Gemini or OpenAI key under Your AI (a free Gemini key from Google AI Studio is enough).")}</p>
+            <p className="cx-help" style={{ marginTop: 6 }}>{t("Uses your own Gemini voice, then your own OpenAI voice, then a Windows voice, whichever you have. Free, and works with Claude too. Just add a Gemini or OpenAI key under Your AI (a free Gemini key from Google AI Studio is enough).").replace(/Windows/g, IS_MAC ? "Mac" : "Windows")}</p>
           )}
 
           {voiceEngine === "gemini" && (
@@ -2037,7 +2043,7 @@ export default function Connect() {
 
           {voiceEngine === "system" && (
             <div className="cx-field" style={{ marginTop: 14 }}>
-              <label className="cx-field-label">{t("Windows voice")} <span className="cx-field-tag">{t("free, works offline")}</span></label>
+              <label className="cx-field-label">{t(IS_MAC ? "Mac voice" : "Windows voice")} <span className="cx-field-tag">{t("free, works offline")}</span></label>
               <select className="cx-select" value={voiceUri} onChange={(e) => saveVoiceUri(e.target.value)}>
                 <option value="">{t("Best available (automatic)")}</option>
                 {sortedVoices.map((v) => <option key={v.voiceURI} value={v.voiceURI}>{v.name} ({v.lang})</option>)}
@@ -2186,7 +2192,7 @@ export default function Connect() {
                     <button className="cx-btn cx-btn--ghost cx-btn--sm" onClick={disconnectBrain} style={{ marginTop: 10 }}>{t("Disconnect")}</button>
                   </div>
 
-                  <div className="cx-field">
+                  <div className="cx-field" style={{ marginTop: 26 }}>
                     <label className="cx-field-label">{t("What Keak may do in this folder")}</label>
                     <select className="cx-select" value={brainPerm} onChange={(e) => saveBrainPerm(e.target.value)}>
                       <option value="read">{t("Read only — look, never change")}</option>
@@ -2197,13 +2203,13 @@ export default function Connect() {
                     <p className="cx-help">{t("Keak always asks before it writes or deletes. Reads are free.")}</p>
                   </div>
 
-                  <label className="cx-check-row" style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 4 }}>
+                  <label className="cx-check-row" style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 20 }}>
                     <input type="checkbox" checked={brainAutoContext} onChange={(e) => toggleBrainAutoContext(e.target.checked)} />
                     <span className="cx-field-label" style={{ margin: 0 }}>{t("Load a summary of my brain into every answer")} <span className="cx-field-tag">{t("knows you better, uses a few more tokens")}</span></span>
                   </label>
-                  <p className="cx-help" style={{ marginTop: 2 }}>{t("Off means Keak only reads what it needs, when you ask. On means it always has your README, CLAUDE.md and folder map for context.")}</p>
+                  <p className="cx-help" style={{ marginTop: 4 }}>{t("Off means Keak only reads what it needs, when you ask. On means it always has your README, CLAUDE.md and folder map for context.")}</p>
 
-                  <div className="cx-field">
+                  <div className="cx-field" style={{ marginTop: 22 }}>
                     <label className="cx-field-label">{t("Top of your Second Brain")} <button className="cx-linkbtn" onClick={refreshBrainTree}>{t("Refresh")}</button></label>
                     {brainTree.length > 0 ? (
                       <div className="cx-tree">{brainTree.slice(0, 40).map((t) => <div key={t} className="cx-tree-row">{t}</div>)}</div>
@@ -2212,7 +2218,13 @@ export default function Connect() {
                     )}
                   </div>
 
-                  <p className="cx-help" style={{ marginTop: 8 }}>{t("Try saying: \"what's in my projects folder\", \"read my README\", \"create a skill that summarizes PDFs\", or \"make a new folder in PROJECTS called LAUNCH\".")}</p>
+                  <div className="cx-field" style={{ marginTop: 28, paddingTop: 24, borderTop: "1px solid var(--line)" }}>
+                    <label className="cx-field-label">{t("See your Second Brain as a map")}</label>
+                    <p className="cx-help" style={{ marginTop: 2, marginBottom: 12 }}>{t("Turn your whole folder into a living graph. Every note and folder is a dot, and the lines are the links between them. Explore it in 2D or 3D.")}</p>
+                    <button className="cx-btn cx-btn--block" onClick={() => setShowGraph(true)}>{t("Make it visual")}</button>
+                  </div>
+
+                  <p className="cx-help" style={{ marginTop: 14 }}>{t("Try saying: \"what's in my projects folder\", \"read my README\", \"create a skill that summarizes PDFs\", or \"make a new folder in PROJECTS called LAUNCH\".")}</p>
                 </>
               ) : (
                 <>
@@ -2960,6 +2972,8 @@ export default function Connect() {
           </div>
         </div>
       </div>
+
+      {showGraph && <BrainGraph root={brainPath} onClose={() => setShowGraph(false)} />}
     </div>
   );
 }
