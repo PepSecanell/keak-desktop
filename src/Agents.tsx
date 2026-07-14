@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import "./Agents.css";
 
 // Fullscreen, click-through overlay of named "star" sub-agents. It reads the live agent list straight from
@@ -67,9 +68,21 @@ export default function Agents() {
     read();
     const onStorage = (e: StorageEvent) => { if (e.key === "keak_agents" || e.key === "keak_agents_viz" || e.key === "keak_agent_labels") read(); };
     window.addEventListener("storage", onStorage);
-    // Poll too — the storage event doesn't always fire reliably across webview windows.
+    // PRIMARY channel: localStorage is NOT shared across Tauri webview windows, so the overlay pushes agent
+    // state to this window via a Tauri event. This is what actually makes the orbs appear.
+    const unlistenP = listen<{ agents?: Agent[]; viz?: Viz; labels?: boolean }>("agents-update", (e) => {
+      const p = e.payload || {};
+      if (Array.isArray(p.agents)) setAgents(p.agents);
+      if (p.viz && p.viz.mode) setViz(p.viz);
+      if (typeof p.labels === "boolean") setShowLabels(p.labels);
+    });
+    // Poll localStorage too as a same-window fallback (harmless if empty).
     const t = window.setInterval(read, 500);
-    return () => { window.removeEventListener("storage", onStorage); window.clearInterval(t); };
+    return () => {
+      window.removeEventListener("storage", onStorage);
+      window.clearInterval(t);
+      unlistenP.then((un) => un()).catch(() => { /* ignore */ });
+    };
   }, []);
 
   // "follow my mouse" mode: poll the real OS cursor position and move the target orb(s) to it.

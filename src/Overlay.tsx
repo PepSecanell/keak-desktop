@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { listen, emitTo } from "@tauri-apps/api/event";
 import keakLogo from "./assets/icon_keak_2.png";
 import keakLogoDark from "./assets/icon_keak_2.png";
 import { effectiveDefaults, saveDefaultOverride } from "./agents-defaults";
@@ -890,6 +890,7 @@ async function parseVizCommand(question: string): Promise<string | null> {
   if (a.action === "labels") {
     const on = a.on === true || a.on === "true";
     localStorage.setItem("keak_agent_labels", on ? "1" : "0");
+    emitTo("agents", "agents-update", { labels: on }).catch(() => { /* ignore */ });
     return on ? "Okay, I'll show the agent names." : "Okay, I hid the agent names.";
   }
   if (a.action === "hide") {
@@ -901,6 +902,7 @@ async function parseVizCommand(question: string): Promise<string | null> {
     const mode = String(a.mode || "drift");
     const target = a.target ? String(a.target) : "all";
     localStorage.setItem("keak_agents_viz", JSON.stringify({ mode, target }));
+    emitTo("agents", "agents-update", { viz: { mode, target } }).catch(() => { /* ignore */ });
     // Make sure some orbs are on screen so the effect is visible.
     let has = false;
     try { const d = JSON.parse(localStorage.getItem("keak_agents") || "{}"); has = Array.isArray(d.agents) && d.agents.length > 0; } catch { /* ignore */ }
@@ -988,10 +990,12 @@ function detectNamedAgent(task: string): { agent: { name: string; description: s
   return null;
 }
 
-// The agents window reads this key to know which orbs to draw, their status + colour. Shared localStorage is
-// the cross-window channel (no extra Tauri permissions needed).
+// The agents window draws which orbs from this state. localStorage is NOT shared across Tauri webview windows
+// (each is its own WebView2), so we ALSO emit a Tauri event to the "agents" window — that is the real
+// cross-window channel. localStorage is kept only as a same-window fallback.
 function writeAgentState(agents: { name: string; status: string; color?: string }[]) {
   try { localStorage.setItem("keak_agents", JSON.stringify({ ts: Date.now(), agents })); } catch { /* ignore */ }
+  emitTo("agents", "agents-update", { agents }).catch(() => { /* ignore */ });
 }
 function updateAgentStatus(name: string, status: string) {
   try {
@@ -999,6 +1003,7 @@ function updateAgentStatus(name: string, status: string) {
     const data = raw ? JSON.parse(raw) : { agents: [] };
     const agents = (data.agents || []).map((a: { name: string; status: string }) => (a.name === name ? { ...a, status } : a));
     localStorage.setItem("keak_agents", JSON.stringify({ ts: Date.now(), agents }));
+    emitTo("agents", "agents-update", { agents }).catch(() => { /* ignore */ });
   } catch { /* ignore */ }
 }
 
@@ -1707,31 +1712,59 @@ export default function Overlay() {
       const lang = localStorage.getItem("keak_language");
       if (lang && lang !== "auto") form.append("language", lang);
 
-      const tRes = await fetch(`${SUPABASE_URL}/functions/v1/transcribe`, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${session.access_token}` },
-        body: form,
-      });
-      const tData = await tRes.json().catch(() => ({} as any));
-      // Surface the REAL reason instead of a blank "nothing transcribed".
-      if (!tRes.ok) {
-        const detail = tData?.error || tData?.message || `error ${tRes.status}`;
-        const friendly =
-          tRes.status === 401 || tRes.status === 403
-            ? "Session expired. Open Keak settings and sign in again."
-            : tRes.status === 402
-            ? "You're out of dictation minutes this month. Upgrade your plan or buy a minutes pack in Keak settings."
-            : `Transcription failed: ${detail}`;
-        if (modeRef.current === "assistant") {
-          setAiReply(friendly);
-          setStateSafe("idle");
-          scheduleAssistantClose(9000);
-        } else {
-          setStateSafe("error");
-          setErrorMsg(friendly);
+      // ── Keak Sovereign: local transcription path ──────────────────────────
+      // Enable by running PROJECTS/KEAK/local-whisper/start.bat, then:
+      //   localStorage.setItem("keak_offline_mode", "true")
+      // Disable: localStorage.setItem("keak_offline_mode", "false")
+      const offlineMode = localStorage.getItem("keak_offline_mode") === "true";
+      let tData: any;
+      if (offlineMode) {
+        const localRes = await fetch("http://127.0.0.1:9889/transcribe", {
+          method: "POST",
+          body: form,
+        }).catch(() => null);
+        if (!localRes || !localRes.ok) {
+          const friendly = "Offline mode: local server not running. Start PROJECTS/KEAK/local-whisper/start.bat first, or disable with: localStorage.setItem('keak_offline_mode','false')";
+          if (modeRef.current === "assistant") {
+            setAiReply(friendly);
+            setStateSafe("idle");
+            scheduleAssistantClose(9000);
+          } else {
+            setStateSafe("error");
+            setErrorMsg("Offline mode: local server not running. Run start.bat first.");
+          }
+          return;
         }
-        return;
+        tData = await localRes.json().catch(() => ({} as any));
+      } else {
+        // ── Cloud path (default) ───────────────────────────────────────────
+        const tRes = await fetch(`${SUPABASE_URL}/functions/v1/transcribe`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${session.access_token}` },
+          body: form,
+        });
+        tData = await tRes.json().catch(() => ({} as any));
+        // Surface the REAL reason instead of a blank "nothing transcribed".
+        if (!tRes.ok) {
+          const detail = tData?.error || tData?.message || `error ${tRes.status}`;
+          const friendly =
+            tRes.status === 401 || tRes.status === 403
+              ? "Session expired. Open Keak settings and sign in again."
+              : tRes.status === 402
+              ? "You're out of dictation minutes this month. Upgrade your plan or buy a minutes pack in Keak settings."
+              : `Transcription failed: ${detail}`;
+          if (modeRef.current === "assistant") {
+            setAiReply(friendly);
+            setStateSafe("idle");
+            scheduleAssistantClose(9000);
+          } else {
+            setStateSafe("error");
+            setErrorMsg(friendly);
+          }
+          return;
+        }
       }
+      // ─────────────────────────────────────────────────────────────────────
       if (!tData.text || !String(tData.text).trim()) {
         // Empty transcription (silence, a very short hold, or a transcribe hiccup). Handle it kindly.
         if (modeRef.current === "assistant") {
@@ -2712,10 +2745,11 @@ export default function Overlay() {
             goal, screenshotB64: shot.b64, shotW: shot.shot_w, shotH: shot.shot_h,
             history: history.slice(-8).join(" -> "),
           } });
-        } catch (e) { setAiReply(`Screen agent stopped: ${String(e).slice(0, 140)}`); break; }
+        } catch (e) { setAiReply(`Screen agent stopped: ${String(e).slice(0, 140)}. To control the screen I need a vision model — connect Claude, GPT-4o, Gemini, or a vision Ollama model in Keak settings.`); break; }
         if (cuAbortRef.current) break;
         let act: { action?: string; x?: number; y?: number; text?: string; key?: string; amount?: number; say?: string };
-        try { act = JSON.parse(actionRaw); } catch { setAiReply("I got a confusing response and stopped."); break; }
+        // A non-JSON reply almost always means the connected model can't see the screenshot (text-only model).
+        try { act = JSON.parse(actionRaw); } catch { setAiReply("I couldn't read the screen with the model you have connected. Screen control needs a vision model — connect Claude, GPT-4o, Gemini, or a vision Ollama model, then try again."); break; }
         const say = act.say || "";
         if (say && localStorage.getItem("keak_show_captions") !== "0") setAiReply(say);
         if (act.action === "done") { finished = true; break; }

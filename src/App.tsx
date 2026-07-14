@@ -191,13 +191,21 @@ export default function App() {
         if (!localStorage.getItem("keak_assistant_name")) {
           localStorage.setItem("keak_assistant_name", "Keak");
         }
-        // Default what Ctrl+Alt does, once: Keak AI on paid, Thought Dump on free.
+        // Ctrl+Alt = Keak AI for EVERYONE by default. Keak AI runs on the user's own connected AI, so there's
+        // no reason to gate it behind a paid plan. (The old build defaulted free plans to Thought Dump, which
+        // made Ctrl+Alt just write text like Ctrl+Win instead of opening the voice assistant.)
         if (!localStorage.getItem("keak_alt_mode")) {
-          const isPaidPlan = ["starter", "pro", "team"].includes(plan);
-          const def = isPaidPlan ? "keak_ai" : "thought_dump";
-          localStorage.setItem("keak_alt_mode", def);
-          setAltMode(def);
+          localStorage.setItem("keak_alt_mode", "keak_ai");
+          setAltMode("keak_ai");
+        } else if (
+          localStorage.getItem("keak_alt_mode") === "thought_dump" &&
+          !localStorage.getItem("keak_alt_migrated_v2")
+        ) {
+          // One-time migration: fix the free installs that were auto-set to Thought Dump by the old default.
+          localStorage.setItem("keak_alt_mode", "keak_ai");
+          setAltMode("keak_ai");
         }
+        localStorage.setItem("keak_alt_migrated_v2", "1");
       }
     }
   }
