@@ -6,6 +6,8 @@ import keakLogoDark from "./assets/icon_keak_2.png";
 import { effectiveDefaults, saveDefaultOverride } from "./agents-defaults";
 import { readRoutines, isRoutineDue, setRoutineRun, upsertRoutine, newRoutineId, nextRunLabel, type Routine } from "./routines";
 import { useUiLang } from "./i18n";
+import { runKeakLiveTest } from "./keakLive"; // EXPERIMENTAL — see keakLive.ts. Delete this line + the
+// liveTestLog/testKeakLive block below + the gated panel in the render to remove the experiment.
 import "./Overlay.css";
 
 const SUPABASE_URL = (import.meta.env.VITE_SUPABASE_URL || "https://c--8d6c4aab-d6cd-4281-ad41-da14196d68fc-prod.lovable.cloud") as string;
@@ -1453,6 +1455,16 @@ export default function Overlay() {
   // Agents: results of the last delegated job + whether the "See it" panel is open.
   const [agentResults, setAgentResults] = useState<{ name: string; title: string; output: string; color: string }[]>([]);
   const [showAgentPanel, setShowAgentPanel] = useState(false);
+  // EXPERIMENTAL — Keak Live validation test (see keakLive.ts). Not part of the real Ctrl+Alt flow.
+  const [liveTestLog, setLiveTestLog] = useState<string[]>([]);
+  const [liveTestRunning, setLiveTestRunning] = useState(false);
+  async function testKeakLive() {
+    if (liveTestRunning) return;
+    setLiveTestRunning(true);
+    setLiveTestLog([]);
+    await runKeakLiveTest(6, (m) => setLiveTestLog((l) => [...l, m]));
+    setLiveTestRunning(false);
+  }
   const closeTimerRef = useRef<number | null>(null); // pending auto-close of the assistant panel
   const assistantVisibleRef = useRef(false); // true while the assistant orb is on screen
   const mrRef = useRef<MediaRecorder | null>(null);
@@ -3581,6 +3593,31 @@ export default function Overlay() {
 
   return (
     <div className="overlay-root">
+      {localStorage.getItem("keak_live_experiment") === "1" && (
+        <div
+          style={{
+            position: "absolute", bottom: 8, right: 8, zIndex: 999999,
+            background: "#2C1508", color: "#F5EDD8", padding: "10px 12px", borderRadius: 10,
+            fontSize: 12, fontFamily: "monospace", maxWidth: 340,
+            border: "1px solid #D4A49A", boxShadow: "0 6px 20px rgba(44,21,8,0.35)",
+          }}
+        >
+          <button
+            onClick={testKeakLive}
+            disabled={liveTestRunning}
+            style={{
+              background: "#D4A49A", color: "#2C1508", border: "none", borderRadius: 6,
+              padding: "4px 10px", fontSize: 12, fontWeight: 600, cursor: liveTestRunning ? "default" : "pointer",
+              marginBottom: 6,
+            }}
+          >
+            {liveTestRunning ? "Recording 6s / listening..." : "Test Keak Live (Gemini)"}
+          </button>
+          <div style={{ maxHeight: 140, overflowY: "auto" }}>
+            {liveTestLog.map((l, i) => <div key={i}>{l}</div>)}
+          </div>
+        </div>
+      )}
       {cuActive && (
         <div
           onClick={() => { cuAbortRef.current = true; }}
