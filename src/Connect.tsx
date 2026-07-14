@@ -1307,6 +1307,42 @@ export default function Connect() {
     setGumloopKey(""); setGumloopUser(""); setGumloopFlow(""); setGumloopConnected(false); setToolTick((n) => n + 1); setConnectMsg(t("Gumloop disconnected."));
   }
 
+  // Make (make.com): API token + region, then pick which scenario Keak runs. Fires via the Make API.
+  const [makeToken, setMakeToken] = useState<string>(() => localStorage.getItem("keak_make_token") || "");
+  const [makeRegion, setMakeRegion] = useState<string>(() => localStorage.getItem("keak_make_region") || "eu2");
+  const [makeScenario, setMakeScenario] = useState<string>(() => localStorage.getItem("keak_make_scenario") || "");
+  const [makeConnected, setMakeConnected] = useState<boolean>(() => !!localStorage.getItem("keak_make_token"));
+  const [makeScenarios, setMakeScenarios] = useState<{ id: string; name: string }[] | null>(null);
+  const [makeLoading, setMakeLoading] = useState<boolean>(false);
+  function saveMake() {
+    const tok = makeToken.trim();
+    if (!tok) { setConnectMsg(t("Paste your Make API token first.")); return; }
+    localStorage.setItem("keak_make_token", tok);
+    localStorage.setItem("keak_make_region", makeRegion.trim() || "eu2");
+    localStorage.setItem("keak_tool_make", tok); // mirror so it counts as a connected tool for agents
+    setMakeConnected(true); setToolTick((n) => n + 1); setConnectMsg(t("Make connected. Load your scenarios and pick one."));
+  }
+  function disconnectMake() {
+    ["keak_make_token", "keak_make_region", "keak_make_scenario", "keak_tool_make"].forEach((k) => localStorage.removeItem(k));
+    setMakeToken(""); setMakeScenario(""); setMakeScenarios(null); setMakeConnected(false); setToolTick((n) => n + 1); setConnectMsg(t("Make disconnected."));
+  }
+  function saveMakeScenario(v: string) {
+    setMakeScenario(v);
+    if (v) localStorage.setItem("keak_make_scenario", v); else localStorage.removeItem("keak_make_scenario");
+  }
+  async function loadMakeScenarios() {
+    const tok = makeToken.trim(); const region = makeRegion.trim() || "eu2";
+    if (!tok) { setConnectMsg(t("Paste your Make API token first.")); return; }
+    setMakeLoading(true); setConnectMsg(t("Loading your Make scenarios…"));
+    try {
+      const raw = await invoke<string>("make_scenarios", { args: { token: tok, region } });
+      const parsed = JSON.parse(raw) as { scenarios: { id: string; name: string }[] };
+      setMakeScenarios(parsed.scenarios);
+      setConnectMsg(t("Loaded. Pick the scenario Keak should run."));
+    } catch (e) { setConnectMsg(`${t("Couldn't load Make scenarios:")} ${String(e).slice(0, 140)}`); }
+    finally { setMakeLoading(false); }
+  }
+
   // Telegram bridge: talk to Keak from your phone. Paste a bot token from @BotFather; the desktop polls it.
   const [telegramToken, setTelegramToken] = useState<string>(() => localStorage.getItem("keak_telegram_token") || "");
   const [telegramConnected, setTelegramConnected] = useState<boolean>(() => !!localStorage.getItem("keak_telegram_token"));
@@ -2650,6 +2686,38 @@ export default function Connect() {
                           {gumloopConnected && <button className="cx-btn cx-btn--ghost cx-btn--sm" onClick={disconnectGumloop}>{t("Disconnect")}</button>}
                           {tool.getUrl && <button className="cx-btn cx-btn--ghost cx-btn--sm" onClick={() => openUrl(tool.getUrl!)}>{t("Get key")}</button>}
                         </div>
+                      </>
+                    ) : tool.id === "make" ? (
+                      <>
+                        <input className="cx-input" type="password" placeholder={t("Make API token")} value={makeToken} onChange={(e) => setMakeToken(e.target.value)} />
+                        <label className="cx-toolpick-label" style={{ marginTop: 8 }}>{t("Region (see your make.com URL, e.g. eu2)")}</label>
+                        <select className="cx-select" value={makeRegion} onChange={(e) => setMakeRegion(e.target.value)}>
+                          {["eu1", "eu2", "us1", "us2"].map((r) => <option key={r} value={r}>{r}</option>)}
+                        </select>
+                        <div className="cx-edit-actions">
+                          <button className="cx-btn cx-btn--sm" onClick={saveMake}>{makeConnected ? t("Update") : t("Connect")}</button>
+                          {makeConnected && <button className="cx-btn cx-btn--ghost cx-btn--sm" onClick={disconnectMake}>{t("Disconnect")}</button>}
+                          {tool.getUrl && <button className="cx-btn cx-btn--ghost cx-btn--sm" onClick={() => openUrl(tool.getUrl!)}>{t("Get token")}</button>}
+                        </div>
+                        {makeConnected && (
+                          <>
+                            <button className="cx-btn cx-btn--ghost cx-btn--sm" style={{ marginTop: 8 }} onClick={loadMakeScenarios} disabled={makeLoading}>
+                              {makeLoading ? t("Loading…") : t("Load my scenarios")}
+                            </button>
+                            {makeScenarios && (
+                              <>
+                                <label className="cx-toolpick-label" style={{ marginTop: 8 }}>{t("Scenario Keak runs")}</label>
+                                <select className="cx-select" value={makeScenario} onChange={(e) => saveMakeScenario(e.target.value)}>
+                                  <option value="">{t("Pick a scenario")}</option>
+                                  {makeScenarios.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+                                </select>
+                              </>
+                            )}
+                            {!makeScenarios && makeScenario && (
+                              <p className="cx-help" style={{ marginTop: 6 }}>{t("Scenario saved. Load again to change.")}</p>
+                            )}
+                          </>
+                        )}
                       </>
                     ) : (
                       <>

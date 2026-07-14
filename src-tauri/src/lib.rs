@@ -2163,6 +2163,66 @@ async fn webhook_post(args: WebhookArgs) -> Result<String, String> {
     Ok("{\"ok\":true}".into())
 }
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MakeArgs { token: String, region: String, #[serde(default)] scenario_id: String }
+
+// List the user's Make scenarios (across their organizations) so they can pick which one Keak runs.
+#[tauri::command]
+async fn make_scenarios(args: MakeArgs) -> Result<String, String> {
+    let region = args.region.trim();
+    let token = args.token.trim();
+    if token.is_empty() || region.is_empty() { return Err("Add your Make API token and region first".into()); }
+    let base = format!("https://{}.make.com/api/v2", region);
+    let client = reqwest::Client::new();
+    let auth = format!("Token {}", token);
+    let orgs: serde_json::Value = client.get(format!("{}/organizations", base))
+        .header("Authorization", &auth).send().await.map_err(|e| e.to_string())?
+        .json().await.map_err(|e| format!("Make: bad token or region ({})", e))?;
+    let mut out: Vec<serde_json::Value> = Vec::new();
+    if let Some(arr) = orgs.get("organizations").and_then(|v| v.as_array()) {
+        for org in arr {
+            let Some(oid) = org.get("id") else { continue };
+            let sc: serde_json::Value = match client.get(format!("{}/scenarios?organizationId={}", base, oid))
+                .header("Authorization", &auth).send().await {
+                Ok(r) => r.json().await.unwrap_or(serde_json::json!({})),
+                Err(_) => continue,
+            };
+            if let Some(list) = sc.get("scenarios").and_then(|v| v.as_array()) {
+                for s in list {
+                    let id = match s.get("id") {
+                        Some(serde_json::Value::Number(n)) => n.to_string(),
+                        Some(serde_json::Value::String(x)) => x.clone(),
+                        _ => continue,
+                    };
+                    let name = s.get("name").and_then(|v| v.as_str()).unwrap_or("Scenario");
+                    out.push(serde_json::json!({ "id": id, "name": name }));
+                }
+            }
+        }
+    }
+    if out.is_empty() { return Err("No scenarios found. Check the token and region.".into()); }
+    Ok(serde_json::json!({ "scenarios": out }).to_string())
+}
+
+// Run a Make scenario now (used by the automation trigger).
+#[tauri::command]
+async fn make_run(args: MakeArgs) -> Result<String, String> {
+    let region = args.region.trim();
+    let token = args.token.trim();
+    let sid = args.scenario_id.trim();
+    if token.is_empty() || region.is_empty() || sid.is_empty() { return Err("Make token, region, and scenario are required".into()); }
+    let res = reqwest::Client::new()
+        .post(format!("https://{}.make.com/api/v2/scenarios/{}/run", region, sid))
+        .header("Authorization", format!("Token {}", token))
+        .header("Content-Type", "application/json")
+        .body("{}").send().await.map_err(|e| e.to_string())?;
+    let status = res.status();
+    let text = res.text().await.unwrap_or_default();
+    if !status.is_success() { return Err(format!("make {}: {}", status.as_u16(), text.chars().take(200).collect::<String>())); }
+    Ok("{\"ok\":true}".into())
+}
+
 // Manus: hand a whole task to the autonomous agent. It runs async in Manus cloud; return the task URL to open.
 // POST https://api.manus.ai/v2/task.create, header x-manus-api-key.
 #[derive(serde::Deserialize)]
@@ -2932,7 +2992,7 @@ pub fn run() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![open_url, inject_text, hide_overlay, show_main, show_agents, hide_agents, save_artifact, restore_clipboard, capture_selection, capture_screen, send_browser_command, capture_screen_full, mouse_click, mouse_move, cursor_pos, type_text, mouse_scroll, press_key, openai_login_start, openai_login_poll, cu_step, cu_chat, copilot_read_cli_token, ollama_list_models, pick_folder, set_autostart, get_autostart, whatsapp_send, sb_tree, sb_read, sb_write, sb_mkdir, sb_delete, sb_search, openai_tts, gemini_tts, google_connect, google_refresh, google_calendar_create, youtube_get, gmail_list, gmail_send, drive_create, ms_connect, ms_refresh, ms_calendar_create, ms_mail_send, ms_drive_create, notion_connect, notion_create_page, slack_connect, slack_test, slack_post, perplexity_ask, elevenlabs_tts, elevenlabs_speak, gamma_generate, heygen_video, webhook_post, manus_task, higgsfield_generate, heygen_assets, figma_connect, resend_send, supabase_rest, supabase_schema, figma_api, github_device_start, github_device_poll, github_api, shopify_api, gumloop_start, telegram_poll, telegram_send, mcp_rpc, claude_verify, claude_read_cli_token])
+        .invoke_handler(tauri::generate_handler![open_url, inject_text, hide_overlay, show_main, show_agents, hide_agents, save_artifact, restore_clipboard, capture_selection, capture_screen, send_browser_command, capture_screen_full, mouse_click, mouse_move, cursor_pos, type_text, mouse_scroll, press_key, openai_login_start, openai_login_poll, cu_step, cu_chat, copilot_read_cli_token, ollama_list_models, pick_folder, set_autostart, get_autostart, whatsapp_send, sb_tree, sb_read, sb_write, sb_mkdir, sb_delete, sb_search, openai_tts, gemini_tts, google_connect, google_refresh, google_calendar_create, youtube_get, gmail_list, gmail_send, drive_create, ms_connect, ms_refresh, ms_calendar_create, ms_mail_send, ms_drive_create, notion_connect, notion_create_page, slack_connect, slack_test, slack_post, perplexity_ask, elevenlabs_tts, elevenlabs_speak, gamma_generate, heygen_video, webhook_post, manus_task, higgsfield_generate, heygen_assets, figma_connect, resend_send, supabase_rest, supabase_schema, figma_api, github_device_start, github_device_poll, github_api, shopify_api, gumloop_start, telegram_poll, telegram_send, mcp_rpc, claude_verify, claude_read_cli_token, make_scenarios, make_run])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

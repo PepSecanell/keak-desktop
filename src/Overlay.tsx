@@ -625,9 +625,16 @@ async function makeVideo(script: string): Promise<string | null> {
   try { return await invoke<string>("heygen_video", { args: { apiKey: key, script, avatarId, voiceId } }); }
   catch (e) { console.log("[KEAK] heygen failed:", String(e)); return String(e); }
 }
-// Fire an n8n / Make webhook. Returns true on success. (Both are Catch-Hook / Custom-webhook URLs.)
+// Fire an automation. Make runs the chosen scenario via its API; n8n fires a Catch-Hook webhook URL.
 async function fireAutomation(text: string): Promise<boolean> {
-  const url = toolKey("n8n") || toolKey("make");
+  const mtoken = localStorage.getItem("keak_make_token");
+  const mscenario = localStorage.getItem("keak_make_scenario");
+  const mregion = localStorage.getItem("keak_make_region") || "eu2";
+  if (mtoken && mscenario) {
+    try { await invoke("make_run", { args: { token: mtoken, region: mregion, scenarioId: mscenario } }); return true; }
+    catch (e) { console.log("[KEAK] make run failed:", String(e)); /* fall through to n8n if present */ }
+  }
+  const url = toolKey("n8n");
   if (!url) return false;
   try { await invoke("webhook_post", { args: { url, text } }); return true; }
   catch (e) { console.log("[KEAK] webhook failed:", String(e)); return false; }
