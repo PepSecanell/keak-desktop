@@ -41,4 +41,6 @@ tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = ["Win32_UI_Input_KeyboardAndMouse"] }
+cpal = "0.15"
+rustpotter = { git = "https://github.com/GiviMAD/rustpotter", tag = "v2.0.0" }
 

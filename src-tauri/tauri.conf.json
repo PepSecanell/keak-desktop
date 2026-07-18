@@ -54,6 +54,23 @@
         "resizable": false,
         "focus": false,
         "visible": false
+      },
+      {
+        "label": "orb",
+        "title": "Keak",
+        "url": "/?view=orb",
+        "width": 96,
+        "height": 96,
+        "x": 1760,
+        "y": 900,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "resizable": false,
+        "focus": false,
+        "visible": false
       }
     ],
     "security": {

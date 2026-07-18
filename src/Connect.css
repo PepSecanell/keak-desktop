@@ -510,8 +510,13 @@
   border: 1px solid var(--line); border-radius: 14px; padding: 16px 18px;
   background: rgba(255, 255, 255, 0.42); max-width: 620px;
 }
-.cx-conn-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.cx-conn-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; cursor: pointer; }
 .cx-conn-name { font-family: Fraunces, Georgia, serif; font-size: 17px; font-weight: 600; color: var(--ink); }
+/* Collapsed by default: only the head (name + status) shows; click the head to reveal the config. The
+   !important beats inline display styles on some card bodies (e.g. a flex button row). */
+.cx-conn:not(.cx-conn--open) > :not(.cx-conn-head) { display: none !important; }
+.cx-conn-head::after { content: "+"; color: var(--rose); font-size: 20px; font-weight: 700; line-height: 1; opacity: .6; }
+.cx-conn--open > .cx-conn-head::after { content: "\2212"; }
 
 .cx-linkbtn {
   border: none; background: transparent; padding: 0; cursor: pointer; font: inherit;
@@ -546,11 +551,25 @@
 }
 
 /* Second Brain: checkbox row (the global `input{width:100%}` rule would otherwise blow the box up) */
-.cx-check-row { cursor: pointer; }
-.cx-check-row input[type="checkbox"] {
-  width: 18px; height: 18px; min-width: 18px; flex: 0 0 auto;
-  padding: 0; margin: 0; border-radius: 5px; accent-color: var(--rose-deep); cursor: pointer;
+.cx-check-row {
+  cursor: pointer; display: flex; align-items: center; gap: 12px;
+  padding: 12px 14px; border: 1px solid var(--line); border-radius: 12px;
+  background: rgba(44, 21, 8, 0.02); transition: border-color .15s ease, background .15s ease;
 }
+.cx-check-row:hover { border-color: var(--rose); background: rgba(212, 164, 154, 0.09); }
+.cx-check-row input[type="checkbox"] {
+  appearance: none; -webkit-appearance: none;
+  width: 22px; height: 22px; min-width: 22px; flex: 0 0 auto;
+  padding: 0; margin: 0; border-radius: 6px; border: 2px solid var(--rose);
+  background: #FBF6E9; cursor: pointer; position: relative;
+  transition: background .15s ease, border-color .15s ease;
+}
+.cx-check-row input[type="checkbox"]:checked { background: var(--rose); border-color: var(--rose-deep); }
+.cx-check-row input[type="checkbox"]:checked::after {
+  content: ""; position: absolute; left: 6px; top: 2px; width: 6px; height: 11px;
+  border: solid var(--ink); border-width: 0 2.5px 2.5px 0; transform: rotate(45deg);
+}
+.cx-check-row span { color: var(--muted); font-size: 14px; line-height: 1.45; }
 
 /* Second Brain folder preview */
 .cx-tree {

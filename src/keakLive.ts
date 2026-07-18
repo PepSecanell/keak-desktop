@@ -120,7 +120,8 @@ export async function runKeakLiveTest(seconds: number, log: KeakLiveLog): Promis
       ws.send(JSON.stringify({
         setup: {
           model: GEMINI_MODEL,
-          responseModalities: ["AUDIO"],
+          // responseModalities lives under generationConfig in the current Live API (not at the setup root).
+          generationConfig: { responseModalities: ["AUDIO"] },
           systemInstruction: {
             parts: [{ text: "You are Keak, a friendly voice assistant. Answer in 1-2 short spoken sentences. No markdown." }],
           },

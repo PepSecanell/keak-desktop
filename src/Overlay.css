@@ -275,8 +275,24 @@ button { -webkit-app-region: no-drag; }
   flex-direction: column;
   align-items: center;
   gap: 12px;
-  cursor: pointer; /* click anywhere to dismiss */
+  cursor: pointer; /* click anywhere to dismiss (or, while recording, to send) */
 }
+
+/* When you wake an agent by name, its orb sits next to Keak's (Standby off) or replaces it (Standby on). */
+.orb-duo { display: flex; align-items: center; justify-content: center; gap: 20px; }
+.orb--agent { box-shadow: 0 8px 26px rgba(44, 21, 8, 0.22), inset 0 2px 6px rgba(255, 255, 255, 0.4); }
+.agent-name-chip { font-size: 13px; font-weight: 700; letter-spacing: .2px; }
+
+/* Standby: the orb "flies" in from the corner it was parked in, then grows to the centre — so it reads as
+   the same single orb moving, never a second orb popping in the middle. One-shot on open. */
+.assistant-orb-wrap.fly-br { animation: fly-br 440ms cubic-bezier(.2,.85,.25,1) both; }
+.assistant-orb-wrap.fly-bl { animation: fly-bl 440ms cubic-bezier(.2,.85,.25,1) both; }
+.assistant-orb-wrap.fly-tr { animation: fly-tr 440ms cubic-bezier(.2,.85,.25,1) both; }
+.assistant-orb-wrap.fly-tl { animation: fly-tl 440ms cubic-bezier(.2,.85,.25,1) both; }
+@keyframes fly-br { from { transform: translate(230px, 175px) scale(.32); opacity: .35; } to { transform: translate(0,0) scale(1); opacity: 1; } }
+@keyframes fly-bl { from { transform: translate(-230px, 175px) scale(.32); opacity: .35; } to { transform: translate(0,0) scale(1); opacity: 1; } }
+@keyframes fly-tr { from { transform: translate(230px, -175px) scale(.32); opacity: .35; } to { transform: translate(0,0) scale(1); opacity: 1; } }
+@keyframes fly-tl { from { transform: translate(-230px, -175px) scale(.32); opacity: .35; } to { transform: translate(0,0) scale(1); opacity: 1; } }
 
 .orb {
   position: relative;

@@ -1,0 +1,61 @@
+name: Build Keak Sovereign engine
+
+# Manual only (workflow_dispatch). macOS runners are billed at ~10x, so run this only when the engine
+# actually changes. It freezes stt-engine/server.py into a single self-contained executable per OS and
+# publishes them to the fixed "stt-engine" release, which the desktop app downloads on first Sovereign enable.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            asset: keak-stt-windows-x64.exe
+            out: dist/keak-stt.exe
+          - os: macos-latest
+            asset: keak-stt-macos
+            out: dist/keak-stt
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r stt-engine/requirements.txt
+          pip install pyinstaller
+
+      - name: Freeze the engine (PyInstaller, one file)
+        run: >
+          pyinstaller --onefile --name keak-stt --noconfirm
+          --collect-all faster_whisper
+          --collect-all ctranslate2
+          --collect-all onnxruntime
+          --collect-all av
+          --collect-all tokenizers
+          --collect-all huggingface_hub
+          --collect-data imageio_ffmpeg
+          stt-engine/server.py
+
+      - name: Rename output
+        shell: bash
+        run: cp "${{ matrix.out }}" "${{ matrix.asset }}"
+
+      - name: Publish to the stt-engine release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view stt-engine >/dev/null 2>&1 || \
+            gh release create stt-engine --title "Keak Sovereign engine" --notes "Local speech engine (faster-whisper). Downloaded by the desktop app on first Sovereign enable."
+          gh release upload stt-engine "${{ matrix.asset }}" --clobber

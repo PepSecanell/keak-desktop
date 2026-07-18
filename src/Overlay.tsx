@@ -8,16 +8,39 @@ import { readRoutines, isRoutineDue, setRoutineRun, upsertRoutine, newRoutineId,
 import { useUiLang } from "./i18n";
 import { runKeakLiveTest } from "./keakLive"; // EXPERIMENTAL — see keakLive.ts. Delete this line + the
 // liveTestLog/testKeakLive block below + the gated panel in the render to remove the experiment.
+import { LiveKeak, liveInfo, type LiveMode } from "./liveKeak"; // real live voice for the Ctrl+Alt Keak AI turn
 import "./Overlay.css";
 
 const SUPABASE_URL = (import.meta.env.VITE_SUPABASE_URL || "https://c--8d6c4aab-d6cd-4281-ad41-da14196d68fc-prod.lovable.cloud") as string;
 const SUPABASE_ANON_KEY = (import.meta.env.VITE_SUPABASE_ANON_KEY || "sb_publishable_GjF5OPvQRDcdLyuiFGroOg_FiyrnhjN") as string;
+
+// Keak Sovereign: auto-detect local whisper server — no manual toggle needed.
+// Just run start.bat and Keak switches to local automatically.
+const LOCAL_WHISPER = "http://127.0.0.1:9889";
+let _sovereignCache: { ok: boolean; ts: number } | null = null;
+async function isLocalServerUp(): Promise<boolean> {
+  const now = Date.now();
+  if (_sovereignCache && now - _sovereignCache.ts < 20_000) return _sovereignCache.ok;
+  const ok = await fetch(`${LOCAL_WHISPER}/health`, { signal: AbortSignal.timeout(400) })
+    .then((r) => r.ok)
+    .catch(() => false);
+  _sovereignCache = { ok, ts: now };
+  return ok;
+}
 
 type OverlayState = "idle" | "recording" | "processing" | "result" | "error" | "responding";
 
 function getSession() {
   const stored = localStorage.getItem("keak_session");
   return stored ? JSON.parse(stored) : null;
+}
+
+// base64 -> Blob, for the WAV chunks the Rust recap engine hands back.
+function b64ToBlob(b64: string, type: string): Blob {
+  const bin = atob(b64);
+  const arr = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+  return new Blob([arr], { type });
 }
 
 function userIdFromToken(token: string): string | null {
@@ -730,6 +753,45 @@ async function askOwnAIRaw(ai: OwnAI, system: string, message: string): Promise<
   } });
 }
 
+// ---- Translate-while-dictating -------------------------------------------------------------------
+// Speak one language, write another. When keak_translate_to is set to a target language, dictation
+// transcribes the speech (in whatever language it was spoken) and then translates the cleaned text into
+// the target before it lands at the cursor. The translation runs on the user's OWN connected AI, so it
+// works with any provider and offline in Sovereign mode. If no AI is connected, the cloud `enhance`
+// function can do it instead (it accepts an optional target_language).
+const TRANSLATE_LANG_NAMES: Record<string, string> = {
+  en: "English", es: "Spanish", ca: "Catalan", fr: "French", de: "German",
+  it: "Italian", pt: "Portuguese", zh: "Chinese", hi: "Hindi", ar: "Arabic",
+};
+// The armed target language code ("" / "off" = disabled).
+function translateTarget(): string {
+  const v = (localStorage.getItem("keak_translate_to") || "").trim();
+  return v && v !== "off" ? v : "";
+}
+function translateSystem(langCode: string): string {
+  const name = TRANSLATE_LANG_NAMES[langCode] || langCode;
+  return `You are a translation engine. Translate the user's text into ${name}. Output ONLY the translation, ` +
+    `with no quotes, no notes, no preamble. Keep the meaning, tone, line breaks and any formatting.`;
+}
+
+// ---- Keak Sovereign (zero-cloud dictation) -------------------------------------------------------
+// When keak_sovereign is on, dictation must never touch the cloud: transcription is forced to the local
+// speech server (no cloud fallback) and the clean-up step runs on the user's own connected model instead
+// of the cloud `enhance` function. If no model is connected, the raw local transcript is used as-is
+// (whisper output is already clean), so it still works fully offline.
+function sovereignOn(): boolean {
+  return localStorage.getItem("keak_sovereign") === "1";
+}
+// System prompt that reproduces what the cloud `enhance` function does (clean spoken text into polished
+// writing, apply the chosen Style, keep the SAME language), for the local model in Sovereign mode.
+function localCleanupSystem(thoughtDump: boolean, stylePrompt: string | null): string {
+  const base = thoughtDump
+    ? "You reorganize messy, rambling dictation into clear, well-structured writing. Keep every idea, drop the filler."
+    : "You clean up dictated speech into polished written text: fix punctuation, capitalization and obvious speech errors.";
+  const style = stylePrompt ? ` Apply this style: ${stylePrompt}.` : "";
+  return `${base}${style} Keep the SAME language as the input. Output ONLY the cleaned text, no notes or preamble.`;
+}
+
 // ---- "Change any setting by voice" ---------------------------------------------------------------
 // Keak AI can adjust the personality dials, the model/effort, the voice source, and create or edit agents
 // just by being asked. The fast regex parsers (adjustPersonaFromSpeech / parseModelSwitch) handle the common
@@ -864,6 +926,39 @@ async function getBrainContext(): Promise<string> {
   return text;
 }
 
+// ---- Keak Memory: opt-in, compounding facts about the user. Stored LOCALLY only (keak_memories), never on
+//      Keak's side. Injected into Keak AI's system prompt so it gets more personal over time, and shown +
+//      editable in Settings so the user always sees and controls what it knows.
+export type MemFact = { id: string; text: string; ts: number };
+function memoryOn(): boolean { return localStorage.getItem("keak_memory_on") === "1"; }
+function getMemories(): MemFact[] { try { const l = JSON.parse(localStorage.getItem("keak_memories") || "[]"); return Array.isArray(l) ? l : []; } catch { return []; } }
+function saveMemories(list: MemFact[]) { localStorage.setItem("keak_memories", JSON.stringify(list.slice(0, 200))); }
+function memoryBlock(): string {
+  if (!memoryOn()) return "";
+  const facts = getMemories();
+  if (!facts.length) return "";
+  return `\n\nWhat you remember about ${localStorage.getItem("keak_user_name") || "the user"} (use naturally to be personal; never read this list aloud):\n` + facts.slice(0, 60).map((f) => `- ${f.text}`).join("\n");
+}
+// After a Keak AI turn, quietly ask the user's own AI whether anything durable is worth remembering, and add
+// the new facts (deduped). Best-effort and fire-and-forget so it never slows the spoken reply.
+async function captureMemories(userText: string, assistantText: string): Promise<void> {
+  if (!memoryOn()) return;
+  const ai = resolveOwnAI();
+  if (!ai) return;
+  const existing = getMemories();
+  const sys = `You maintain a short long-term memory of durable facts about the user: their name, role, business, projects, preferences, people they mention, goals, ongoing situations. From the exchange, extract ONLY genuinely durable facts worth remembering later. Ignore one-off questions, small talk, and anything temporary. Do NOT repeat facts already known. Reply with ONLY a JSON array of short strings (max 5), or [] if nothing is worth keeping. Each string is one fact, third person, under 15 words.`;
+  const msg = `Already known:\n${existing.slice(0, 80).map((f) => "- " + f.text).join("\n") || "(nothing yet)"}\n\nUser said: ${userText}\nAssistant said: ${assistantText}`;
+  let facts: string[] = [];
+  try { const raw = await askOwnAIRaw(ai, sys, msg); const m = raw.match(/\[[\s\S]*\]/); if (m) { const arr = JSON.parse(m[0]); if (Array.isArray(arr)) facts = arr.filter((x) => typeof x === "string" && x.trim()).map((x) => x.trim().slice(0, 120)); } } catch { return; }
+  if (!facts.length) return;
+  const seen = new Set(existing.map((f) => f.text.toLowerCase()));
+  const add = facts.filter((f) => !seen.has(f.toLowerCase())).slice(0, 5);
+  if (!add.length) return;
+  const merged = [...add.map((text, i) => ({ id: `${Date.now()}_${i}`, text, ts: Date.now() })), ...existing];
+  saveMemories(merged);
+  emitTo("connect", "memory-updated", {}).catch(() => { /* Connect may be closed */ });
+}
+
 // ---- Control the on-screen agent orbs by voice ("make the agents move in circles", "follow my mouse",
 //      "make them stay still", "gather them", "Sirius, follow my cursor", "hide the names") -------------
 function looksLikeVizCommand(t: string): boolean {
@@ -971,6 +1066,11 @@ function readAgentRoster(): RosterAgent[] {
 type NamedAgent = { name: string; description: string; color: string; choice?: string; personality?: string; tools?: string[] };
 function allAgents(): NamedAgent[] {
   return [...effectiveDefaults().map((a) => ({ name: a.name, description: a.description, color: a.color, personality: a.personality, choice: a.choice || "", tools: a.tools })), ...readAgentRoster()];
+}
+// Slug used as an agent's wake-word key. MUST match the same function in Connect.tsx so training and
+// detection line up ("Nova" -> "nova", "AI Coach" -> "ai_coach").
+function agentKey(name: string): string {
+  return name.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
 }
 
 // If the user addresses a specific agent by name ("Sirius, research X", "ask Rigel to write the copy"),
@@ -1436,10 +1536,28 @@ export default function Overlay() {
   const [errorMsg, setErrorMsg] = useState("");
   const [thoughtDump, setThoughtDump] = useState(false);
   const thoughtDumpRef = useRef(false); // read at processing time (state may be stale in the closure)
+  // Ctrl+Space forces a one-off translation into the shortcut target for THIS dictation only. The ref is
+  // read at processing time; the state drives the pill badge.
+  const translateOnceRef = useRef<string>("");
+  const [liveTranslate, setLiveTranslate] = useState("");
+  const [liveText, setLiveText] = useState(""); // Keak Streaming: the words appearing live in the pill as you talk
+  const recogRef = useRef<{ stop: () => void; abort?: () => void } | null>(null);
+  const streamRawRef = useRef(""); // at-cursor mode: the cleaned text typed live so far
+  const streamFinalLenRef = useRef(0);
+  const recogGotResultRef = useRef(false); // did the live engine produce anything (else fall back to the normal pipeline)
+  const pendingInterimRef = useRef(""); // the not-yet-finalised tail, flushed on release so nothing is lost
+  const recogStoppingRef = useRef(false);
+  const typedFinalsRef = useRef(0); // how many finalised sentences we've already queued to type
+  const cleanChainRef = useRef<Promise<void>>(Promise.resolve()); // sequential clean+type queue (keeps order)
   const modeRef = useRef<"dictate" | "assistant" | "rewrite">("dictate");
   const rewriteTextRef = useRef(""); // the selected text captured for a Rewrite
   const [rewriting, setRewriting] = useState(false);
   const [assistant, setAssistant] = useState(false); // Keak AI panel active
+  const [fromCorner, setFromCorner] = useState(""); // "" = normal centered orb; "br"/"bl"/"tr"/"tl" = flew in from that corner (Standby)
+  const [activeAgent, setActiveAgent] = useState<NamedAgent | null>(null); // set when you wake an agent by name ("Hey Nova") — the turn runs as that agent + shows its orb
+  const activeAgentRef = useRef<NamedAgent | null>(null);
+  useEffect(() => { activeAgentRef.current = activeAgent; }, [activeAgent]);
+  useEffect(() => { if (!assistant) setActiveAgent(null); }, [assistant]); // agent context is per conversation; drop it when the panel closes
   const [aiReply, setAiReply] = useState("");
   // A write/outward action Keak AI proposed and is waiting for the user to confirm before it runs.
   const [pendingAction, setPendingAction] = useState<
@@ -1474,6 +1592,12 @@ export default function Overlay() {
   const assistantVisibleRef = useRef(false); // true while the assistant orb is on screen
   const mrRef = useRef<MediaRecorder | null>(null);
   const chunks = useRef<Blob[]>([]);
+  // Live voice (Gemini Live / OpenAI Realtime) for the Keak AI turn: the session, whether it's active, and
+  // the turn mode set by the entry point ("ptt" for Ctrl+Alt / orb click-toggle, "handsfree" for wake word).
+  const liveRef = useRef<LiveKeak | null>(null);
+  const liveActiveRef = useRef<boolean>(false);
+  const liveModeRef = useRef<LiveMode>("ptt");
+  const liveFinishPendingRef = useRef<boolean>(false); // a release that arrived while the session was still opening
   const streamRef = useRef<MediaStream | null>(null); // the (warm) mic stream, reused between dictations
   const micReleaseRef = useRef<number | null>(null); // idle timer that turns the mic off after use
   const readyToStop = useRef(false);
@@ -1490,9 +1614,91 @@ export default function Overlay() {
     if (s?.access_token) ensureFillers(s.access_token);
   }, []);
 
+  // Standby orb: bring the corner orb back on startup if the user had it on last session.
+  useEffect(() => {
+    if (localStorage.getItem("keak_standby") === "1") {
+      invoke("set_standby", { on: true, corner: localStorage.getItem("keak_orb_corner") || "br" }).catch(() => { /* ignore */ });
+    }
+  }, []);
+
+  // Reset the orb's "listening" ring whenever the turn ends — on idle OR error (else it spins forever).
+  useEffect(() => {
+    if (state === "idle" || state === "error") emitTo("orb", "orb-idle").catch(() => { /* ignore */ });
+  }, [state]);
+
+  // ONE orb only (Standby). When the Keak AI panel opens, hide the corner orb and remember which corner it
+  // sat in so the centered orb can fly in from there. When the panel closes, bring the corner orb back. This
+  // is why you never see two orbs: the corner orb and the centered orb are never on screen at the same time.
+  // When Standby is OFF, this does nothing — Ctrl+Alt just shows the centered orb as before.
+  useEffect(() => {
+    if (localStorage.getItem("keak_standby") !== "1") return;
+    const corner = localStorage.getItem("keak_orb_corner") || "br";
+    if (assistant) { setFromCorner(corner); invoke("orb_hide").catch(() => { /* ignore */ }); }
+    else { setFromCorner(""); invoke("set_standby", { on: true, corner }).catch(() => { /* ignore */ }); }
+  }, [assistant]);
+
+  // Hey Keak wake word: a detection from the on-device engine starts a hands-free Keak AI turn on the HIDDEN
+  // overlay (records, auto-stops after you go quiet, answers out loud). Restart the engine on load if it was on.
+  useEffect(() => {
+    if (localStorage.getItem("keak_wake") === "1") invoke("wake_start").catch(() => { /* not trained yet */ });
+    // Silence-based auto-stop for hands-free turns: wait for speech, then stop after ~1.2s of quiet.
+    const startVad = () => {
+      const stream = streamRef.current;
+      if (!stream) return;
+      const AC: typeof AudioContext = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+      let ctx: AudioContext;
+      try { ctx = new AC(); } catch { return; }
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 512;
+      ctx.createMediaStreamSource(stream).connect(analyser);
+      const data = new Uint8Array(analyser.fftSize);
+      let spoke = false, silenceStart = 0;
+      const startT = performance.now();
+      const tick = () => {
+        if (stateRef.current !== "recording") { ctx.close().catch(() => {}); return; }
+        analyser.getByteTimeDomainData(data);
+        let sum = 0;
+        for (let i = 0; i < data.length; i++) { const v = (data[i] - 128) / 128; sum += v * v; }
+        const rms = Math.sqrt(sum / data.length);
+        const now = performance.now();
+        if (rms > 0.045) { spoke = true; silenceStart = 0; }
+        else if (spoke && silenceStart === 0) { silenceStart = now; }
+        else if (spoke && now - silenceStart > 1200) { stopRecording(); ctx.close().catch(() => {}); return; }
+        if (now - startT > 14000) { stopRecording(); ctx.close().catch(() => {}); return; }
+        requestAnimationFrame(tick);
+      };
+      requestAnimationFrame(tick);
+    };
+    const wakeP = listen<string>("wake-detected", async (e) => {
+      if (stateRef.current !== "idle") return; // busy — ignore
+      const which = (e.payload as string) || "hey_keak";
+      // "hey_keak" wakes Keak AI; anything else is an agent's wake word ("Hey Nova") -> run as that agent.
+      const agent = which === "hey_keak" ? null : (allAgents().find((a) => agentKey(a.name) === which) || null);
+      // Keak AI needs a connected AI; agents need the user's OWN AI. If there's nothing to answer with, ignore
+      // the wake instead of recording into a dead end (that was the old "spins forever" bug).
+      if (agent && !resolveOwnAI()) return;
+      if (which === "hey_keak" && !resolveOwnAI() && !getSession()?.access_token) return;
+      setActiveAgent(agent);
+      modeRef.current = "assistant";
+      liveModeRef.current = "handsfree"; // wake word is hands-free: the live session ends on its own silence
+      if (assistantVisibleRef.current) { cancelAssistantClose(); }
+      else { assistantVisibleRef.current = true; setAssistant(true); setAiReply(""); historyRef.current = []; }
+      setAttachedScreen(false);
+      screenOffThisTurnRef.current = false;
+      seeScreenRef.current = false;
+      setSeeScreen(false);
+      refreshScreenPermission();
+      invoke("orb_show").catch(() => {}); // show the Keak AI panel so the answer is visible
+      emitTo("orb", "orb-active").catch(() => {});
+      await startRecording();
+      if (!liveInfo()) startVad(); // live sessions detect end-of-speech themselves; classic flow needs the VAD
+    });
+    return () => { wakeP.then((f) => f()); };
+  }, []);
+
   // Push-to-talk. Ctrl+Win = Dictate; Ctrl+Alt = Keak AI or Thought Dump (per the user's setting).
   useEffect(() => {
-    const startP = listen<boolean>("ptt-start", (e) => {
+    const startP = listen<{ dump?: boolean; translate?: boolean } | boolean>("ptt-start", (e) => {
       if (stateRef.current === "idle") {
         // Plan gate: dictation is the paid feature. If the plan's minutes are used up, don't record — show the
         // upgrade message. Keak AI (Ctrl+Alt) still works because it runs on the user's own AI.
@@ -1507,9 +1713,16 @@ export default function Overlay() {
         setAssistant(false); // leaving any open Keak AI conversation
         setAiReply("");
         historyRef.current = [];
-        const dump = e.payload === true;
+        const p = e.payload;
+        const dump = p === true || (typeof p === "object" && p?.dump === true);
+        const translate = typeof p === "object" && p?.translate === true;
         thoughtDumpRef.current = dump;
         setThoughtDump(dump);
+        // Ctrl+Space: translate this dictation into the chosen language (the target set in Settings, else the
+        // last language picked, else English).
+        const forced = translate ? (translateTarget() || localStorage.getItem("keak_translate_shift") || "en") : "";
+        translateOnceRef.current = forced;
+        setLiveTranslate(forced);
         startRecording();
       }
     });
@@ -1536,12 +1749,14 @@ export default function Overlay() {
         startRecording();
       } else {
         modeRef.current = "assistant";
+        liveModeRef.current = "ptt"; // Ctrl+Alt / orb: ends when you release (or click the orb again)
         if (assistantVisibleRef.current) {
           // Overlay still visible (or was interrupted mid-response) — continue the conversation.
           // Cancel the auto-close and keep history so this feels like a natural follow-up.
           cancelAssistantClose();
         } else {
-          // Overlay was already closed — start a fresh conversation.
+          // Overlay was already closed — start a fresh Keak AI conversation (not an agent).
+          setActiveAgent(null);
           assistantVisibleRef.current = true;
           setAssistant(true);
           setAiReply("");
@@ -1627,11 +1842,103 @@ export default function Overlay() {
     }, 90000);
   }
 
+  // Keak Streaming: a live, best-effort preview of your words in the pill while you talk, using the browser's
+  // built-in speech recognition. It NEVER touches the recording or the injected text (which still comes from
+  // our accurate pipeline on release), so if it fails, dictation is completely unaffected. Toggle: keak_streaming.
+  function streamMode(): "off" | "pill" | "cursor" {
+    const v = localStorage.getItem("keak_streaming");
+    if (v === "0" || v === "off") return "off";
+    // "cursor" (true at-the-cursor live typing) is deferred to the proper local streaming engine — until then
+    // any old "cursor" setting behaves as the reliable pill preview. The cursor code below stays for later.
+    return "pill";
+  }
+  // Clean one recognised sentence (punctuation, capitalisation, tidy) on the fast enhance backend, translating
+  // if Ctrl+Space translate is armed. Falls back to the raw sentence if the call fails.
+  async function cleanSentence(raw: string): Promise<string> {
+    const text = raw.trim();
+    if (!text) return "";
+    const session = getSession();
+    const outLang = translateOnceRef.current;
+    const targetName = outLang ? (TRANSLATE_LANG_NAMES[outLang] || outLang) : "";
+    try {
+      const body: Record<string, unknown> = { text, mode: "normal", style_prompt: targetName ? `Translate the text into ${targetName}. Output ONLY the ${targetName} text, nothing else.` : "" };
+      if (targetName) body.target_language = targetName;
+      const res = await fetch(`${SUPABASE_URL}/functions/v1/enhance`, { method: "POST", headers: { Authorization: `Bearer ${session?.access_token || ""}`, "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      const d = await res.json().catch(() => ({} as { enhanced_text?: string }));
+      return (d.enhanced_text && d.enhanced_text.trim()) ? d.enhanced_text.trim() : text;
+    } catch { return text; }
+  }
+  // Queue a sentence to be cleaned then typed at the cursor, keeping order.
+  function enqueueClean(raw: string) {
+    const text = raw.trim();
+    if (!text) return;
+    cleanChainRef.current = cleanChainRef.current.then(async () => {
+      const cleaned = await cleanSentence(text);
+      if (!cleaned) return;
+      const piece = (streamRawRef.current ? " " : "") + cleaned;
+      streamRawRef.current += piece;
+      try { await invoke("stream_type", { text: piece }); } catch { /* ignore */ }
+    });
+  }
+  function startLivePreview() {
+    if (streamMode() === "off") return;
+    try {
+      const SR = (window as unknown as { webkitSpeechRecognition?: new () => any; SpeechRecognition?: new () => any }).webkitSpeechRecognition
+        || (window as unknown as { SpeechRecognition?: new () => any }).SpeechRecognition;
+      if (!SR) return;
+      const l = localStorage.getItem("keak_language") || "auto";
+      const M: Record<string, string> = { es: "es-ES", ca: "ca-ES", en: "en-US", fr: "fr-FR", de: "de-DE", pt: "pt-PT", it: "it-IT" };
+      const rec: any = new SR();
+      rec.continuous = true; rec.interimResults = true;
+      rec.lang = (l !== "auto" && M[l]) ? M[l] : (navigator.language || "en-US");
+      recogStoppingRef.current = false;
+      rec.onresult = (e: any) => {
+        if (recogStoppingRef.current) return;
+        recogGotResultRef.current = true;
+        const finals: string[] = [];
+        let interim = "";
+        for (let i = 0; i < e.results.length; i++) {
+          const r = e.results[i];
+          if (r.isFinal) finals.push(r[0].transcript); else interim += r[0].transcript;
+        }
+        // Cursor mode types at the cursor, so DON'T also show the words in the pill (that was the confusion —
+        // it looked like it typed "in the pill"). Pill mode shows them in the pill.
+        if (streamMode() === "cursor" && modeRef.current === "dictate") {
+          for (let k = typedFinalsRef.current; k < finals.length; k++) enqueueClean(finals[k]);
+          typedFinalsRef.current = finals.length;
+          pendingInterimRef.current = interim;
+        } else {
+          setLiveText((finals.join(" ") + " " + interim).replace(/\s+/g, " ").trim());
+        }
+      };
+      rec.onerror = () => { /* best-effort, ignore */ };
+      recogRef.current = rec;
+      rec.start();
+    } catch { /* ignore — preview is optional */ }
+  }
+  function stopLivePreview() {
+    recogStoppingRef.current = true;
+    // Flush the last (not-yet-finalised) words so the tail of your sentence isn't lost.
+    const tail = pendingInterimRef.current.trim();
+    pendingInterimRef.current = "";
+    if (tail && streamMode() === "cursor" && modeRef.current === "dictate") enqueueClean(tail);
+    try { recogRef.current?.stop(); } catch { /* ignore */ }
+    recogRef.current = null;
+  }
+
   async function startRecording() {
     cancelAssistantClose(); // a new question cancels any pending auto-close
     cancelMicRelease(); // we're about to use the mic; don't let the idle timer stop it mid-use
     stopSpeaking(); // interrupt any answer still playing so you can talk over it
+    if (liveActiveRef.current) { liveRef.current?.close(); liveActiveRef.current = false; } // end any live session first
+    // Live voice: a Keak AI turn on a live-capable provider (Gemini Live / OpenAI Realtime) goes straight to
+    // the realtime session instead of the record -> transcribe -> answer -> TTS chain.
+    if (modeRef.current === "assistant" && liveInfo()) { await startLiveTurn(liveModeRef.current); return; }
     chunks.current = [];
+    setLiveText("");
+    streamRawRef.current = ""; streamFinalLenRef.current = 0;
+    recogGotResultRef.current = false; pendingInterimRef.current = ""; recogStoppingRef.current = false;
+    typedFinalsRef.current = 0; cleanChainRef.current = Promise.resolve();
     readyToStop.current = false;
     try {
       const stream = await getWarmStream();
@@ -1649,6 +1956,7 @@ export default function Overlay() {
       readyToStop.current = true;
       setStateSafe("recording"); // only after recorder is live
       cancelAssistantClose(); // kill any close scheduled while the mic was being acquired
+      startLivePreview(); // show words forming live (best-effort, never blocks the above)
     } catch {
       setStateSafe("error");
       setErrorMsg("Microphone access denied");
@@ -1656,8 +1964,15 @@ export default function Overlay() {
   }
 
   function stopRecording() {
+    // Live voice: end the user's turn -> the model replies out loud. finishTurn() is guarded/idempotent.
+    // If the session is still opening, mark it pending so startLiveTurn finishes as soon as it's ready.
+    if (liveActiveRef.current) {
+      if (liveRef.current) liveRef.current.finishTurn(); else liveFinishPendingRef.current = true;
+      setStateSafe("processing"); return;
+    }
     if (!readyToStop.current || !mrRef.current) return;
     readyToStop.current = false;
+    stopLivePreview();
     if (mrRef.current.state !== "inactive") {
       mrRef.current.stop();
     }
@@ -1688,6 +2003,24 @@ export default function Overlay() {
       return;
     }
 
+    // Keak Streaming "at cursor" mode: the clean sentences were already typed at the cursor live. Wait for the
+    // last queued sentence to finish typing, then finish — don't transcribe + inject again. Only when the live
+    // engine produced nothing do we fall through to the normal accurate pipeline (so dictation never breaks).
+    if (modeRef.current === "dictate" && streamMode() === "cursor" && recogGotResultRef.current) {
+      try { await cleanChainRef.current; } catch { /* ignore */ }
+      const finalText = streamRawRef.current.trim();
+      if (finalText) {
+        // The clean sentences were typed at the cursor live — finish without transcribing/injecting again.
+        await invoke("hide_overlay");
+        saveHistory(session, { raw_text: finalText, final_text: finalText, mode: thoughtDumpRef.current ? "thought_dump" : "normal", duration_seconds: null });
+        setLiveTranslate("");
+        reset();
+        return;
+      }
+      // Nothing actually landed (recognition gave only interim, or typing failed) — fall through to the normal
+      // accurate pipeline so your dictation still gets injected.
+    }
+
     // Renew the token if it expired (~1h), so authed calls don't silently fail.
     session = await ensureFreshSession(session);
 
@@ -1712,11 +2045,11 @@ export default function Overlay() {
       const lang = localStorage.getItem("keak_language");
       if (lang && lang !== "auto") form.append("language", lang);
 
-      // ── Keak Sovereign: local transcription path ──────────────────────────
-      // Enable by running PROJECTS/KEAK/local-whisper/start.bat, then:
-      //   localStorage.setItem("keak_offline_mode", "true")
-      // Disable: localStorage.setItem("keak_offline_mode", "false")
-      const offlineMode = localStorage.getItem("keak_offline_mode") === "true";
+      // ── Keak Sovereign: force fully-local, zero-cloud ────────────────────
+      // When Sovereign is on we ALWAYS use the local server and never fall back to the cloud (below, if
+      // the local server isn't up it errors out instead of transcribing in the cloud). Otherwise we
+      // auto-detect: if a local server is running (e.g. start.bat), use it; else use the cloud.
+      const offlineMode = sovereignOn() ? true : await isLocalServerUp();
       let tData: any;
       if (offlineMode) {
         const localRes = await fetch("http://127.0.0.1:9889/transcribe", {
@@ -1777,6 +2110,20 @@ export default function Overlay() {
           reset();
         }
         return;
+      }
+
+      // Whisper hallucination guard: on silence or ambient/keyboard noise the model often "hears" its own
+      // vocabulary ("Keak", "Keoly") or a stock filler ("Thank you", "Subtitles by…"). That is NOT real
+      // speech — never inject it at the cursor (this is what wrote "keak and keoly" while typing). Only guards
+      // dictation/rewrite; the assistant already handles junk by just answering.
+      if (modeRef.current !== "assistant") {
+        const junk = String(tData.text).toLowerCase().replace(/[.,!¡¿?"'()\-–—:;\s]+/g, " ").replace(/\s+/g, " ").trim();
+        const HALLUCINATIONS = new Set([
+          "", "keak", "keoly", "keak keoly", "keak and keoly", "keoly keak", "keak keak", "keoly keoly",
+          "you", "thank you", "thanks", "thanks for watching", "thank you for watching", "bye", "amen", "the",
+          "subtitles by the amara org community", "subtitulos realizados por la comunidad de amara org", "subtitulos amara org", "amara org",
+        ]);
+        if (junk === "" || HALLUCINATIONS.has(junk)) { await invoke("hide_overlay"); reset(); return; }
       }
 
       // Remember the language of what was actually said, so fillers + auto-detect replies match it (Spanish
@@ -1855,22 +2202,77 @@ export default function Overlay() {
       } catch { /* kodes are best-effort — fall through to normal enhance */ }
 
       const stylePrompt = localStorage.getItem("keak_default_style") || null;
-      const eRes = await fetch(`${SUPABASE_URL}/functions/v1/enhance`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${session.access_token}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
+      // Translate-while-dictating: if a target language is armed, the cleaned text is translated into it
+      // before injecting. Prefer the user's own connected AI (free, works offline / in Sovereign); if none
+      // is connected, fall back to Keak's cloud AI — except in Sovereign mode, which must stay zero-cloud.
+      // Only Ctrl+Win+Shift translates. Plain Ctrl+Win always writes the spoken language, no translation.
+      const forcedLang = translateOnceRef.current;
+      translateOnceRef.current = "";
+      const outLang = forcedLang;
+      const targetName = outLang ? (TRANSLATE_LANG_NAMES[outLang] || outLang) : "";
+      // The user's own model — used for translation, and for the clean-up step in Sovereign mode.
+      const ownAi = (outLang || sovereignOn()) ? resolveOwnAI() : null;
+      let finalText: string;
+      if (sovereignOn()) {
+        // Zero-cloud: clean up the transcript on the user's own model. No connected model → use the raw
+        // transcript (whisper output is already clean). The cloud enhance function is never called.
+        if (ownAi) {
+          try {
+            finalText = (await askOwnAIRaw(ownAi, localCleanupSystem(!!thoughtDumpRef.current, stylePrompt), tData.text)).trim() || tData.text;
+          } catch { finalText = tData.text; }
+        } else {
+          finalText = tData.text;
+        }
+      } else {
+        const enhanceBody: Record<string, unknown> = {
           text: tData.text,
           mode: thoughtDumpRef.current ? "thought_dump" : "normal",
           style_prompt: stylePrompt,
-        }),
-      });
-      const eData = await eRes.json();
-      const finalText = eData.enhanced_text || tData.text;
+        };
+        const eRes = await fetch(`${SUPABASE_URL}/functions/v1/enhance`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${session.access_token}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(enhanceBody),
+        });
+        const eData = await eRes.json();
+        finalText = eData.enhanced_text || tData.text;
+      }
+      // Translate the cleaned text into the target language. Own AI first (free/offline); if that isn't
+      // available or fails, a dedicated cloud enhance call does the translation — so it works even with no
+      // model connected. Never hits the cloud in Sovereign mode.
+      if (outLang) {
+        let translated = "";
+        if (ownAi) {
+          try { translated = (await askOwnAIRaw(ownAi, translateSystem(outLang), finalText)).trim(); }
+          catch { /* fall through to the cloud fallback below */ }
+        }
+        if (!translated && !sovereignOn()) {
+          try {
+            const tRes = await fetch(`${SUPABASE_URL}/functions/v1/enhance`, {
+              method: "POST",
+              headers: {
+                Authorization: `Bearer ${session.access_token}`,
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({
+                text: finalText,
+                mode: "normal",
+                style_prompt: `Translate the text into ${targetName}. Output ONLY the ${targetName} translation, nothing else — no notes, no quotes, no original text.`,
+                target_language: targetName,
+              }),
+            });
+            const tData2 = await tRes.json();
+            if (tData2.enhanced_text && tData2.enhanced_text.trim()) translated = tData2.enhanced_text.trim();
+          } catch { /* translation is best-effort — fall back to the untranslated text */ }
+        }
+        if (translated) finalText = translated;
+      }
       // Wispr-style: drop the cleaned text straight where the cursor was, no review step.
       await invoke("inject_text", { text: finalText });
+      setLiveTranslate(""); // clear the one-off translate badge now the dictation is done
       // Save to shared History (best-effort) so it shows across web/mobile/desktop.
       saveHistory(session, {
         raw_text: tData.text,
@@ -2111,11 +2513,134 @@ export default function Overlay() {
     finally { clearTimeout(safety); show(); if (stateRef.current === "idle") scheduleAssistantClose(11000); }
   }
 
+  // Keak team-to-team (Telegram group): log each interaction for the Connect "Team" tab.
+  function pushTeamLog(e: { ts: number; dir: string; who: string; body: string; result?: string }) {
+    try { const prev = JSON.parse(localStorage.getItem("keak_team_log") || "[]"); const h = Array.isArray(prev) ? prev : []; h.unshift(e); localStorage.setItem("keak_team_log", JSON.stringify(h.slice(0, 40))); } catch { /* ignore */ }
+  }
+  // A teammate addressed my Keak in the team Telegram group. Run the task on MY own AI (optionally with my
+  // Second Brain) and return the finished result to post back in the group. Runs entirely on my side.
+  async function answerForTeam(task: string, fromName: string): Promise<string> {
+    const ai = resolveOwnAI();
+    if (!ai) return "Couldn't run it — no AI is connected on my Keak.";
+    const access = localStorage.getItem("keak_team_access") || "ai";
+    let ctx = "";
+    if (access === "brain") { try { ctx = await getBrainContext(); } catch { /* ignore */ } }
+    const myNm = localStorage.getItem("keak_team_name") || localStorage.getItem("keak_user_name") || "me";
+    const system = `You are ${myNm}'s Keak assistant, helping in a team group chat. ${fromName} asked you to do a task. Do it as well as you can and reply with ONLY the finished result, concise and ready to read in the group.${ctx ? `\n\nContext from ${myNm}'s Second Brain (use if relevant, never dump it verbatim):\n${ctx}` : ""}`;
+    try { return (await askOwnAIRaw(ai, system, task)).trim() || "(no result)"; } catch (e) { return `Hit an error: ${String(e).slice(0, 140)}`; }
+  }
+
+  // Keak Recap by voice: stop the capture, transcribe it in chunks, summarise on the user's own AI, speak a
+  // short version and save the full recap so it shows in the Recap tab.
+  async function runRecapVoice(token: string) {
+    setStateSafe("responding"); setAiReply("Wrapping up the recap...");
+    let res: [string, number];
+    try { res = await invoke<[string, number]>("recap_stop"); }
+    catch (e) { await sayAndClose(`I couldn't stop the recap: ${String(e).slice(0, 120)}`, token); return; }
+    const secs = res[1] || 0;
+    if (secs < 1.5) { await sayAndClose("There was nothing to recap. Start it while the meeting audio is playing.", token); return; }
+    let count = 0; try { count = await invoke<number>("recap_chunk_count", { chunkSecs: 120 }); } catch { /* ignore */ }
+    const session = getSession();
+    const lang = localStorage.getItem("keak_language");
+    let transcript = "";
+    for (let i = 0; i < count; i++) {
+      setAiReply(`Transcribing the recap ${i + 1}/${count}...`);
+      let b64 = ""; try { b64 = await invoke<string>("recap_chunk_b64", { index: i, chunkSecs: 120 }); } catch { /* ignore */ }
+      if (!b64) continue;
+      const form = new FormData();
+      form.append("file", b64ToBlob(b64, "audio/wav"), "chunk.wav");
+      if (lang && lang !== "auto") form.append("language", lang);
+      try {
+        const r = await fetch(`${SUPABASE_URL}/functions/v1/transcribe`, { method: "POST", headers: { Authorization: `Bearer ${session?.access_token || ""}` }, body: form });
+        const d = await r.json().catch(() => ({} as { text?: string }));
+        if (d.text) transcript += (transcript ? " " : "") + String(d.text).trim();
+      } catch { /* skip a bad chunk */ }
+    }
+    transcript = transcript.trim();
+    if (!transcript) { await sayAndClose("I captured audio but couldn't hear any speech to recap.", token); return; }
+    setAiReply("Writing the recap...");
+    const ai = resolveOwnAI();
+    const uiCode = localStorage.getItem("keak_ui_lang") || "en";
+    const LN: Record<string, string> = { es: "Spanish", ca: "Catalan", fr: "French", de: "German", pt: "Portuguese", it: "Italian", en: "English" };
+    const system = `You are given a raw transcript of a call or meeting captured from the user's computer audio. Write a clean recap in ${LN[uiCode] || "English"} with these markdown sections: a one-paragraph Summary, Key points (bullets), Decisions, and Action items (with the owner if named). Be faithful to the transcript and never invent anything. Keep it tight.`;
+    let recap = transcript;
+    if (ai) { try { recap = (await askOwnAIRaw(ai, system, transcript.slice(0, 24000))).trim() || transcript; } catch { /* keep the raw transcript */ } }
+    try { const prev = JSON.parse(localStorage.getItem("keak_recap_history") || "[]"); const h = Array.isArray(prev) ? prev : []; h.unshift({ ts: Date.now(), secs, recap, transcript }); localStorage.setItem("keak_recap_history", JSON.stringify(h.slice(0, 20))); } catch { /* ignore */ }
+    emitTo("connect", "recap-done", { recap }).catch(() => { /* Connect may be closed */ });
+    historyRef.current.push({ role: "user", text: "Recap the meeting" }, { role: "assistant", text: recap });
+    await sayAndClose(shortSpoken(recap) + " I saved the full recap in the Recap tab.", token, 18000);
+  }
+
+  // Keak Ledger by voice: parse a spoken money entry (expense OR income) on the user's own AI and append a
+  // clean CSV row to "Keak Ledger/ledger.csv" inside the connected Second Brain folder. Privacy by design:
+  // the row only ever lives in the user's own folder, never on Keak's side. No dedicated UI — you just ask.
+  async function runLedgerVoice(question: string, token: string) {
+    const root = localStorage.getItem("keak_brain_path") || "";
+    if (!root) { await sayAndClose("To keep your ledger, connect your Second Brain folder in settings first.", token); return; }
+    const ai = resolveOwnAI();
+    if (!ai) { await sayAndClose("Connect your AI first so I can read the entry.", token); return; }
+    setStateSafe("responding"); setAiReply("Adding it to your ledger...");
+    const defCur = (localStorage.getItem("keak_ledger_currency") || "EUR").toUpperCase();
+    const now = new Date();
+    const iso = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+    const system = `You turn a spoken money entry into ONE JSON object and nothing else: {"type":"expense" or "income","amount":number,"currency":"3-letter code","category":"one or two word category","description":"what it was for","vendor":"who was paid or who paid, or empty","date":"YYYY-MM-DD"}. Decide type: money going out (spent, bought, paid a bill) = expense; money coming in (earned, invoice paid, client paid me, revenue) = income. Use ${defCur} if no currency is said. Use ${iso} if no date is said; understand relative dates like "yesterday" or "last Monday" against ${iso}. Category examples: Food, Travel, Software, Office, Client, Marketing, Sales. Keep description short. Reply with ONLY the JSON.`;
+    let row: { type?: unknown; amount?: unknown; currency?: unknown; category?: unknown; description?: unknown; vendor?: unknown; date?: unknown } | null = null;
+    try { const raw = await askOwnAIRaw(ai, system, question); const m = raw.match(/\{[\s\S]*\}/); if (m) row = JSON.parse(m[0]); } catch { /* ignore */ }
+    const amount = typeof row?.amount === "number" ? row.amount : parseFloat(String(row?.amount ?? ""));
+    if (!row || !isFinite(amount)) { await sayAndClose("I didn't catch an amount. Try: log forty euros, lunch with a client.", token); return; }
+    const kind = String(row.type || "").toLowerCase().startsWith("inc") ? "Income" : "Expense";
+    const cur = String(row.currency || defCur).toUpperCase().slice(0, 6);
+    const date = /^\d{4}-\d{2}-\d{2}$/.test(String(row.date || "")) ? String(row.date) : iso;
+    const category = String(row.category || "").slice(0, 40);
+    const description = String(row.description || "").slice(0, 200);
+    const vendor = String(row.vendor || "").slice(0, 80);
+    const esc = (s: string | number) => { const v = String(s ?? "").replace(/"/g, '""'); return /[",\n]/.test(v) ? `"${v}"` : v; };
+    const line = [date, kind, amount, cur, esc(category), esc(description), esc(vendor)].join(",");
+    const path = "Keak Ledger/ledger.csv";
+    const perm = localStorage.getItem("keak_brain_perm") || "full";
+    const header = "Date,Type,Amount,Currency,Category,Description,Vendor";
+    let existing = "";
+    try { existing = await invoke<string>("sb_read", { args: { root, path } }); } catch { /* file doesn't exist yet */ }
+    const body = existing.trim() ? `${existing.replace(/\s+$/, "")}\n${line}\n` : `${header}\n${line}\n`;
+    try { await invoke("sb_write", { args: { root, path, content: body, perm } }); }
+    catch (e) { await sayAndClose(`I couldn't save it: ${String(e).slice(0, 120)}`, token); return; }
+    historyRef.current.push({ role: "user", text: question }, { role: "assistant", text: `Logged ${kind.toLowerCase()} ${amount} ${cur} ${category}` });
+    const curWord = cur === "EUR" ? "euros" : cur === "USD" ? "dollars" : cur === "GBP" ? "pounds" : cur;
+    const verb = kind === "Income" ? "Added income of" : "Logged";
+    await sayAndClose(`${verb} ${amount} ${curWord}${category ? " for " + category.toLowerCase() : ""}. It's in your ledger.`, token);
+  }
+
   async function runAssistant(question: string, token: string, image?: string) {
     cancelAssistantClose();
     const assistantName = localStorage.getItem("keak_assistant_name") || "Keak";
     const userName = localStorage.getItem("keak_user_name") || "there";
     try {
+      // Keak Recap by voice. "start a recap / record this meeting" begins capture; "finish/stop the recap /
+      // recap the meeting" stops and writes it. Checked first so these never get treated as a question.
+      if (/\b(start|begin|empieza|inicia|comienza)\b[\s\S]*\b(recap|recording|record|grabaci[oó]n|grabar|resumen)\b|\brecord (?:this|the) (?:meeting|call)\b|\bgraba (?:esta|la) (?:reuni[oó]n|llamada)\b/i.test(question)) {
+        await invoke("recap_start", { mic: localStorage.getItem("keak_recap_mic") !== "0" }).catch(() => {});
+        await sayAndClose("Recording the meeting. Say finish the recap when you are done.", token);
+        return;
+      }
+      if (/\b(finish|stop|end|finali[sz]e|termina|finaliza|para)\b[\s\S]*\b(recap|recording|grabaci[oó]n|resumen)\b|\brecap (?:the|this|it|that)\b|\bhaz (?:el|un) resumen\b/i.test(question)) {
+        await runRecapVoice(token);
+        return;
+      }
+      // Keak Ledger by voice: "log 40 euros for lunch", "add an expense", "track 500 euros income from a
+      // client", "apunta un gasto de 20 euros". Parses the spoken money entry (expense OR income) on your own
+      // AI and appends a clean row to Keak Ledger/ledger.csv in your connected Second Brain folder. Never
+      // stored on Keak's side.
+      {
+        const ledgerVerb = /\b(log|add|record|note|track|jot|apunta|an[oó]ta|registra|a[ñn]ade|ap[uú]nta(?:me)?|guarda)\b/i.test(question);
+        const moneyNoun = /\b(expenses?|spend|spent|cost|costs|purchase|payment|paid|bought|receipt|income|earned|earning|revenue|received|invoice|got paid|gasto|gastos|gast[eé]|compr[eé]|pagu[eé]|recibo|ticket|ingresos?|ingres[eé]|cobr[eé]|factura|ganancia)\b/i.test(question);
+        const currencyWord = /\b(euros?|dollars?|pounds?|d[oó]lares?|libras?|usd|eur|gbp)\b|[€$£]/i.test(question);
+        const money = /(\d+([.,]\d+)?)\s*(€|\$|£|euros?|dollars?|pounds?|usd|eur|gbp|d[oó]lares?|libras?)|[€$£]\s*\d/i.test(question);
+        const toLedger = /\b(?:to|in) (?:my|the) (?:ledger|expenses?|income|accounts?|books?)\b|\b(?:al?|en) (?:mi|el|la) (?:libro|ledger|gastos|ingresos|cuentas?|contabilidad)\b/i.test(question);
+        if ((ledgerVerb && (moneyNoun || money || currencyWord)) || toLedger) {
+          await runLedgerVoice(question, token);
+          return;
+        }
+      }
       // [KEAK-DEBUG v1.2] confirms the new local handlers are running + shows what was heard.
       console.log("[KEAK v1.2] heard:", JSON.stringify(question));
       // Computer-use: an explicit "take control and do X" command runs the screen agent (TARS) instead
@@ -2137,8 +2662,13 @@ export default function Overlay() {
         return;
       }
 
-      // Direct research via Perplexity when connected: "research X", "look up Y", "investiga Z", or naming it.
-      if (toolKey("perplexity") && (/^\s*(research|look up|find out|search for|investiga|busca|averigua)\b/i.test(question) || /\bperplexity\b/i.test(question))) {
+      // Direct research via Perplexity when connected. Broad triggers so "search the internet", "latest AI
+      // news", "what's new", "look it up", ES "busca en internet / noticias" all reach live web search.
+      const wantsWeb = /\b(search (?:the )?(?:internet|web|online)|on the (?:internet|web)|look ?up|find out|latest|newest|recent(?:ly)?|current|today'?s?|this week|the news|headlines|what'?s (?:new|happening)|breaking|price of|weather|who won)\b/i.test(question)
+        || /^\s*(research|investiga|busca|averigua|google|noticias)\b/i.test(question)
+        || /\b(search the internet|busca en internet|en internet|noticias|últimas noticias)\b/i.test(question)
+        || /\bperplexity\b/i.test(question);
+      if (toolKey("perplexity") && wantsWeb) {
         setAssistant(true); assistantVisibleRef.current = true; cancelAssistantClose();
         setStateSafe("responding"); setAiReply("Researching that live...");
         const r = await askPerplexity(question);
@@ -2645,6 +3175,28 @@ export default function Overlay() {
               offset = Math.max(offset, (upd.update_id || 0) + 1);
               const msg = upd.message; const chatId = msg?.chat?.id; const textIn = msg?.text;
               if (!chatId || !textIn) continue;
+              const isGroup = msg?.chat?.type === "group" || msg?.chat?.type === "supergroup";
+              if (isGroup) {
+                // TEAM GROUP: my Keak only acts on messages that address ME by name ("Pep, do X"), and never on
+                // another bot's post (so the teammates' Keaks don't react to each other's results). Everyone in
+                // the group sees the task and the reply. The first group the bot is added to becomes the team room.
+                if (msg?.from?.is_bot) continue;
+                let grp = localStorage.getItem("keak_team_group") || "";
+                if (!grp) { grp = String(chatId); localStorage.setItem("keak_team_group", grp); }
+                if (String(chatId) !== grp) continue;
+                const myName = (localStorage.getItem("keak_team_name") || localStorage.getItem("keak_user_name") || "").trim();
+                if (!myName) continue;
+                const esc = myName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+                const m = textIn.match(new RegExp("^\\s*@?" + esc + "\\b[\\s,:]+([\\s\\S]+)$", "i"));
+                if (!m || !m[1].trim()) continue; // not addressed to me
+                const task = m[1].trim();
+                const fromName = msg?.from?.first_name || msg?.from?.username || "A teammate";
+                let out = "";
+                try { out = await answerForTeam(task, fromName); } catch (e) { out = `Error: ${String(e).slice(0, 140)}`; }
+                pushTeamLog({ ts: Date.now(), dir: "in-task", who: fromName, body: task, result: out });
+                try { await invoke("telegram_send", { args: { token: tk, chatId: String(chatId), text: `${myName}: ${out}`.slice(0, 3900) } }); } catch { /* ignore */ }
+                continue;
+              }
               let owner = localStorage.getItem("keak_telegram_chat") || "";
               if (!owner) { owner = String(chatId); localStorage.setItem("keak_telegram_chat", owner); }
               if (String(chatId) !== owner) continue; // only the linked phone
@@ -2780,6 +3332,95 @@ export default function Overlay() {
     setStateSafe("idle"); scheduleAssistantClose(9000);
   }
 
+  // Build Keak AI's system prompt (persona, agent team, web ability, language, Second Brain context, Memory).
+  // Shared by the classic cu_chat path AND the live voice session so live Keak knows the user just the same.
+  async function buildAssistantSystem(): Promise<string> {
+    const activeAg = activeAgentRef.current; // set when the user woke an agent by name ("Hey Nova")
+    const assistantName = activeAg ? activeAg.name : (localStorage.getItem("keak_assistant_name") || "Keak");
+    const agentLine = activeAg ? ` You are speaking AS the agent "${activeAg.name}"${activeAg.description ? `, ${activeAg.description}` : ""}. Stay fully in that role and answer as ${activeAg.name}.${activeAg.personality ? ` Your tone: ${activeAg.personality}.` : ""}` : "";
+    const webLine = toolKey("perplexity")
+      ? " You CAN search the live web yourself when asked about current, online, or news topics, so never tell the user you cannot browse the internet."
+      : " You cannot browse the live web right now. If the user asks for current or online info, tell them to enable web search by connecting Perplexity in Keak settings (Connect your AI, then Tools). Do NOT say an agent will do the search for you.";
+    const userName = localStorage.getItem("keak_user_name") || "there";
+    const team = [...effectiveDefaults(), ...readAgentRoster()];
+    const teamInfo = team.map((a) => `${a.name} (${a.description || "general help"})`).join("; ");
+    const brainCtx = await getBrainContext();
+    const UILN: Record<string, string> = { es: "Spanish", fr: "French", de: "German", pt: "Portuguese", it: "Italian", en: "English" };
+    const uiCode = localStorage.getItem("keak_ui_lang") || "en";
+    const langLine = uiCode !== "en" && UILN[uiCode] ? ` Always reply in ${UILN[uiCode]} unless the user clearly writes to you in another language, then reply in that language.` : "";
+    return `You are ${assistantName}, a friendly voice assistant talking to ${userName}. Your reply is read ALOUD, so keep it concise and spoken, usually 1 to 3 sentences. Plain text only, no markdown. When the user explicitly asks you to list something (like your agents), you may give a short plain list. You have a team of ${team.length} agents the user can call on: ${teamInfo}. If asked about your agents or team, tell them how many there are and their names and roles from that list, do NOT say you have no access. To put them to work, the user says "use your team to..." or calls one by name, like "Sirius, research X".${webLine}${agentLine}${langLine} ${personaLines()}${brainCtx ? `\n\nContext about ${userName} from their Second Brain (use it to be accurate and personal; never read it aloud verbatim):\n${brainCtx}` : ""}${memoryBlock()}`;
+  }
+
+  // A LEAN system prompt for the LIVE voice: the live model reads the whole prompt before it can start
+  // talking, so a big one makes the first word slow. Keep just persona + language + Memory + a short slice of
+  // the Second Brain, and drop the heavy agent roster / web boilerplate (live can't call tools anyway).
+  async function buildLiveSystem(): Promise<string> {
+    const activeAg = activeAgentRef.current;
+    const assistantName = activeAg ? activeAg.name : (localStorage.getItem("keak_assistant_name") || "Keak");
+    const userName = localStorage.getItem("keak_user_name") || "there";
+    const persona = activeAg?.personality ? ` Your tone: ${activeAg.personality}.` : "";
+    const UILN: Record<string, string> = { es: "Spanish", fr: "French", de: "German", pt: "Portuguese", it: "Italian", en: "English" };
+    const uiCode = localStorage.getItem("keak_ui_lang") || "en";
+    const langLine = uiCode !== "en" && UILN[uiCode] ? ` Reply in ${UILN[uiCode]} unless the user clearly speaks another language.` : "";
+    let ctx = "";
+    try { const b = await getBrainContext(); if (b) ctx = `\n\nAbout ${userName} (use to be personal, never read aloud): ${b.slice(0, 700)}`; } catch { /* ignore */ }
+    const mem = memoryBlock();
+    const searchLine = localStorage.getItem("keak_brain_path") ? " If the user asks about their own notes, projects, people, or anything you are not sure of, call the search_second_brain tool to look it up before answering." : "";
+    return `You are ${assistantName}, ${userName}'s voice assistant, in a live spoken conversation. Reply in one or two short spoken sentences, warm and quick, plain text, no markdown.${searchLine}${langLine}${persona} ${personaLines()}${ctx}${mem ? mem.slice(0, 700) : ""}`;
+  }
+
+  // Start a REAL live Keak AI turn (Gemini Live / OpenAI Realtime): open the session, stream the mic, and
+  // play Keak's spoken reply the instant you stop. Called from startRecording when the turn is a Keak AI
+  // turn and a live-capable provider is connected. `mode` = "ptt" (Ctrl+Alt / orb) or "handsfree" (wake).
+  async function startLiveTurn(mode: LiveMode) {
+    const info = liveInfo();
+    if (!info) return false;
+    cancelAssistantClose();
+    setLiveText("");
+    liveActiveRef.current = true;          // claim active now so a fast release routes to finishTurn
+    liveFinishPendingRef.current = false;
+    const instructions = await buildLiveSystem(); // lean prompt = faster first word
+    const brainRoot = localStorage.getItem("keak_brain_path") || "";
+    const session = new LiveKeak(mode, info.provider, info.apiKey, instructions, {
+      // Let live Keak look things up in the Second Brain mid-answer (only when a folder is connected).
+      onToolCall: brainRoot ? async (name, args) => {
+        if (name !== "search_second_brain") return "Unknown tool.";
+        const q = String((args as { query?: unknown })?.query || "").trim();
+        if (localStorage.getItem("keak_show_captions") !== "0") setAiReply(`Searching your Second Brain for "${q}"...`);
+        try {
+          const raw = await invoke<string>("sb_search", { args: { root: brainRoot, query: q, maxResults: 8 } });
+          const hits = JSON.parse(raw || "[]") as Array<{ path?: string; snippet?: string }>;
+          if (!Array.isArray(hits) || !hits.length) return `Nothing found in the Second Brain about "${q}".`;
+          return hits.slice(0, 8).map((h) => `${h.path || ""}: ${h.snippet || ""}`).join("\n").slice(0, 3000);
+        } catch (e) { return "Could not search the Second Brain: " + String(e).slice(0, 100); }
+      } : undefined,
+      onListening: () => { setStateSafe("recording"); },
+      onResponding: () => { setStateSafe("responding"); },
+      onKeakText: (t) => { if (localStorage.getItem("keak_show_captions") !== "0") setAiReply(t); },
+      onDone: (userText, keakText) => {
+        liveActiveRef.current = false;
+        if (keakText) {
+          historyRef.current.push({ role: "user", text: userText || "(spoken)" }, { role: "assistant", text: keakText });
+          void captureMemories(userText || "", keakText); // Keak Memory learns from live turns too
+        }
+        emitTo("orb", "orb-idle").catch(() => {});
+        setStateSafe("idle");
+        scheduleAssistantClose(9000); // keep the panel up briefly for a follow-up
+      },
+      onError: (msg) => {
+        liveActiveRef.current = false;
+        setStateSafe("error"); setErrorMsg(msg);
+        emitTo("orb", "orb-idle").catch(() => {});
+        scheduleAssistantClose(6000);
+      },
+    });
+    liveRef.current = session;
+    setStateSafe("recording");
+    await session.open();
+    if (liveFinishPendingRef.current) { liveFinishPendingRef.current = false; session.finishTurn(); } // release came during setup
+    return true;
+  }
+
   // Answer a normal Keak AI question using the user's OWN connected model (via the Rust cu_chat brain).
   // Returns true if it answered, false to fall back to the hosted keak-assistant path.
   async function answerWithOwnAI(question: string, token: string): Promise<{ answered: boolean; error?: string }> {
@@ -2806,18 +3447,7 @@ export default function Overlay() {
     // user can still raise it in Settings or by voice). This is the biggest speed win for Claude answers.
     const chatEffort = provider === "claude" ? (localStorage.getItem("keak_cu_claude_effort") || "low") : "";
 
-    const assistantName = localStorage.getItem("keak_assistant_name") || "Keak";
-    const userName = localStorage.getItem("keak_user_name") || "there";
-    // Tell Keak about its own agent team so it can answer "how many agents do I have / their names + roles".
-    const team = [...effectiveDefaults(), ...readAgentRoster()];
-    const teamInfo = team.map((a) => `${a.name} (${a.description || "general help"})`).join("; ");
-    const brainCtx = await getBrainContext();
-    // Follow the interface language: reply in the chosen UI language by default, but still mirror the user if
-    // they clearly write in another language.
-    const UILN: Record<string, string> = { es: "Spanish", fr: "French", de: "German", pt: "Portuguese", it: "Italian", en: "English" };
-    const uiCode = localStorage.getItem("keak_ui_lang") || "en";
-    const langLine = uiCode !== "en" && UILN[uiCode] ? ` Always reply in ${UILN[uiCode]} unless the user clearly writes to you in another language, then reply in that language.` : "";
-    const system = `You are ${assistantName}, a friendly voice assistant talking to ${userName}. Your reply is read ALOUD, so keep it concise and spoken, usually 1 to 3 sentences. Plain text only, no markdown. When the user explicitly asks you to list something (like your agents), you may give a short plain list. You have a team of ${team.length} agents the user can call on: ${teamInfo}. If asked about your agents or team, tell them how many there are and their names and roles from that list, do NOT say you have no access. To put them to work, the user says "use your team to..." or calls one by name, like "Sirius, research X".${langLine} ${personaLines()}${brainCtx ? `\n\nContext about ${userName} from their Second Brain (use it to be accurate and personal; never read it aloud verbatim):\n${brainCtx}` : ""}`;
+    const system = await buildAssistantSystem();
     // Claude requires messages that start with "user" and strictly alternate. Trim any leading assistant
     // turn and trailing user turn from recent history before we append the new question, or Claude 400s.
     let hist = historyRef.current.slice(-4); // fewer turns = fewer tokens = it starts answering sooner
@@ -2842,6 +3472,8 @@ export default function Overlay() {
     reply = cleanReply(reply || "");
     if (!reply) return { answered: false, error: "your AI returned an empty reply" };
     historyRef.current.push({ role: "user", text: question }, { role: "assistant", text: reply });
+    // Keak Memory: quietly remember durable facts from this exchange (opt-in, best-effort, non-blocking).
+    void captureMemories(question, reply);
     // Substantial answers Keak AI makes also land in the Work log (not just agent runs).
     if (reply.length > 160) {
       try {
@@ -3587,6 +4219,7 @@ export default function Overlay() {
   async function doClose() {
     cancelAssistantClose();
     cancelMicRelease();
+    if (liveActiveRef.current) { liveRef.current?.close(); liveActiveRef.current = false; } // tear down any live session
     readyToStop.current = false;
     if (mrRef.current && mrRef.current.state !== "inactive") {
       mrRef.current.stop();
@@ -3602,6 +4235,8 @@ export default function Overlay() {
 
   function reset() {
     cancelAssistantClose();
+    stopLivePreview();
+    setLiveText("");
     setStateSafe("idle");
     setResult("");
     setErrorMsg("");
@@ -3667,8 +4302,18 @@ export default function Overlay() {
         </div>
       )}
       {assistant && (
-        <div className="assistant-orb-wrap" onClick={doClose} title="Click to dismiss">
-          <div className={`orb orb--${state}`} />
+        <div
+          className={`assistant-orb-wrap${fromCorner ? ` fly-${fromCorner}` : ""}`}
+          onClick={() => { if (state === "recording") stopRecording(); else doClose(); }}
+          title={state === "recording" ? "Click to send" : "Click to dismiss"}
+        >
+          <div className="orb-duo">
+            {/* Keak orb hides only when an agent was woken while Standby is on (that agent orb flew in from the
+                corner as the single orb). Otherwise it shows — including "agent + Standby off" = Keak + agent. */}
+            {(!activeAgent || localStorage.getItem("keak_standby") !== "1") && <div className={`orb orb--${state}`} />}
+            {activeAgent && <div className={`orb orb--${state} orb--agent`} style={{ background: `radial-gradient(circle at 35% 30%, rgba(255,255,255,0.6), ${activeAgent.color} 58%, ${activeAgent.color} 100%)` }} />}
+          </div>
+          {activeAgent && <span className="agent-name-chip" style={{ color: activeAgent.color }}>{activeAgent.name}</span>}
           {state === "error" ? (
             <p className="ai-reply">{errorMsg}</p>
           ) : aiReply && localStorage.getItem("keak_show_captions") !== "0" ? (
@@ -3759,7 +4404,11 @@ export default function Overlay() {
           {state === "recording" ? (
             <div className="pill-live">
               <Waveform active streamRef={streamRef} />
-              <span className="pill-label">{rewriting ? t("Rewrite") : thoughtDump ? t("Thought Dump") : t("Listening")}</span>
+              {/* Keak Streaming: show the words forming live (tail of the transcript) while you talk. The
+                  accurate, styled final text still lands at your cursor on release. */}
+              <span className="pill-label" style={liveText ? { maxWidth: 360, overflow: "hidden", whiteSpace: "nowrap", opacity: 0.85, fontWeight: 500 } : undefined}>
+                {liveText ? (liveText.length > 70 ? "…" + liveText.slice(-69) : liveText) : (rewriting ? t("Rewrite") : thoughtDump ? t("Thought Dump") : t("Listening"))}
+              </span>
             </div>
           ) : state === "processing" ? (
             <div className="pill-live">
@@ -3768,6 +4417,19 @@ export default function Overlay() {
             </div>
           ) : (
             <span className="pill-hint">{thoughtDump ? "Thought Dump on · click mic" : "Click mic to speak"}</span>
+          )}
+
+          {liveTranslate && state !== "processing" && (
+            <span
+              className="pill-xlate"
+              title={`Writing in ${TRANSLATE_LANG_NAMES[liveTranslate] || liveTranslate}`}
+              style={{
+                fontSize: 11, fontWeight: 700, color: "#2C1508", background: "#D4A49A",
+                borderRadius: 6, padding: "2px 7px", marginLeft: 2, letterSpacing: 0.3,
+              }}
+            >
+              → {liveTranslate.toUpperCase()}
+            </span>
           )}
 
           {state !== "processing" && (

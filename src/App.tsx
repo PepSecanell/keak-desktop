@@ -66,10 +66,15 @@ export default function App() {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const [isSignUp, setIsSignUp] = useState(false);
-  const [altMode, setAltMode] = useState<string>(() => localStorage.getItem("keak_alt_mode") || "keak_ai");
   const [actionMode, setActionMode] = useState<string>(() => localStorage.getItem("keak_action_mode") || "ask");
+  // Ctrl+Alt is always Keak AI now. Thought Dump lives on only as the TD button on the dictation pill.
   const [showCaptions, setShowCaptions] = useState<boolean>(() => localStorage.getItem("keak_show_captions") !== "0");
   const [language, setLanguage] = useState<string>(() => localStorage.getItem("keak_language") || "auto");
+  // Translate-while-dictating: speak any language, write it in this one. "off" = normal dictation.
+  const [translateTo, setTranslateTo] = useState<string>(() => localStorage.getItem("keak_translate_to") || "off");
+  // Keak Sovereign (BETA): fully local, zero-cloud dictation. Nothing you say leaves your computer.
+  const [sovereign, setSovereign] = useState<boolean>(() => localStorage.getItem("keak_sovereign") === "1");
+  const [sovereignMsg, setSovereignMsg] = useState<string>("");
   // "Connect your AI" — which model powers screen control (TARS), and the per-provider credential.
   // Claude + OpenAI connect through the user's SUBSCRIPTION (no per-call cost); Gemini uses a key.
   const [cuProvider, setCuProvider] = useState<string>(() => localStorage.getItem("keak_cu_provider") || "claude");
@@ -196,28 +201,11 @@ export default function App() {
         if (!localStorage.getItem("keak_assistant_name")) {
           localStorage.setItem("keak_assistant_name", "Keak");
         }
-        // Ctrl+Alt = Keak AI for EVERYONE by default. Keak AI runs on the user's own connected AI, so there's
-        // no reason to gate it behind a paid plan. (The old build defaulted free plans to Thought Dump, which
-        // made Ctrl+Alt just write text like Ctrl+Win instead of opening the voice assistant.)
-        if (!localStorage.getItem("keak_alt_mode")) {
-          localStorage.setItem("keak_alt_mode", "keak_ai");
-          setAltMode("keak_ai");
-        } else if (
-          localStorage.getItem("keak_alt_mode") === "thought_dump" &&
-          !localStorage.getItem("keak_alt_migrated_v2")
-        ) {
-          // One-time migration: fix the free installs that were auto-set to Thought Dump by the old default.
-          localStorage.setItem("keak_alt_mode", "keak_ai");
-          setAltMode("keak_ai");
-        }
-        localStorage.setItem("keak_alt_migrated_v2", "1");
+        // Ctrl+Alt is always Keak AI now (the Thought Dump mode option was removed; Thought Dump lives on as
+        // the TD button on the dictation pill). Force any old thought_dump installs back to Keak AI.
+        localStorage.setItem("keak_alt_mode", "keak_ai");
       }
     }
-  }
-
-  function chooseAltMode(mode: string) {
-    setAltMode(mode);
-    localStorage.setItem("keak_alt_mode", mode);
   }
 
   function chooseActionMode(mode: string) {
@@ -302,6 +290,34 @@ export default function App() {
     cuProvider === "claude" ? !!claudeToken.trim()
     : cuProvider === "openai" ? !!(openaiKey.trim() || openaiToken.trim())
     : !!geminiKey.trim();
+
+  function chooseTranslateTo(code: string) {
+    setTranslateTo(code);
+    if (!code || code === "off") localStorage.removeItem("keak_translate_to");
+    else localStorage.setItem("keak_translate_to", code);
+  }
+
+  async function toggleSovereign(on: boolean) {
+    setSovereign(on);
+    localStorage.setItem("keak_sovereign", on ? "1" : "0");
+    try {
+      if (on) {
+        const st = await invoke<{ running: boolean; engineInstalled: boolean }>("stt_status");
+        if (!st.engineInstalled) {
+          setSovereignMsg("Downloading the local speech engine, one time. This can take a minute…");
+          await invoke("stt_download_engine");
+        }
+        setSovereignMsg("Starting the local engine…");
+        await invoke("stt_start");
+        setSovereignMsg("Local engine running. Your dictation now stays on this computer.");
+      } else {
+        await invoke("stt_stop");
+        setSovereignMsg("");
+      }
+    } catch (e: any) {
+      setSovereignMsg(String(e?.message || e));
+    }
+  }
 
   function chooseLanguage(code: string) {
     setLanguage(code);
@@ -474,41 +490,9 @@ export default function App() {
                   <span className="shortcut-desc">{t("Hold and talk. Keak AI answers out loud.")}</span>
                 </div>
               </div>
-              <div className="shortcut-item">
-                <div className="shortcut-keys">
-                  <kbd>Ctrl</kbd><span className="plus">+</span><kbd>Alt</kbd>
-                </div>
-                <div className="shortcut-meta">
-                  <span className="shortcut-name">{t("Thought Dump")}</span>
-                  <span className="shortcut-desc">{t("Ramble freely. Keak organizes it.")}</span>
-                </div>
-              </div>
             </div>
             <p className="shortcut-hint">
               {t("Works in any app on your computer. Hold to talk, let go to drop the text in.")}
-            </p>
-          </div>
-
-          <div className="card altmode-card">
-            <p className="shortcut-label">{t("Ctrl + Alt does")}</p>
-            <div className="seg">
-              <button
-                className={`seg-btn${altMode === "keak_ai" ? " seg-btn--on" : ""}`}
-                onClick={() => chooseAltMode("keak_ai")}
-              >
-                Keak AI
-              </button>
-              <button
-                className={`seg-btn${altMode === "thought_dump" ? " seg-btn--on" : ""}`}
-                onClick={() => chooseAltMode("thought_dump")}
-              >
-                {t("Thought Dump")}
-              </button>
-            </div>
-            <p className="shortcut-hint">
-              {altMode === "keak_ai"
-                ? t("Hold Ctrl+Alt to talk to your Keak AI assistant. It answers out loud.")
-                : t("Hold Ctrl+Alt to ramble; Keak reorganizes it into clean text.")}
             </p>
           </div>
 
@@ -668,6 +652,39 @@ export default function App() {
                 ? "Keak detects your language automatically. Pick one to lock it in for best accuracy."
                 : "Keak will transcribe and reply in this language. More languages coming soon."}
             </p>
+          </div>
+
+          <div className="card altmode-card">
+            <p className="shortcut-label">Translate my speech into</p>
+            <select
+              className="lang-select"
+              value={translateTo}
+              onChange={(e) => chooseTranslateTo(e.target.value)}
+            >
+              <option value="off">Off (write what I say)</option>
+              {LANGUAGES.filter((l) => l.code !== "auto").map((l) => (
+                <option key={l.code} value={l.code}>{l.label}</option>
+              ))}
+            </select>
+            <p className="shortcut-hint">
+              {translateTo === "off"
+                ? "Speak any language and Keak writes exactly that. Pick a language to have Keak translate your speech into it as you dictate."
+                : "Speak any language and Keak writes it in this one. It translates on your own connected AI, so it works even offline."}
+            </p>
+          </div>
+
+          <div className="card altmode-card">
+            <p className="shortcut-label">Keak Sovereign <span style={{ fontSize: 10, fontWeight: 700, color: "#2C1508", background: "#D4A49A", borderRadius: 5, padding: "1px 6px", marginLeft: 6, letterSpacing: 0.5 }}>BETA</span></p>
+            <label style={{ display: "flex", alignItems: "center", gap: 10, cursor: "pointer", margin: "6px 0" }}>
+              <input type="checkbox" checked={sovereign} onChange={(e) => toggleSovereign(e.target.checked)} />
+              <span>Fully local, zero cloud. Nothing you say leaves this computer.</span>
+            </label>
+            <p className="shortcut-hint">
+              {sovereign
+                ? "Dictation runs only on the local speech engine and your own AI, never the cloud."
+                : "Turn on to run dictation entirely on your own machine for maximum privacy. Best with a good CPU or GPU. Off means Keak uses the fast cloud transcription."}
+            </p>
+            {sovereignMsg && <p className="shortcut-hint" style={{ color: "#C68B7E", fontWeight: 600 }}>{sovereignMsg}</p>}
           </div>
 
           <button className="logout-btn" onClick={logout}>

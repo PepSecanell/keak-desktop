@@ -129,6 +129,29 @@ fn inject_text(app: AppHandle, text: String) -> Result<(), String> {
     Ok(())
 }
 
+// Keak Streaming (at-cursor): type a small delta live as you speak, WITHOUT hiding the overlay pill or the
+// settle delay, so words appear at your cursor in real time. The pill never has focus, so this lands in the
+// text field you're typing in (same as normal dictation inject).
+#[tauri::command]
+fn stream_type(text: String) -> Result<(), String> {
+    if text.is_empty() { return Ok(()); }
+    let mut enigo = Enigo::new(&Settings::default()).map_err(|e| e.to_string())?;
+    enigo.text(&text).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+// On release, swap the raw live-typed text for the final clean version: backspace `back` characters, then
+// type the well-written `add`. This is the one place backspaces are sent, right when the key is released.
+#[tauri::command]
+fn stream_replace(app: AppHandle, back: usize, add: String) -> Result<(), String> {
+    if let Some(overlay) = app.get_webview_window("overlay") { let _ = overlay.hide(); }
+    std::thread::sleep(std::time::Duration::from_millis(120));
+    let mut enigo = Enigo::new(&Settings::default()).map_err(|e| e.to_string())?;
+    for _ in 0..back { let _ = enigo.key(Key::Backspace, Direction::Click); }
+    if !add.is_empty() { enigo.text(&add).map_err(|e| e.to_string())?; }
+    Ok(())
+}
+
 // ---- Native computer-use primitives ("TARS": Keak can touch anything on the whole screen) ----
 // These move the real OS cursor / keyboard, so they work in ANY app, not just the browser. The
 // frontend agent loop screenshots (capture_screen_full), asks a vision model for the next action,
@@ -3008,6 +3031,569 @@ fn keak_open_window(app: &AppHandle, what: &str) {
     }
 }
 
+// ── Standby orb (Hey Keak) — always-on corner orb that talks to Keak AI hands-free ─────────────────
+// The orb drives the SAME Keak AI flow as Ctrl+Alt: orb_talk_start shows the overlay and emits alt-start,
+// orb_talk_stop emits alt-stop (overlay records, then processes). set_standby parks the orb in the
+// bottom-right corner and shows/hides it. Wake-word detection ("Hey Keak") calls the same start/stop path.
+#[tauri::command]
+fn orb_talk_start(app: AppHandle) {
+    // ONE orb only: hide the corner orb and show the centered Keak AI panel, so the orb reads as flying from
+    // the corner to the middle (the overlay animates the slide). The overlay restores the corner orb when the
+    // turn ends. The centered orb is clickable to stop the turn.
+    if let Some(orb) = app.get_webview_window("orb") { let _ = orb.hide(); }
+    if let Some(overlay) = app.get_webview_window("overlay") { let _ = overlay.show(); }
+    let _ = app.emit("alt-start", ());
+}
+
+// Show the Keak AI panel (used by the "Hey Keak" wake turn, which does its own recording + auto-stop).
+#[tauri::command]
+fn orb_show(app: AppHandle) {
+    if let Some(overlay) = app.get_webview_window("overlay") { let _ = overlay.show(); }
+}
+
+// Hide the corner orb (while a centered turn is on screen, so there's never a second orb).
+#[tauri::command]
+fn orb_hide(app: AppHandle) {
+    if let Some(orb) = app.get_webview_window("orb") { let _ = orb.hide(); }
+}
+
+#[tauri::command]
+fn orb_talk_stop(app: AppHandle) {
+    let _ = app.emit("alt-stop", ());
+}
+
+#[tauri::command]
+fn set_standby(app: AppHandle, on: bool, corner: Option<String>) {
+    if let Some(orb) = app.get_webview_window("orb") {
+        if on {
+            let _ = orb.show();
+            // Park it in the chosen corner. corner = "br" | "bl" | "tr" | "tl" (default bottom-right).
+            if let Ok(Some(mon)) = orb.primary_monitor() {
+                let sz = mon.size();
+                let sf = mon.scale_factor();
+                let ow = (96.0 * sf) as i32;
+                let margin = (24.0 * sf) as i32;
+                let taskbar = (52.0 * sf) as i32; // clear the Windows taskbar on the bottom edge
+                let c = corner.unwrap_or_else(|| "br".into());
+                let right = c.ends_with('r');
+                let bottom = c.starts_with('b');
+                let x = if right { sz.width as i32 - ow - margin } else { margin };
+                let y = if bottom { sz.height as i32 - ow - margin - taskbar } else { margin };
+                let _ = orb.set_position(tauri::PhysicalPosition::new(x, y));
+            }
+            let _ = orb.set_always_on_top(true);
+        } else {
+            let _ = orb.hide();
+        }
+    }
+}
+
+// ── Hey Keak wake word (on-device, no cloud) ───────────────────────────────────────────────────────
+// A personal wake word ("Hey Keak") trained from a few of the user's own voice samples (WAV files under
+// app-data/wake). rustpotter runs the detector on a live cpal mic stream entirely on-device; on a match it
+// emits "wake-detected", which the overlay turns into a hands-free Keak AI turn. Nothing leaves the machine.
+#[cfg(windows)]
+mod wake {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+    use tauri::{AppHandle, Emitter, Manager};
+    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+    use rustpotter::{Rustpotter, RustpotterConfig, SampleFormat, ScoreMode, Wakeword};
+
+    static RUNNING: AtomicBool = AtomicBool::new(false);
+
+    fn wake_dir(app: &AppHandle) -> Option<std::path::PathBuf> {
+        app.path().app_data_dir().ok().map(|d| d.join("wake"))
+    }
+    // Each wake target lives in its own place: Keak ("" or "keak") = wav files directly in wake/, and each
+    // agent = wake/a_<key>/*.wav. This lets one engine listen for "Hey Keak" AND "Hey <agent>" at once.
+    fn target_dir(app: &AppHandle, key: &str) -> Option<std::path::PathBuf> {
+        let root = wake_dir(app)?;
+        if key.is_empty() || key == "keak" { Some(root) } else { Some(root.join(format!("a_{}", key))) }
+    }
+    fn wavs_in(dir: &std::path::Path) -> Vec<String> {
+        let mut v = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_file() && p.extension().and_then(|x| x.to_str()) == Some("wav") {
+                    if let Some(s) = p.to_str() { v.push(s.to_string()); }
+                }
+            }
+        }
+        v.sort();
+        v
+    }
+    // Every trained wake word: ("hey_keak", …) plus one per trained agent (its key = the wakeword name we
+    // emit on a match, so the overlay knows WHICH agent to wake).
+    fn all_targets(app: &AppHandle) -> Vec<(String, Vec<String>)> {
+        let mut out = Vec::new();
+        if let Some(root) = wake_dir(app) {
+            let keak = wavs_in(&root);
+            if !keak.is_empty() { out.push(("hey_keak".to_string(), keak)); }
+            if let Ok(rd) = std::fs::read_dir(&root) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if p.is_dir() {
+                        if let Some(name) = p.file_name().and_then(|x| x.to_str()) {
+                            if let Some(key) = name.strip_prefix("a_") {
+                                let w = wavs_in(&p);
+                                if !w.is_empty() { out.push((key.to_string(), w)); }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+    pub fn has_samples(app: &AppHandle, key: &str) -> usize {
+        target_dir(app, key).map(|d| wavs_in(&d).len()).unwrap_or(0)
+    }
+    pub fn save_sample(app: &AppHandle, key: &str, index: u32, b64: &str) -> Result<(), String> {
+        use base64::Engine;
+        let bytes = base64::engine::general_purpose::STANDARD.decode(b64).map_err(|e| e.to_string())?;
+        let dir = target_dir(app, key).ok_or("no app data dir")?;
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        std::fs::write(dir.join(format!("keak_{}.wav", index)), bytes).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+    pub fn clear_samples(app: &AppHandle, key: &str) {
+        if key.is_empty() || key == "keak" {
+            // Only remove Keak's own wav files at the root — never the agent subfolders.
+            if let Some(dir) = wake_dir(app) {
+                if let Ok(rd) = std::fs::read_dir(&dir) {
+                    for e in rd.flatten() {
+                        let p = e.path();
+                        if p.is_file() && p.extension().and_then(|x| x.to_str()) == Some("wav") { let _ = std::fs::remove_file(&p); }
+                    }
+                }
+            }
+        } else if let Some(dir) = target_dir(app, key) {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+    pub fn stop() { RUNNING.store(false, Ordering::SeqCst); }
+
+    pub fn start(app: AppHandle) -> Result<(), String> {
+        let targets = all_targets(&app);
+        if targets.is_empty() { return Err("No wake word trained yet".into()); }
+        if RUNNING.swap(true, Ordering::SeqCst) { return Ok(()); } // already listening
+        std::thread::spawn(move || {
+            if let Err(e) = run_loop(&app, targets) { eprintln!("[KEAK wake] {}", e); }
+            RUNNING.store(false, Ordering::SeqCst);
+        });
+        Ok(())
+    }
+
+    fn run_loop(app: &AppHandle, targets: Vec<(String, Vec<String>)>) -> Result<(), String> {
+        let host = cpal::default_host();
+        let device = host.default_input_device().ok_or("no input device")?;
+        let supported = device.default_input_config().map_err(|e| e.to_string())?;
+        let sample_format = supported.sample_format();
+        let stream_config: cpal::StreamConfig = supported.into();
+
+        let mut config = RustpotterConfig::default();
+        config.fmt.sample_rate = stream_config.sample_rate.0 as usize;
+        config.fmt.channels = stream_config.channels;
+        config.fmt.sample_format = SampleFormat::Float;
+        config.fmt.bits_per_sample = 32;
+        config.detector.score_mode = ScoreMode::Max;
+        config.detector.avg_threshold = 0.18;
+        config.detector.threshold = 0.40;
+        config.detector.min_scores = 4;
+
+        let mut rustpotter = Rustpotter::new(&config)?;
+        // Load every trained wake word (Keak + each agent). On a match, det.name tells us which one fired.
+        for (name, paths) in &targets {
+            match Wakeword::new_from_sample_files(name.clone(), None, None, paths.clone()) {
+                Ok(w) => rustpotter.add_wakeword(w),
+                Err(e) => eprintln!("[KEAK wake] wakeword '{}' failed: {}", name, e),
+            }
+        }
+        let frame = rustpotter.get_samples_per_frame();
+        let app_cb = app.clone();
+        let err_fn = |e| eprintln!("[KEAK wake] stream error: {}", e);
+
+        let stream = match sample_format {
+            cpal::SampleFormat::F32 => {
+                let mut rp = rustpotter;
+                let mut buf: Vec<f32> = Vec::with_capacity(frame * 4);
+                let mut last: Option<Instant> = None;
+                let app2 = app_cb.clone();
+                device.build_input_stream(
+                    &stream_config,
+                    move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                        buf.extend_from_slice(data);
+                        while buf.len() >= frame {
+                            let chunk: Vec<f32> = buf.drain(..frame).collect();
+                            if let Some(det) = rp.process_f32(&chunk) {
+                                let now = Instant::now();
+                                let ok = last.map_or(true, |t| now.duration_since(t) > Duration::from_millis(2500));
+                                if ok { last = Some(now); let _ = app2.emit("wake-detected", det.name.clone()); }
+                            }
+                        }
+                    },
+                    err_fn, None,
+                ).map_err(|e| e.to_string())?
+            }
+            cpal::SampleFormat::I16 => {
+                let mut rp = rustpotter;
+                let mut buf: Vec<f32> = Vec::with_capacity(frame * 4);
+                let mut last: Option<Instant> = None;
+                let app2 = app_cb.clone();
+                device.build_input_stream(
+                    &stream_config,
+                    move |data: &[i16], _: &cpal::InputCallbackInfo| {
+                        buf.extend(data.iter().map(|s| *s as f32 / 32768.0));
+                        while buf.len() >= frame {
+                            let chunk: Vec<f32> = buf.drain(..frame).collect();
+                            if let Some(det) = rp.process_f32(&chunk) {
+                                let now = Instant::now();
+                                let ok = last.map_or(true, |t| now.duration_since(t) > Duration::from_millis(2500));
+                                if ok { last = Some(now); let _ = app2.emit("wake-detected", det.name.clone()); }
+                            }
+                        }
+                    },
+                    err_fn, None,
+                ).map_err(|e| e.to_string())?
+            }
+            other => return Err(format!("unsupported input sample format: {:?}", other)),
+        };
+
+        stream.play().map_err(|e| e.to_string())?;
+        while RUNNING.load(Ordering::SeqCst) { std::thread::sleep(Duration::from_millis(100)); }
+        drop(stream);
+        Ok(())
+    }
+}
+
+// ── Keak Recap — capture the computer's audio (a meeting, a video, a call) and recap it ─────────────
+// Uses WASAPI loopback: cpal opens an INPUT stream on the default OUTPUT device, which captures whatever
+// the system is playing (the people you hear on the call). Everything stays on the machine until Keak
+// sends it to the user's own transcription. Mixed down to mono, resampled to 16 kHz for transcription.
+#[cfg(windows)]
+mod recap {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+    use std::time::Duration;
+    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+    use tauri::{AppHandle, Manager};
+
+    static RUNNING: AtomicBool = AtomicBool::new(false);
+    static CAPTURE_MIC: AtomicBool = AtomicBool::new(true);  // also mix in the user's own microphone
+    static RAW: Mutex<Vec<f32>> = Mutex::new(Vec::new());   // system audio (loopback), mono at device rate
+    static SR: Mutex<u32> = Mutex::new(48000);
+    static MIC: Mutex<Vec<f32>> = Mutex::new(Vec::new());   // the user's mic, mono at its device rate
+    static MIC_SR: Mutex<u32> = Mutex::new(48000);
+    static R16K: Mutex<Vec<f32>> = Mutex::new(Vec::new());  // final mixed mono 16 kHz (built on stop)
+
+    pub fn start(capture_mic: bool) -> Result<(), String> {
+        if RUNNING.swap(true, Ordering::SeqCst) { return Ok(()); }
+        CAPTURE_MIC.store(capture_mic, Ordering::SeqCst);
+        RAW.lock().unwrap().clear();
+        MIC.lock().unwrap().clear();
+        R16K.lock().unwrap().clear();
+        std::thread::spawn(move || {
+            if let Err(e) = run() { eprintln!("[KEAK recap] {}", e); }
+            RUNNING.store(false, Ordering::SeqCst);
+        });
+        Ok(())
+    }
+    // Build an input stream that downmixes any format to mono f32 and appends into `target`.
+    fn build_capture(device: &cpal::Device, config: &cpal::StreamConfig, fmt: cpal::SampleFormat, channels: usize, target: &'static Mutex<Vec<f32>>) -> Result<cpal::Stream, String> {
+        let err_fn = |e| eprintln!("[KEAK recap] stream error: {}", e);
+        let ch = channels.max(1);
+        match fmt {
+            cpal::SampleFormat::F32 => device.build_input_stream(config, move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                let mut buf = target.lock().unwrap();
+                for frame in data.chunks(ch) { buf.push(frame.iter().sum::<f32>() / ch as f32); }
+            }, err_fn, None).map_err(|e| e.to_string()),
+            cpal::SampleFormat::I16 => device.build_input_stream(config, move |data: &[i16], _: &cpal::InputCallbackInfo| {
+                let mut buf = target.lock().unwrap();
+                for frame in data.chunks(ch) { buf.push(frame.iter().map(|x| *x as f32 / 32768.0).sum::<f32>() / ch as f32); }
+            }, err_fn, None).map_err(|e| e.to_string()),
+            cpal::SampleFormat::U16 => device.build_input_stream(config, move |data: &[u16], _: &cpal::InputCallbackInfo| {
+                let mut buf = target.lock().unwrap();
+                for frame in data.chunks(ch) { buf.push(frame.iter().map(|x| (*x as f32 - 32768.0) / 32768.0).sum::<f32>() / ch as f32); }
+            }, err_fn, None).map_err(|e| e.to_string()),
+            other => Err(format!("unsupported format {:?}", other)),
+        }
+    }
+    fn run() -> Result<(), String> {
+        let host = cpal::default_host();
+        // System audio via WASAPI loopback = an input stream on the default OUTPUT device.
+        let out_device = host.default_output_device().ok_or("no output device (nothing is playing to capture)")?;
+        let out_config = out_device.default_output_config().map_err(|e| e.to_string())?;
+        let out_fmt = out_config.sample_format();
+        let out_channels = out_config.channels() as usize;
+        *SR.lock().unwrap() = out_config.sample_rate().0;
+        let out_stream_config: cpal::StreamConfig = out_config.into();
+        let loop_stream = build_capture(&out_device, &out_stream_config, out_fmt, out_channels, &RAW)?;
+        loop_stream.play().map_err(|e| e.to_string())?;
+        // The user's own microphone (mixed in on stop) — best-effort so a missing mic never fails the recap.
+        let mic_stream = if CAPTURE_MIC.load(Ordering::SeqCst) {
+            match host.default_input_device().and_then(|d| d.default_input_config().ok().map(|c| (d, c))) {
+                Some((in_device, in_config)) => {
+                    let in_fmt = in_config.sample_format();
+                    let in_channels = in_config.channels() as usize;
+                    *MIC_SR.lock().unwrap() = in_config.sample_rate().0;
+                    let in_stream_config: cpal::StreamConfig = in_config.into();
+                    match build_capture(&in_device, &in_stream_config, in_fmt, in_channels, &MIC) {
+                        Ok(s) => { let _ = s.play(); Some(s) }
+                        Err(e) => { eprintln!("[KEAK recap] mic: {}", e); None }
+                    }
+                }
+                None => { eprintln!("[KEAK recap] no mic available; system audio only"); None }
+            }
+        } else { None };
+        while RUNNING.load(Ordering::SeqCst) { std::thread::sleep(Duration::from_millis(100)); }
+        drop(loop_stream);
+        drop(mic_stream);
+        Ok(())
+    }
+    fn resample_to_16k(src: &[f32], sr: u32) -> Vec<f32> {
+        let target = 16000f32;
+        if sr == 16000 || src.is_empty() { return src.to_vec(); }
+        let ratio = target / sr as f32;
+        let out_len = (src.len() as f32 * ratio) as usize;
+        let mut out = Vec::with_capacity(out_len);
+        for i in 0..out_len {
+            let pos = i as f32 / ratio;
+            let idx = pos as usize;
+            let frac = pos - idx as f32;
+            let a = src.get(idx).copied().unwrap_or(0.0);
+            let b = src.get(idx + 1).copied().unwrap_or(a);
+            out.push(a + (b - a) * frac);
+        }
+        out
+    }
+    fn wav_bytes(samples: &[f32], rate: u32) -> Vec<u8> {
+        let n = samples.len();
+        let mut v = Vec::with_capacity(44 + n * 2);
+        let data_len = (n * 2) as u32;
+        v.extend_from_slice(b"RIFF");
+        v.extend_from_slice(&(36 + data_len).to_le_bytes());
+        v.extend_from_slice(b"WAVE");
+        v.extend_from_slice(b"fmt ");
+        v.extend_from_slice(&16u32.to_le_bytes());
+        v.extend_from_slice(&1u16.to_le_bytes());      // PCM
+        v.extend_from_slice(&1u16.to_le_bytes());      // mono
+        v.extend_from_slice(&rate.to_le_bytes());
+        v.extend_from_slice(&(rate * 2).to_le_bytes()); // byte rate
+        v.extend_from_slice(&2u16.to_le_bytes());      // block align
+        v.extend_from_slice(&16u16.to_le_bytes());     // bits
+        v.extend_from_slice(b"data");
+        v.extend_from_slice(&data_len.to_le_bytes());
+        for &s in samples {
+            let c = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
+            v.extend_from_slice(&c.to_le_bytes());
+        }
+        v
+    }
+    // Stop capture, resample to 16 kHz mono, write a full WAV to app-data/recap/recap.wav.
+    // Returns (path, seconds).
+    pub fn stop(app: &AppHandle) -> Result<(String, f32), String> {
+        RUNNING.store(false, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(250)); // let the streams flush their last buffers
+        let sr = *SR.lock().unwrap();
+        let raw = RAW.lock().unwrap().clone();
+        let mut r16 = resample_to_16k(&raw, sr);
+        // Mix in the user's own mic (both captured from the same start moment, so index-aligned at 16 kHz).
+        if CAPTURE_MIC.load(Ordering::SeqCst) {
+            let mic_sr = *MIC_SR.lock().unwrap();
+            let mic_raw = MIC.lock().unwrap().clone();
+            if !mic_raw.is_empty() {
+                let mic16 = resample_to_16k(&mic_raw, mic_sr);
+                if mic16.len() > r16.len() { r16.resize(mic16.len(), 0.0); }
+                for i in 0..mic16.len() { r16[i] = (r16[i] + mic16[i]).clamp(-1.0, 1.0); }
+            }
+        }
+        let secs = r16.len() as f32 / 16000.0;
+        *R16K.lock().unwrap() = r16.clone();
+        let dir = app.path().app_data_dir().map_err(|e| e.to_string())?.join("recap");
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let path = dir.join("recap.wav");
+        std::fs::write(&path, wav_bytes(&r16, 16000)).map_err(|e| e.to_string())?;
+        Ok((path.to_string_lossy().to_string(), secs))
+    }
+    pub fn is_running() -> bool { RUNNING.load(Ordering::SeqCst) }
+    pub fn seconds() -> f32 { RAW.lock().unwrap().len() as f32 / *SR.lock().unwrap() as f32 }
+    // Stop and throw the capture away (a mistaken/empty recording) without transcribing anything.
+    pub fn cancel() {
+        RUNNING.store(false, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(150));
+        RAW.lock().unwrap().clear();
+        MIC.lock().unwrap().clear();
+        R16K.lock().unwrap().clear();
+    }
+    // One ~chunk_secs slice of the resampled recording as a base64 WAV (so JS can transcribe long meetings
+    // chunk by chunk without holding the whole thing in memory).
+    pub fn chunk_count(chunk_secs: u32) -> usize {
+        let per = (chunk_secs * 16000) as usize;
+        let len = R16K.lock().unwrap().len();
+        if per == 0 || len == 0 { 0 } else { (len + per - 1) / per }
+    }
+    pub fn chunk_b64(index: usize, chunk_secs: u32) -> String {
+        use base64::Engine;
+        let per = (chunk_secs * 16000) as usize;
+        let buf = R16K.lock().unwrap();
+        let start = index * per;
+        if start >= buf.len() { return String::new(); }
+        let end = (start + per).min(buf.len());
+        base64::engine::general_purpose::STANDARD.encode(wav_bytes(&buf[start..end], 16000))
+    }
+}
+
+#[tauri::command]
+fn recap_start(mic: Option<bool>) -> Result<(), String> {
+    #[cfg(windows)] { recap::start(mic.unwrap_or(true)) }
+    #[cfg(not(windows))] { let _ = mic; Err("Recap is Windows-only for now".into()) }
+}
+#[tauri::command]
+fn recap_stop(app: AppHandle) -> Result<(String, f32), String> {
+    #[cfg(windows)] { recap::stop(&app) }
+    #[cfg(not(windows))] { let _ = app; Err("Windows-only".into()) }
+}
+#[tauri::command]
+fn recap_status() -> (bool, f32) {
+    #[cfg(windows)] { (recap::is_running(), recap::seconds()) }
+    #[cfg(not(windows))] { (false, 0.0) }
+}
+#[tauri::command]
+fn recap_chunk_count(chunk_secs: u32) -> usize {
+    #[cfg(windows)] { recap::chunk_count(chunk_secs) }
+    #[cfg(not(windows))] { let _ = chunk_secs; 0 }
+}
+#[tauri::command]
+fn recap_chunk_b64(index: usize, chunk_secs: u32) -> String {
+    #[cfg(windows)] { recap::chunk_b64(index, chunk_secs) }
+    #[cfg(not(windows))] { let _ = (index, chunk_secs); String::new() }
+}
+#[tauri::command]
+fn recap_cancel() {
+    #[cfg(windows)] { recap::cancel(); }
+}
+
+#[tauri::command]
+fn wake_start(app: AppHandle) -> Result<(), String> {
+    #[cfg(windows)] { wake::start(app) }
+    #[cfg(not(windows))] { let _ = app; Err("Wake word is Windows-only for now".into()) }
+}
+#[tauri::command]
+fn wake_stop() {
+    #[cfg(windows)] { wake::stop(); }
+}
+#[tauri::command]
+fn wake_save_sample(app: AppHandle, key: Option<String>, index: u32, wav_base64: String) -> Result<(), String> {
+    #[cfg(windows)] { wake::save_sample(&app, key.as_deref().unwrap_or("keak"), index, &wav_base64) }
+    #[cfg(not(windows))] { let _ = (app, key, index, wav_base64); Err("Windows-only".into()) }
+}
+#[tauri::command]
+fn wake_clear(app: AppHandle, key: Option<String>) {
+    #[cfg(windows)] { wake::clear_samples(&app, key.as_deref().unwrap_or("keak")); }
+    #[cfg(not(windows))] { let _ = (app, key); }
+}
+#[tauri::command]
+fn wake_has_samples(app: AppHandle, key: Option<String>) -> usize {
+    #[cfg(windows)] { return wake::has_samples(&app, key.as_deref().unwrap_or("keak")); }
+    #[cfg(not(windows))] { let _ = (app, key); 0 }
+}
+
+// ── Keak Sovereign: local speech engine (faster-whisper) management ────────────────────────────────
+// The engine is a standalone build of the local-whisper server (FastAPI + faster-whisper) that serves
+// /health + /transcribe on 127.0.0.1:9889 — the contract the overlay already uses. Keak downloads the
+// prebuilt engine on first Sovereign enable and starts/stops it with the toggle. Nothing leaves the
+// machine. In dev, set KEAK_STT_SCRIPT to a local server.py path to run it via python instead.
+static STT_CHILD: Mutex<Option<std::process::Child>> = Mutex::new(None);
+
+fn stt_asset_name() -> &'static str {
+    #[cfg(windows)] { "keak-stt-windows-x64.exe" }
+    #[cfg(target_os = "macos")] { "keak-stt-macos" }
+    #[cfg(all(unix, not(target_os = "macos")))] { "keak-stt-linux" }
+}
+fn stt_engine_path(app: &AppHandle) -> Option<std::path::PathBuf> {
+    app.path().app_data_dir().ok().map(|d| d.join("stt").join(stt_asset_name()))
+}
+fn stt_is_running() -> bool {
+    let mut g = STT_CHILD.lock().unwrap();
+    match g.as_mut() {
+        Some(c) => matches!(c.try_wait(), Ok(None)),
+        None => false,
+    }
+}
+
+#[tauri::command]
+fn stt_status(app: AppHandle) -> serde_json::Value {
+    let engine = stt_engine_path(&app);
+    serde_json::json!({
+        "running": stt_is_running(),
+        "engineInstalled": engine.as_ref().map(|p| p.exists()).unwrap_or(false),
+    })
+}
+
+#[tauri::command]
+fn stt_start(app: AppHandle) -> Result<(), String> {
+    if stt_is_running() { return Ok(()); }
+    // Prefer the downloaded standalone engine; in dev fall back to python + a server.py path from env.
+    let (program, args): (String, Vec<String>) = match stt_engine_path(&app) {
+        Some(p) if p.exists() => (p.to_string_lossy().to_string(), vec![]),
+        _ => {
+            let script = std::env::var("KEAK_STT_SCRIPT").unwrap_or_default();
+            if script.is_empty() {
+                return Err("The local speech engine isn't installed yet. Turn on Sovereign to download it first.".into());
+            }
+            let py = if cfg!(windows) { "python".to_string() } else { "python3".to_string() };
+            (py, vec![script])
+        }
+    };
+    let mut cmd = std::process::Command::new(&program);
+    cmd.args(&args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)] { use std::os::windows::process::CommandExt; cmd.creation_flags(0x08000000); }
+    let child = cmd.spawn().map_err(|e| format!("Couldn't start the local speech engine: {}", e))?;
+    *STT_CHILD.lock().unwrap() = Some(child);
+    Ok(())
+}
+
+#[tauri::command]
+fn stt_stop() -> Result<(), String> {
+    if let Some(mut c) = STT_CHILD.lock().unwrap().take() {
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn stt_download_engine(app: AppHandle) -> Result<(), String> {
+    let dest = stt_engine_path(&app).ok_or("No app data directory")?;
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let url = format!(
+        "https://github.com/PepSecanell/keak-desktop/releases/download/stt-engine/{}",
+        stt_asset_name()
+    );
+    let _ = app.emit("stt-download-progress", 0u32);
+    let client = reqwest::Client::new();
+    let resp = client.get(&url).send().await.map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("Couldn't download the engine ({}). It may not be published yet.", resp.status()));
+    }
+    let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
+    let tmp = dest.with_extension("part");
+    std::fs::write(&tmp, &bytes).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &dest).map_err(|e| e.to_string())?;
+    #[cfg(unix)] {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755));
+    }
+    let _ = app.emit("stt-download-progress", 100u32);
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let mut builder = tauri::Builder::default();
@@ -3175,7 +3761,7 @@ pub fn run() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![open_url, inject_text, hide_overlay, show_main, show_agents, hide_agents, save_artifact, restore_clipboard, capture_selection, capture_screen, send_browser_command, capture_screen_full, mouse_click, mouse_move, cursor_pos, type_text, mouse_scroll, press_key, openai_login_start, openai_login_poll, cu_step, cu_chat, copilot_read_cli_token, ollama_list_models, pick_folder, set_autostart, get_autostart, whatsapp_send, sb_tree, sb_read, sb_write, sb_mkdir, sb_delete, sb_search, sb_graph, openai_tts, gemini_tts, google_connect, google_refresh, google_calendar_create, youtube_get, gmail_list, gmail_send, drive_create, ms_connect, ms_refresh, ms_calendar_create, ms_mail_send, ms_drive_create, notion_connect, notion_create_page, slack_connect, slack_test, slack_post, perplexity_ask, elevenlabs_tts, elevenlabs_speak, gamma_generate, heygen_video, webhook_post, manus_task, higgsfield_generate, heygen_assets, figma_connect, resend_send, supabase_rest, supabase_schema, figma_api, github_device_start, github_device_poll, github_api, shopify_api, gumloop_start, telegram_poll, telegram_send, mcp_rpc, claude_verify, claude_read_cli_token, make_scenarios, make_run])
+        .invoke_handler(tauri::generate_handler![open_url, inject_text, hide_overlay, show_main, show_agents, hide_agents, save_artifact, restore_clipboard, capture_selection, capture_screen, send_browser_command, capture_screen_full, mouse_click, mouse_move, cursor_pos, type_text, mouse_scroll, press_key, openai_login_start, openai_login_poll, cu_step, cu_chat, copilot_read_cli_token, ollama_list_models, pick_folder, set_autostart, get_autostart, whatsapp_send, sb_tree, sb_read, sb_write, sb_mkdir, sb_delete, sb_search, sb_graph, openai_tts, gemini_tts, google_connect, google_refresh, google_calendar_create, youtube_get, gmail_list, gmail_send, drive_create, ms_connect, ms_refresh, ms_calendar_create, ms_mail_send, ms_drive_create, notion_connect, notion_create_page, slack_connect, slack_test, slack_post, perplexity_ask, elevenlabs_tts, elevenlabs_speak, gamma_generate, heygen_video, webhook_post, manus_task, higgsfield_generate, heygen_assets, figma_connect, resend_send, supabase_rest, supabase_schema, figma_api, github_device_start, github_device_poll, github_api, shopify_api, gumloop_start, telegram_poll, telegram_send, mcp_rpc, claude_verify, claude_read_cli_token, make_scenarios, make_run, stt_status, stt_start, stt_stop, stt_download_engine, orb_talk_start, orb_talk_stop, orb_show, orb_hide, set_standby, wake_start, wake_stop, wake_save_sample, wake_clear, wake_has_samples, recap_start, recap_stop, recap_status, recap_chunk_count, recap_chunk_b64, recap_cancel, stream_type, stream_replace])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
@@ -3192,7 +3778,8 @@ mod ptt_watch {
 
     static APP: OnceLock<AppHandle> = OnceLock::new();
     // 0 = idle, 1 = dictate (Ctrl+Win), 2 = alt (Ctrl+Alt — JS routes to Keak AI or Thought Dump),
-    // 3 = rewrite (Win+Alt — rewrite the current selection from a spoken instruction)
+    // 3 = rewrite (Win+Alt — rewrite the current selection from a spoken instruction),
+    // 4 = translate-dictate (Ctrl+Space — dictate and translate into the chosen language)
     static ACTIVE: AtomicU8 = AtomicU8::new(0);
 
     fn down(vk: i32) -> bool {
@@ -3205,11 +3792,15 @@ mod ptt_watch {
         }
     }
 
-    fn start_dictate() {
-        ACTIVE.store(1, Ordering::SeqCst);
+    #[derive(Clone, serde::Serialize)]
+    struct PttStart { dump: bool, translate: bool }
+
+    fn start_dictate(translate: bool, active: u8) {
+        ACTIVE.store(active, Ordering::SeqCst);
         if let Some(app) = APP.get() {
             show_overlay(app);
-            let _ = app.emit("ptt-start", false); // dump=false (normal cleanup)
+            // Ctrl+Win = plain dictation (translate=false). Ctrl+Space = dictate + translate (translate=true).
+            let _ = app.emit("ptt-start", PttStart { dump: false, translate });
         }
     }
 
@@ -3244,15 +3835,21 @@ mod ptt_watch {
             let ctrl = down(0x11); // VK_CONTROL (either side)
             let win = down(0x5B) || down(0x5C); // VK_LWIN / VK_RWIN
             let lalt = down(0xA4); // VK_LMENU only, so AltGr (right Alt) never triggers this
-            // Mutually exclusive so the three combos never overlap:
-            let ctrl_win = ctrl && win && !lalt; // Dictate
+            let ralt = down(0xA5); // VK_RMENU = AltGr. On many layouts (Spanish, etc.) AltGr fires as LCtrl+RAlt,
+                                   // so we MUST exclude it from Ctrl+Space or normal typing triggers dictation.
+            let space = down(0x20); // VK_SPACE — Ctrl+Space = dictate + translate
+            // Mutually exclusive so the combos never overlap:
+            let ctrl_win = ctrl && win && !lalt && !ralt; // Dictate (same language)
+            let ctrl_space = ctrl && space && !win && !lalt && !ralt; // Dictate + translate (NOT AltGr+Space)
             let ctrl_alt = ctrl && lalt && !win; // Thought Dump / Keak AI
             let win_alt = win && lalt && !ctrl; // Rewrite selection
 
             match ACTIVE.load(Ordering::SeqCst) {
                 0 => {
                     if ctrl_win {
-                        start_dictate();
+                        start_dictate(false, 1);
+                    } else if ctrl_space {
+                        start_dictate(true, 4);
                     } else if ctrl_alt {
                         start_alt();
                     } else if win_alt {
@@ -3261,6 +3858,11 @@ mod ptt_watch {
                 }
                 1 => {
                     if !ctrl_win {
+                        emit_stop("ptt-stop");
+                    }
+                }
+                4 => {
+                    if !ctrl_space {
                         emit_stop("ptt-stop");
                     }
                 }

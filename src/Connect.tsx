@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import keakLogo from "./assets/icon_keak_2.png";
@@ -6,7 +6,7 @@ import { effectiveDefaults, saveDefaultOverride, resetDefaultOverride, readDefau
 import { AI_TOOLS, getToolKey, setToolKey, toolConnected, assignableForAgents, CONN_ICON } from "./integrations";
 import { readRoutines, upsertRoutine, removeRoutine, newRoutineId, nextRunLabel, type Routine } from "./routines";
 import { readMcpServers, writeMcpServers, newMcpId, mcpListTools, mcpCallTool, type McpServer } from "./mcp";
-import { useUiLang, UI_LANGS, UI_LANG_AI_NAME, getUiLang, tr } from "./i18n";
+import { useUiLang, UI_LANGS, UI_LANG_AI_NAME, getUiLang, tr, wakePhrase } from "./i18n";
 import BrainGraph from "./BrainGraph";
 import "./App.css";
 import "./Connect.css";
@@ -74,6 +74,8 @@ const SECTIONS = [
   { id: "brain", label: "Second Brain" },
   { id: "routines", label: "Routines" },
   { id: "connections", label: "Connections" },
+  { id: "recap", label: "Recap" },
+  { id: "team", label: "Team" },
   { id: "work", label: "Work" },
   { id: "personality", label: "Personality" },
   { id: "settings", label: "Settings" },
@@ -104,6 +106,15 @@ function resolveChatAI(choice: string): { provider: string; credential: string; 
   // Default Claude to LOW effort in chat — heavier effort on a subscription token rate-limits fast.
   const effort = prov === "claude" ? (localStorage.getItem("keak_cu_claude_effort") || "low") : "";
   return { provider: prov, credential, accountId, isSub, model, effort };
+}
+// Keak Recap: the transcribe endpoint (same backend the overlay uses) + a base64->Blob helper for the WAV
+// chunks Rust hands back.
+const RECAP_SUPABASE_URL = (import.meta.env.VITE_SUPABASE_URL || "https://c--8d6c4aab-d6cd-4281-ad41-da14196d68fc-prod.lovable.cloud") as string;
+function b64ToBlob(b64: string, type: string): Blob {
+  const bin = atob(b64);
+  const arr = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+  return new Blob([arr], { type });
 }
 // System prompt for the text chat, honouring the interface language. If an agent is chosen, take on its persona.
 function chatSystem(agent?: { name: string; description?: string; personality?: string }): string {
@@ -257,6 +268,31 @@ function cleanAgentText(s: string): string {
 }
 function isHtmlOutput(s: string): boolean {
   return /^\s*<!doctype html|^\s*<html[\s>]/i.test((s || "").trim());
+}
+// Render the recap as proper formatted text (headings, bullets, bold) instead of raw "###" and "**".
+function inlineMd(s: string): ReactNode[] {
+  const out: ReactNode[] = [];
+  const re = /\*\*(.+?)\*\*/g;
+  let last = 0; let m: RegExpExecArray | null;
+  while ((m = re.exec(s))) { if (m.index > last) out.push(s.slice(last, m.index)); out.push(<strong key={m.index}>{m[1]}</strong>); last = m.index + m[0].length; }
+  if (last < s.length) out.push(s.slice(last));
+  return out;
+}
+function RecapText({ text }: { text: string }) {
+  return (
+    <div style={{ lineHeight: 1.55, color: "#3a2a12" }}>
+      {(text || "").split("\n").map((line, i) => {
+        const h = line.match(/^\s*#{1,6}\s+(.*)$/);
+        if (h) return <div key={i} style={{ fontWeight: 800, fontSize: 15, marginTop: 14, marginBottom: 4, color: "#2C1508" }}>{inlineMd(h[1])}</div>;
+        const b = line.match(/^\s*[-*]\s+(.*)$/);
+        if (b) return <div key={i} style={{ margin: "3px 0 3px 4px", display: "flex", gap: 8 }}><span style={{ color: "#C68B7E" }}>•</span><span>{inlineMd(b[1])}</span></div>;
+        const num = line.match(/^\s*(\d+)\.\s+(.*)$/);
+        if (num) return <div key={i} style={{ margin: "3px 0 3px 4px" }}>{num[1]}. {inlineMd(num[2])}</div>;
+        if (!line.trim()) return <div key={i} style={{ height: 6 }} />;
+        return <div key={i} style={{ marginBottom: 4 }}>{inlineMd(line)}</div>;
+      })}
+    </div>
+  );
 }
 
 // Group runs into day buckets ("Today", "Yesterday", or a date) — like the chat list in Claude/ChatGPT.
@@ -491,8 +527,98 @@ export default function Connect() {
     return () => { un.then((f) => f()).catch(() => {}); };
   }, []);
   const [uiLang, setUiLangState, t] = useUiLang();
+  const wp = wakePhrase(uiLang); // the wake phrase in the user's language: "Hey Keak" / "Hola Keak" / "Ei Keak"…
   const [agentLabels, setAgentLabels] = useState<boolean>(localStorage.getItem("keak_agent_labels") !== "0");
   function toggleAgentLabels(v: boolean) { setAgentLabels(v); localStorage.setItem("keak_agent_labels", v ? "1" : "0"); }
+  // Translate-while-dictating: speak one language, Keak writes another. "off" = normal dictation. Read by the overlay.
+  const [translateTo, setTranslateTo] = useState<string>(() => {
+    const v = localStorage.getItem("keak_translate_to");
+    return v && v !== "off" ? v : "en"; // the language Ctrl+Win+Shift translates into (English by default)
+  });
+  function chooseTranslateTo(code: string) {
+    setTranslateTo(code);
+    localStorage.setItem("keak_translate_to", code);
+    localStorage.setItem("keak_translate_shift", code);
+  }
+  // Standby: the always-on Keak orb in a screen corner. Click it to talk to Keak AI without a hotkey.
+  const [standby, setStandby] = useState<boolean>(localStorage.getItem("keak_standby") === "1");
+  const [orbCorner, setOrbCorner] = useState<string>(localStorage.getItem("keak_orb_corner") || "br");
+  function toggleStandby(v: boolean) {
+    setStandby(v);
+    localStorage.setItem("keak_standby", v ? "1" : "0");
+    invoke("set_standby", { on: v, corner: orbCorner }).catch(() => { /* ignore */ });
+  }
+  function chooseOrbCorner(c: string) {
+    setOrbCorner(c);
+    localStorage.setItem("keak_orb_corner", c);
+    if (standby) invoke("set_standby", { on: true, corner: c }).catch(() => { /* ignore */ });
+  }
+  // Dictation language: locks the transcriber to one language for much better accuracy (Auto can mishear).
+  const [dictLang, setDictLang] = useState<string>(localStorage.getItem("keak_language") || "auto");
+  function chooseDictLang(code: string) {
+    setDictLang(code);
+    localStorage.setItem("keak_language", code);
+  }
+  // Hey Keak wake word: train a personal on-device model from a few voice samples, then toggle listening.
+  const [wakeTrained, setWakeTrained] = useState<boolean>(false);
+  const [wakeOn, setWakeOn] = useState<boolean>(localStorage.getItem("keak_wake") === "1");
+  const [wakeStatus, setWakeStatus] = useState<string>("");
+  useEffect(() => { invoke<number>("wake_has_samples").then((n) => setWakeTrained((n || 0) > 0)).catch(() => { /* ignore */ }); }, []);
+  function wavBase64(samples: Float32Array, rate: number): string {
+    const n = samples.length; const buf = new ArrayBuffer(44 + n * 2); const v = new DataView(buf);
+    const ws = (o: number, s: string) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+    ws(0, "RIFF"); v.setUint32(4, 36 + n * 2, true); ws(8, "WAVE"); ws(12, "fmt ");
+    v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+    v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+    ws(36, "data"); v.setUint32(40, n * 2, true);
+    let o = 44; for (let i = 0; i < n; i++) { const s = Math.max(-1, Math.min(1, samples[i])); v.setInt16(o, s < 0 ? s * 0x8000 : s * 0x7fff, true); o += 2; }
+    const bytes = new Uint8Array(buf); let bin = ""; for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    return btoa(bin);
+  }
+  async function recordWakeWav(ms: number): Promise<string> {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1 } });
+    const AC: typeof AudioContext = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+    const ctx = new AC();
+    const src = ctx.createMediaStreamSource(stream);
+    const proc = ctx.createScriptProcessor(4096, 1, 1);
+    const parts: Float32Array[] = [];
+    proc.onaudioprocess = (e) => { parts.push(new Float32Array(e.inputBuffer.getChannelData(0))); };
+    src.connect(proc); proc.connect(ctx.destination);
+    await new Promise((r) => setTimeout(r, ms));
+    proc.disconnect(); src.disconnect(); stream.getTracks().forEach((tr) => tr.stop());
+    const rate = ctx.sampleRate; await ctx.close();
+    let len = 0; for (const p of parts) len += p.length;
+    const pcm = new Float32Array(len); let off = 0; for (const p of parts) { pcm.set(p, off); off += p.length; }
+    return wavBase64(pcm, rate);
+  }
+  async function trainWake() {
+    try {
+      await invoke("wake_clear").catch(() => { /* ignore */ });
+      for (let i = 0; i < 3; i++) {
+        setWakeStatus(t("Get ready…"));
+        await new Promise((r) => setTimeout(r, 800));
+        setWakeStatus(`${t("Say")} "${wp}"  (${i + 1}/3)`);
+        const wav = await recordWakeWav(1500);
+        await invoke("wake_save_sample", { index: i, wavBase64: wav });
+      }
+      setWakeTrained(true);
+      setWakeStatus(t("Wake word ready."));
+      if (wakeOn) { await invoke("wake_stop").catch(() => {}); await invoke("wake_start").catch(() => {}); }
+    } catch {
+      setWakeStatus(t("Training failed. Check the microphone."));
+    }
+  }
+  function toggleWake(v: boolean) {
+    setWakeOn(v);
+    localStorage.setItem("keak_wake", v ? "1" : "0");
+    if (v) {
+      invoke("wake_start").then(() => setWakeStatus(t("Listening for \"{phrase}\".").replace("{phrase}", wp)))
+        .catch((e) => { setWakeStatus(String(e)); setWakeOn(false); localStorage.setItem("keak_wake", "0"); });
+    } else {
+      invoke("wake_stop").catch(() => {});
+      setWakeStatus("");
+    }
+  }
   const [history, setHistory] = useState<AgentRun[]>([]);
   useEffect(() => {
     const read = () => {
@@ -559,6 +685,25 @@ export default function Connect() {
     persistMcp([...mcpServers, s]);
     setMcpForm({ open: false, name: "", transport: "local", command: "npx", args: "", url: "", auth: "" });
     testMcpServer(s);
+  }
+
+  // Canva + Clay (API-key tools) and Zapier (connected as a remote MCP server, which reaches 9000+ apps).
+  const [zapierUrl, setZapierUrl] = useState<string>(() => localStorage.getItem("keak_zapier_mcp_url") || "");
+  // Canva connects by sign-in (OAuth), not an API key. The one-click flow needs a registered Canva app (like
+  // Google/Microsoft); until that's wired this opens Canva to approve.
+  function connectCanva() {
+    invoke("open_url", { url: "https://www.canva.com/" }).catch(() => { /* ignore */ });
+    setConnectMsg(t("Canva uses sign-in, not an API key. One-click Canva sign-in is being set up like Google — for now this opens Canva."));
+  }
+  function connectZapier() {
+    const url = zapierUrl.trim();
+    if (!url) { setConnectMsg(t("Paste your Zapier MCP URL first.")); return; }
+    localStorage.setItem("keak_zapier_mcp_url", url);
+    const rest = mcpServers.filter((s) => s.name.toLowerCase() !== "zapier");
+    const s: McpServer = { id: newMcpId(), name: "Zapier", transport: "remote", enabled: true, url };
+    persistMcp([...rest, s]);
+    testMcpServer(s);
+    setConnectMsg(t("Zapier connected. Loading your actions…"));
   }
   const chatReqRef = useRef(0); // bumping this invalidates an in-flight reply (Stop button)
   function stopChat() { chatReqRef.current++; setChatBusy(false); setChatStatus(""); setQuotePop(null); }
@@ -812,7 +957,7 @@ export default function Connect() {
   }
   const [actionMode, setActionMode] = useState<string>(() => localStorage.getItem("keak_action_mode") || "ask");
   const [showCaptions, setShowCaptions] = useState<boolean>(() => localStorage.getItem("keak_show_captions") !== "0");
-  const [useOwnAi, setUseOwnAi] = useState<boolean>(() => localStorage.getItem("keak_ai_use_own") !== "0");
+  // The assistant always runs on the user's own AI; this flag just makes answer-routing explicit.
   const [humor, setHumor] = useState<number>(() => parseInt(localStorage.getItem("keak_humor") || "20", 10));
   const [warmth, setWarmth] = useState<number>(() => parseInt(localStorage.getItem("keak_warmth") || "50", 10));
   const [formality, setFormality] = useState<number>(() => parseInt(localStorage.getItem("keak_formality") || "30", 10));
@@ -852,7 +997,6 @@ export default function Connect() {
       setGeminiModel(/gemini-2\.5-flash|gemini-2\.0-flash|gemini-2\.5-pro|gemini-1\.5|^gemini-pro$/i.test(gm) ? "" : gm);
       setActionMode(localStorage.getItem("keak_action_mode") || "ask");
       setShowCaptions(localStorage.getItem("keak_show_captions") !== "0");
-      setUseOwnAi(localStorage.getItem("keak_ai_use_own") !== "0");
       setVoiceEngine(localStorage.getItem("keak_voice_engine") || "auto");
     };
     const onStorage = (e: StorageEvent) => { if (!e.key || e.key.startsWith("keak_")) sync(); };
@@ -1396,13 +1540,192 @@ export default function Connect() {
 
   // Clicking an agent opens its history: every run where it did something. detailAgent = the agent's name.
   const [detailAgent, setDetailAgent] = useState<string | null>(null);
+  // Keak Recap: capture the computer's audio (a call/meeting), transcribe it in chunks, then summarise.
+  const [recapOn, setRecapOn] = useState(false);
+  const [recapSecs, setRecapSecs] = useState(0);
+  const [recapBusy, setRecapBusy] = useState(false);
+  const [recapStatus, setRecapStatus] = useState("");
+  const [recapOut, setRecapOut] = useState("");
+  // Keak Streaming: how live dictation shows up. "pill" (default) shows words in the Keak pill; "cursor" types
+  // them live where you're writing and swaps for the clean version on release; "off" disables it.
+  const [streamMode, setStreamMode] = useState<string>(() => { const v = localStorage.getItem("keak_streaming"); return (v === "0" || v === "off") ? "off" : "pill"; });
+  function chooseStreamMode(v: string) { setStreamMode(v); localStorage.setItem("keak_streaming", v); }
+  // At-cursor live typing is deferred to the proper streaming engine; normalise any old "cursor" setting.
+  useEffect(() => { const v = localStorage.getItem("keak_streaming"); if (v && v !== "off" && v !== "pill") localStorage.setItem("keak_streaming", "pill"); }, []);
+  // Team-to-team (Telegram group): your name in the group + what an incoming task can use + a live log.
+  const [teamName, setTeamName] = useState<string>(() => localStorage.getItem("keak_team_name") || localStorage.getItem("keak_user_name") || "");
+  const [teamAccess, setTeamAccess] = useState<string>(() => localStorage.getItem("keak_team_access") || "ai");
+  const [teamGroup, setTeamGroup] = useState<string>(() => localStorage.getItem("keak_team_group") || "");
+  const [teamLog, setTeamLog] = useState<Array<{ ts: number; dir: string; who: string; body: string; result?: string }>>([]);
+  function saveTeamName(v: string) { setTeamName(v); if (v.trim()) localStorage.setItem("keak_team_name", v.trim()); else localStorage.removeItem("keak_team_name"); }
+  function chooseTeamAccess(v: string) { setTeamAccess(v); localStorage.setItem("keak_team_access", v); }
+  function forgetTeamGroup() { localStorage.removeItem("keak_team_group"); setTeamGroup(""); }
+  useEffect(() => {
+    const read = () => { try { const l = JSON.parse(localStorage.getItem("keak_team_log") || "[]"); setTeamLog(Array.isArray(l) ? l : []); } catch { /* ignore */ } setTeamGroup(localStorage.getItem("keak_team_group") || ""); };
+    read(); const id = window.setInterval(read, 3000); return () => clearInterval(id);
+  }, []);
+  // Keak Memory: the opt-in facts Keak remembers about you. Stored locally (keak_memories), auto-captured
+  // after Keak AI turns (see Overlay), shown + editable here so you always see and control what it knows.
+  type MemFact = { id: string; text: string; ts: number };
+  const [memoryOn, setMemoryOn] = useState<boolean>(() => localStorage.getItem("keak_memory_on") === "1");
+  const [memories, setMemories] = useState<MemFact[]>([]);
+  const [newMemory, setNewMemory] = useState<string>("");
+  function readMemories() { try { const l = JSON.parse(localStorage.getItem("keak_memories") || "[]"); setMemories(Array.isArray(l) ? l : []); } catch { setMemories([]); } }
+  function toggleMemory(v: boolean) { setMemoryOn(v); localStorage.setItem("keak_memory_on", v ? "1" : "0"); }
+  function saveMemoriesList(list: MemFact[]) { localStorage.setItem("keak_memories", JSON.stringify(list.slice(0, 200))); setMemories(list); }
+  function addMemory() { const v = newMemory.trim(); if (!v) return; saveMemoriesList([{ id: `${Date.now()}`, text: v.slice(0, 120), ts: Date.now() }, ...memories]); setNewMemory(""); }
+  function deleteMemory(id: string) { saveMemoriesList(memories.filter((m) => m.id !== id)); }
+  function clearMemories() { saveMemoriesList([]); }
+  useEffect(() => { readMemories(); const un = listen("memory-updated", readMemories); const id = window.setInterval(readMemories, 4000); return () => { un.then((f) => f()); clearInterval(id); }; }, []);
+  // Live voice: default ON. When on, a Keak AI turn opens a realtime session on your connected AI.
+  const [liveMode, setLiveMode] = useState<boolean>(() => localStorage.getItem("keak_live_mode") !== "0");
+  function toggleLiveMode(v: boolean) { setLiveMode(v); localStorage.setItem("keak_live_mode", v ? "1" : "0"); }
+  // X (Twitter) posting needs OAuth 1.0a user context: 4 credentials from a read+write developer app.
+  const [xApiKey, setXApiKey] = useState<string>(() => localStorage.getItem("keak_x_api_key") || "");
+  const [xApiSecret, setXApiSecret] = useState<string>(() => localStorage.getItem("keak_x_api_secret") || "");
+  const [xAccessToken, setXAccessToken] = useState<string>(() => localStorage.getItem("keak_x_access_token") || "");
+  const [xAccessSecret, setXAccessSecret] = useState<string>(() => localStorage.getItem("keak_x_access_secret") || "");
+  const [xConnected, setXConnected] = useState<boolean>(() => !!localStorage.getItem("keak_tool_x"));
+  function saveX() {
+    const k = xApiKey.trim(), s = xApiSecret.trim(), at = xAccessToken.trim(), asec = xAccessSecret.trim();
+    if (!k || !s || !at || !asec) { setConnectMsg(t("Fill in all four X credentials.")); return; }
+    localStorage.setItem("keak_x_api_key", k);
+    localStorage.setItem("keak_x_api_secret", s);
+    localStorage.setItem("keak_x_access_token", at);
+    localStorage.setItem("keak_x_access_secret", asec);
+    localStorage.setItem("keak_tool_x", "1"); // marks the X tool connected + assignable to agents
+    setXConnected(true); setConnectMsg(t("X connected."));
+  }
+  function disconnectX() {
+    ["keak_x_api_key", "keak_x_api_secret", "keak_x_access_token", "keak_x_access_secret", "keak_tool_x"].forEach((k) => localStorage.removeItem(k));
+    setXApiKey(""); setXApiSecret(""); setXAccessToken(""); setXAccessSecret(""); setXConnected(false); setConnectMsg(t("X disconnected."));
+  }
+  // Bluesky posts via the AT Protocol: just a handle + an app password (never the real login password).
+  const [bskyHandle, setBskyHandle] = useState<string>(() => localStorage.getItem("keak_bsky_handle") || "");
+  const [bskyAppPw, setBskyAppPw] = useState<string>(() => localStorage.getItem("keak_bsky_app_password") || "");
+  const [bskyConnected, setBskyConnected] = useState<boolean>(() => !!localStorage.getItem("keak_tool_bluesky"));
+  function saveBluesky() {
+    const h = bskyHandle.trim().replace(/^@/, ""), p = bskyAppPw.trim();
+    if (!h || !p) { setConnectMsg(t("Enter your Bluesky handle and app password.")); return; }
+    localStorage.setItem("keak_bsky_handle", h);
+    localStorage.setItem("keak_bsky_app_password", p);
+    localStorage.setItem("keak_tool_bluesky", "1"); // marks Bluesky connected + assignable to agents
+    setBskyConnected(true); setConnectMsg(t("Bluesky connected."));
+  }
+  function disconnectBluesky() {
+    ["keak_bsky_handle", "keak_bsky_app_password", "keak_tool_bluesky"].forEach((k) => localStorage.removeItem(k));
+    setBskyHandle(""); setBskyAppPw(""); setBskyConnected(false); setConnectMsg(t("Bluesky disconnected."));
+  }
+  // Connections: each connector is collapsed to just its name + status. Click the head to reveal its config
+  // (API key / sign-in), one open at a time. Delegated so we don't have to wire every card by hand.
+  const [openConn, setOpenConn] = useState<number>(-1);
+  const connSecRef = useRef<HTMLElement | null>(null);
+  function onConnHeadClick(e: { target: EventTarget | null }) {
+    const head = (e.target as HTMLElement)?.closest?.(".cx-conn-head");
+    const root = connSecRef.current;
+    if (!head || !root) return;
+    const card = head.closest(".cx-conn");
+    if (!card) return;
+    const idx = Array.from(root.querySelectorAll(".cx-conn")).indexOf(card as Element);
+    setOpenConn((cur) => (cur === idx ? -1 : idx));
+  }
+  useEffect(() => {
+    const root = connSecRef.current;
+    if (!root) return;
+    Array.from(root.querySelectorAll(".cx-conn")).forEach((el, i) => (el as HTMLElement).classList.toggle("cx-conn--open", i === openConn));
+  });
+  const recapBusyRef = useRef(false);
+  useEffect(() => { recapBusyRef.current = recapBusy; }, [recapBusy]);
+  // Reflect the REAL capture state. A recap can be started/stopped BY VOICE from the overlay (not just this
+  // button), so the tab polls Rust and always shows whether a recording is running, with the live timer.
+  useEffect(() => {
+    const id = window.setInterval(async () => {
+      try {
+        const st = await invoke<[boolean, number]>("recap_status");
+        if (recapBusyRef.current) return; // don't fight the stop + transcribe flow
+        setRecapSecs(st[1] || 0);
+        setRecapOn(st[0]);
+      } catch { /* ignore */ }
+    }, 1000);
+    return () => clearInterval(id);
+  }, []);
+  // When a recap is finished by voice, the overlay pushes it here (with the text in the payload, so it works
+  // even if windows don't share storage). Also load the last saved recap when the app opens.
+  useEffect(() => {
+    try { const h = JSON.parse(localStorage.getItem("keak_recap_history") || "[]"); if (Array.isArray(h) && h[0]?.recap) setRecapOut((cur) => cur || h[0].recap); } catch { /* ignore */ }
+    const un = listen<{ recap?: string }>("recap-done", (e) => { const r = e.payload?.recap; if (r) { setRecapOut(r); setRecapStatus(""); setRecapBusy(false); } });
+    return () => { un.then((f) => f()); };
+  }, []);
+  const [recapMic, setRecapMic] = useState<boolean>(() => localStorage.getItem("keak_recap_mic") !== "0");
+  function toggleRecapMic(v: boolean) { setRecapMic(v); localStorage.setItem("keak_recap_mic", v ? "1" : "0"); }
+  async function startRecap() {
+    setRecapOut(""); setRecapStatus(""); setRecapSecs(0);
+    try { await invoke("recap_start", { mic: localStorage.getItem("keak_recap_mic") !== "0" }); setRecapOn(true); }
+    catch (e) { setRecapStatus(String(e)); }
+  }
+  // Throw away a running capture (a mistake / nothing recorded) without transcribing it.
+  async function cancelRecap() {
+    try { await invoke("recap_cancel"); } catch { /* ignore */ }
+    setRecapOn(false); setRecapSecs(0); setRecapBusy(false); setRecapStatus(t("Discarded, nothing was saved."));
+  }
+  async function stopRecap() {
+    setRecapOn(false); setRecapBusy(true);
+    try {
+      const res = await invoke<[string, number]>("recap_stop");
+      const secs = res[1] || 0;
+      if (secs < 1.5) { setRecapStatus(t("Nothing was captured. Make sure the meeting audio plays out loud (speakers), then try again.")); setRecapBusy(false); return; }
+      const CHUNK = 120;
+      const count = await invoke<number>("recap_chunk_count", { chunkSecs: CHUNK });
+      const session = JSON.parse(localStorage.getItem("keak_session") || "null");
+      const lang = localStorage.getItem("keak_language");
+      let transcript = "";
+      for (let i = 0; i < count; i++) {
+        setRecapStatus(`${t("Transcribing…")} ${i + 1}/${count}`);
+        const b64 = await invoke<string>("recap_chunk_b64", { index: i, chunkSecs: CHUNK });
+        if (!b64) continue;
+        const form = new FormData();
+        form.append("file", b64ToBlob(b64, "audio/wav"), "chunk.wav");
+        if (lang && lang !== "auto") form.append("language", lang);
+        try {
+          const r = await fetch(`${RECAP_SUPABASE_URL}/functions/v1/transcribe`, { method: "POST", headers: { Authorization: `Bearer ${session?.access_token || ""}` }, body: form });
+          const d = await r.json().catch(() => ({} as { text?: string }));
+          if (d.text) transcript += (transcript ? " " : "") + String(d.text).trim();
+        } catch { /* skip a bad chunk, keep going */ }
+      }
+      transcript = transcript.trim();
+      if (!transcript) { setRecapStatus(t("I captured audio but heard no speech to transcribe. Check the output device and try again.")); setRecapBusy(false); return; }
+      setRecapStatus(t("Writing the recap…"));
+      const ai = resolveChatAI("");
+      if (!ai) { setRecapOut(transcript); setRecapStatus(t("Connect your AI to summarise. Here's the raw transcript for now.")); setRecapBusy(false); return; }
+      const uiCode = localStorage.getItem("keak_ui_lang") || "en";
+      const LN: Record<string, string> = { es: "Spanish", ca: "Catalan", fr: "French", de: "German", pt: "Portuguese", it: "Italian", en: "English" };
+      const system = `You are given a raw transcript of a call or meeting captured from the user's computer audio. Write a clean recap in ${LN[uiCode] || "English"} using these markdown sections: a one-paragraph Summary, Key points (bullets), Decisions, and Action items (with the owner if a name is mentioned). Be faithful to the transcript and never invent anything. If the transcript is thin or unclear, keep the recap short and say so.`;
+      try {
+        const recap = await invoke<string>("cu_chat", { args: { provider: ai.provider, credential: ai.credential, accountId: ai.accountId, isSubscription: ai.isSub, model: ai.model, effort: ai.effort, system, history: [], message: transcript.slice(0, 24000) } });
+        setRecapOut(recap || transcript); setRecapStatus("");
+        try { const prev = JSON.parse(localStorage.getItem("keak_recap_history") || "[]"); const h = Array.isArray(prev) ? prev : []; h.unshift({ ts: Date.now(), secs, recap: recap || "", transcript }); localStorage.setItem("keak_recap_history", JSON.stringify(h.slice(0, 20))); } catch { /* ignore */ }
+      } catch (e) { setRecapOut(transcript); setRecapStatus(`${t("Couldn't summarise")}: ${String(e).slice(0, 120)}`); }
+    } catch (e) { setRecapStatus(String(e)); }
+    setRecapBusy(false);
+  }
+  // Send the recap into a Work chat so you can tell Keak to turn it into a PDF, a Google Doc, an email, etc.
+  function openRecapInChat() {
+    if (!recapOut.trim()) return;
+    const now = Date.now();
+    const run: AgentRun = { ts: now, job: t("Meeting recap"), results: [], messages: [{ role: "assistant", text: recapOut, ts: now }] };
+    persistHistory([run, ...history]); setSelectedRun(0);
+    setChatInput(t("Turn this recap into a PDF I can share."));
+    setActiveSection("work");
+  }
   // Work section: which run (chat) is open in the right pane.
   const [selectedRun, setSelectedRun] = useState<number>(0);
 
-  function toggleUseOwnAi(v: boolean) { setUseOwnAi(v); localStorage.setItem("keak_ai_use_own", v ? "1" : "0"); }
+  function toggleUseOwnAi(v: boolean) { localStorage.setItem("keak_ai_use_own", v ? "1" : "0"); }
   function setDial(key: string, set: (v: number) => void, v: number) { set(v); localStorage.setItem(key, String(v)); }
 
   function chooseCuProvider(p: string) { setCuProvider(p); localStorage.setItem("keak_cu_provider", p); setConnectMsg(""); }
+  // Keak's assistant always runs on the user's OWN AI. Picking a provider ensures answers route to it.
+  function pickProvider(p: string) { toggleUseOwnAi(true); chooseCuProvider(p); }
   const [claudeBusy, setClaudeBusy] = useState(false);
   async function saveClaudeToken() {
     const v = claudeToken.trim();
@@ -1619,14 +1942,14 @@ export default function Connect() {
           <p className="cx-lead">{t("Keak runs on your own Claude, ChatGPT, Gemini, or a local model. It powers both Keak AI and screen control, so there's no extra cost per action.")}</p>
 
           <div className="cx-seg cx-seg--providers">
-            <button className={`cx-seg-btn${cuProvider === "claude" ? " cx-seg-btn--on" : ""}`} onClick={() => chooseCuProvider("claude")}>Claude</button>
-            <button className={`cx-seg-btn${cuProvider === "openai" ? " cx-seg-btn--on" : ""}`} onClick={() => chooseCuProvider("openai")}>ChatGPT</button>
-            <button className={`cx-seg-btn${cuProvider === "gemini" ? " cx-seg-btn--on" : ""}`} onClick={() => chooseCuProvider("gemini")}>Gemini</button>
-            <button className={`cx-seg-btn${cuProvider === "copilot" ? " cx-seg-btn--on" : ""}`} onClick={() => chooseCuProvider("copilot")}>Copilot</button>
-            <button className={`cx-seg-btn${cuProvider === "xai" ? " cx-seg-btn--on" : ""}`} onClick={() => chooseCuProvider("xai")}>Grok</button>
-            <button className={`cx-seg-btn${cuProvider === "deepseek" ? " cx-seg-btn--on" : ""}`} onClick={() => chooseCuProvider("deepseek")}>DeepSeek</button>
-            <button className={`cx-seg-btn${cuProvider === "mistral" ? " cx-seg-btn--on" : ""}`} onClick={() => chooseCuProvider("mistral")}>Mistral</button>
-            <button className={`cx-seg-btn${cuProvider === "ollama" ? " cx-seg-btn--on" : ""}`} onClick={() => chooseCuProvider("ollama")}>Local</button>
+            <button className={`cx-seg-btn${cuProvider === "claude" ? " cx-seg-btn--on" : ""}`} onClick={() => pickProvider("claude")}>Claude</button>
+            <button className={`cx-seg-btn${cuProvider === "openai" ? " cx-seg-btn--on" : ""}`} onClick={() => pickProvider("openai")}>ChatGPT</button>
+            <button className={`cx-seg-btn${cuProvider === "gemini" ? " cx-seg-btn--on" : ""}`} onClick={() => pickProvider("gemini")}>Gemini</button>
+            <button className={`cx-seg-btn${cuProvider === "copilot" ? " cx-seg-btn--on" : ""}`} onClick={() => pickProvider("copilot")}>Copilot</button>
+            <button className={`cx-seg-btn${cuProvider === "xai" ? " cx-seg-btn--on" : ""}`} onClick={() => pickProvider("xai")}>Grok</button>
+            <button className={`cx-seg-btn${cuProvider === "deepseek" ? " cx-seg-btn--on" : ""}`} onClick={() => pickProvider("deepseek")}>DeepSeek</button>
+            <button className={`cx-seg-btn${cuProvider === "mistral" ? " cx-seg-btn--on" : ""}`} onClick={() => pickProvider("mistral")}>Mistral</button>
+            <button className={`cx-seg-btn${cuProvider === "ollama" ? " cx-seg-btn--on" : ""}`} onClick={() => pickProvider("ollama")}>Local</button>
           </div>
 
           {cuProvider === "claude" && (
@@ -1927,6 +2250,93 @@ export default function Connect() {
             </section>
             )}
 
+            {activeSection === "team" && (
+            <section className="cx-card">
+          <p className="cx-eyebrow">{t("Keak AI")}</p>
+          <h2 className="cx-h">{t("Team")}</h2>
+          <p className="cx-lead" style={{ marginBottom: 12 }}>{t("Put your Keak in a Telegram group with your teammates. Write \"<name>, do X\" in the group and that person's Keak does it and posts the result back for everyone to see. Each Keak runs on that person's own AI.")}</p>
+          {!localStorage.getItem("keak_telegram_token") ? (
+            <p className="cx-help">{t("First connect Telegram in Connections (paste your bot token), then come back here.")}</p>
+          ) : (
+            <>
+              <ol className="cx-help" style={{ margin: "0 0 12px 18px", lineHeight: 1.8 }}>
+                <li>{t("Create a Telegram group with your teammates.")}</li>
+                <li>{t("Add your Keak bot to the group. In BotFather, /setprivacy → Disable, so your bot can read group messages.")}</li>
+                <li>{t("Each teammate adds their own Keak bot to the same group and does the same.")}</li>
+                <li>{t("Send any message in the group so Keak learns it. Then write \"<your name>, …\" to give your Keak a task in front of everyone.")}</li>
+              </ol>
+              <div className="cx-field">
+                <label className="cx-field-label">{t("Your name in the group")}</label>
+                <input className="cx-input" placeholder={t("e.g. Pep")} value={teamName} onChange={(e) => saveTeamName(e.target.value)} />
+                <p className="cx-help" style={{ marginTop: 6 }}>{t("Your Keak answers when a group message starts with this, like \"Pep, draft the reply\".")}</p>
+              </div>
+              <div className="cx-field" style={{ marginTop: 12 }}>
+                <label className="cx-field-label">{t("What a teammate's task can use")}</label>
+                <select className="cx-select" value={teamAccess} onChange={(e) => chooseTeamAccess(e.target.value)}>
+                  <option value="ai">{t("Just my AI")}</option>
+                  <option value="brain">{t("My AI + read my Second Brain")}</option>
+                </select>
+              </div>
+              <p className="cx-help" style={{ marginTop: 12 }}>
+                {teamGroup ? t("Team group linked.") : t("No group linked yet — send a message in your group so Keak learns it.")}
+                {teamGroup && <button className="cx-btn cx-btn--ghost cx-btn--sm" style={{ marginLeft: 8 }} onClick={forgetTeamGroup}>{t("Forget group")}</button>}
+              </p>
+              {teamLog.length > 0 && (
+                <div style={{ marginTop: 16, borderTop: "1px solid #DECFB0", paddingTop: 14 }}>
+                  <label className="cx-field-label">{t("Recent team activity")}</label>
+                  {teamLog.slice(0, 12).map((e, i) => (
+                    <div key={i} className="cx-run" style={{ marginTop: 8 }}>
+                      <div className="cx-run-job">{e.who} <span className="cx-run-time">{clockLabel(e.ts)}</span></div>
+                      <div className="cx-run-out" style={{ whiteSpace: "pre-wrap" }}>{e.body}{e.result ? `\n→ ${e.result}` : ""}</div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </>
+          )}
+            </section>
+            )}
+
+            {activeSection === "recap" && (
+            <section className="cx-card">
+          <p className="cx-eyebrow">{t("Keak AI")}</p>
+          <h2 className="cx-h">{t("Recap a meeting")}</h2>
+          <p className="cx-help" style={{ marginTop: 4 }}>{t("Keak records the audio playing on your computer (a call, a meeting, a video) and writes you a clean recap: summary, key points, decisions and action items. It captures what you hear and transcribes on your own setup.")}</p>
+          <p className="cx-help" style={{ marginTop: 6 }}>{t("You can also just say \"Hey Keak, start a recap\" and later \"finish the recap\".")}</p>
+          {!recapOn && (
+            <label className="cx-check-row" style={{ marginTop: 12 }}>
+              <input type="checkbox" checked={recapMic} onChange={(e) => toggleRecapMic(e.target.checked)} />
+              <span>{t("Include my microphone, so your own voice is in the recap too (not just the other people).")}</span>
+            </label>
+          )}
+          <div style={{ marginTop: 12, display: "flex", alignItems: "center", gap: 14 }}>
+            {!recapOn ? (
+              <button onClick={startRecap} disabled={recapBusy} style={{ padding: "10px 20px", borderRadius: 10, border: "none", background: recapBusy ? "#E7D9C2" : "#D4A49A", color: "#2C1508", fontWeight: 700, cursor: recapBusy ? "default" : "pointer" }}>{recapBusy ? t("Working…") : t("Start recap")}</button>
+            ) : (
+              <>
+                <button onClick={stopRecap} style={{ padding: "10px 20px", borderRadius: 10, border: "none", background: "#C68B7E", color: "#fff", fontWeight: 700, cursor: "pointer" }}>{t("Stop & recap")}</button>
+                <button onClick={cancelRecap} className="cx-btn cx-btn--ghost cx-btn--sm" title={t("Throw this recording away")}>{t("Discard")}</button>
+              </>
+            )}
+            {recapOn && <span className="cx-help" style={{ color: "#C68B7E", fontWeight: 700 }}>● {t("Recording")} {Math.floor(recapSecs / 60)}:{String(Math.floor(recapSecs % 60)).padStart(2, "0")}</span>}
+          </div>
+          {recapStatus && <p className="cx-help" style={{ marginTop: 8, color: "#C68B7E", fontWeight: 600 }}>{recapStatus}</p>}
+          {recapOut && (
+            <div style={{ marginTop: 14, borderTop: "1px solid #DECFB0", paddingTop: 14 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                <label className="cx-field-label">{t("Recap")}</label>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <button className="cx-btn cx-btn--ghost cx-btn--sm" onClick={openRecapInChat}>{t("Open in chat")}</button>
+                  <button className="cx-btn cx-btn--ghost cx-btn--sm" onClick={() => { navigator.clipboard.writeText(recapOut).catch(() => {}); }}>{t("Copy")}</button>
+                  <button className="cx-btn cx-btn--ghost cx-btn--sm" onClick={() => { setRecapOut(""); setRecapStatus(""); }} title={t("Remove this recap")}>{t("Delete")}</button>
+                </div>
+              </div>
+              <div style={{ maxHeight: 340, overflowY: "auto", paddingRight: 6 }}><RecapText text={recapOut} /></div>
+            </div>
+          )}
+            </section>
+            )}
+
             {activeSection === "settings" && (
             <section className="cx-card">
           <p className="cx-eyebrow">{t("Language")}</p>
@@ -1936,6 +2346,88 @@ export default function Connect() {
               {UI_LANGS.map((l) => <option key={l.code} value={l.code}>{l.label}</option>)}
             </select>
             <p className="cx-help" style={{ marginTop: 12 }}>{t("Keak will show its buttons and menus in this language, and Keak AI will reply in it.")}</p>
+          </div>
+            </section>
+            )}
+
+            {activeSection === "settings" && (
+            <section className="cx-card">
+          <p className="cx-eyebrow">{t("Dictation")}</p>
+          <h2 className="cx-h">{t("Dictation language")}</h2>
+          <div className="cx-field">
+            <select className="cx-select" value={dictLang} onChange={(e) => chooseDictLang(e.target.value)}>
+              <option value="auto">{t("Auto-detect")}</option>
+              {UI_LANGS.map((l) => <option key={l.code} value={l.code}>{l.label}</option>)}
+            </select>
+            <p className="cx-help" style={{ marginTop: 12 }}>{t("Pick the language you dictate in for much better accuracy. Auto-detect can mishear you.")}</p>
+          </div>
+            </section>
+            )}
+
+            {activeSection === "settings" && (
+            <section className="cx-card">
+          <p className="cx-eyebrow">{t("Dictation")}</p>
+          <h2 className="cx-h">{t("Live dictation")}</h2>
+          <div className="cx-field">
+            <select className="cx-select" value={streamMode} onChange={(e) => chooseStreamMode(e.target.value)}>
+              <option value="pill">{t("Show my words live in the Keak pill")}</option>
+              <option value="off">{t("Off")}</option>
+            </select>
+            <p className="cx-help" style={{ marginTop: 12 }}>{t("See your words in the Keak pill as you talk. The final, well-written text lands at your cursor when you release.")}</p>
+          </div>
+            </section>
+            )}
+
+            {activeSection === "settings" && (
+            <section className="cx-card">
+          <p className="cx-eyebrow">{t("Dictation")}</p>
+          <h2 className="cx-h">{t("Translate my speech into")}</h2>
+          <div className="cx-field">
+            <select className="cx-select" value={translateTo} onChange={(e) => chooseTranslateTo(e.target.value)}>
+              {UI_LANGS.map((l) => <option key={l.code} value={l.code}>{l.label}</option>)}
+            </select>
+            <p className="cx-help" style={{ marginTop: 12 }}>
+              {t("Hold Ctrl + Win to write exactly what you say. Hold Ctrl + Space to translate what you say into this language.")}
+            </p>
+          </div>
+            </section>
+            )}
+
+            {activeSection === "settings" && (
+            <section className="cx-card">
+          <p className="cx-eyebrow">{t("Keak AI")}</p>
+          <h2 className="cx-h">{t("Hey Keak (Standby)")}</h2>
+          <label className="cx-check-row">
+            <input type="checkbox" checked={standby} onChange={(e) => toggleStandby(e.target.checked)} />
+            <span>{t("Show the Keak orb in the corner so you can talk to Keak AI without a hotkey")}</span>
+          </label>
+          {standby && (
+            <div className="cx-field" style={{ marginTop: 12 }}>
+              <label className="cx-field-label">{t("Orb position")}</label>
+              <select className="cx-select" value={orbCorner} onChange={(e) => chooseOrbCorner(e.target.value)}>
+                <option value="br">{t("Bottom right")}</option>
+                <option value="bl">{t("Bottom left")}</option>
+                <option value="tr">{t("Top right")}</option>
+                <option value="tl">{t("Top left")}</option>
+              </select>
+            </div>
+          )}
+          <p className="cx-help" style={{ marginTop: 10 }}>{t("Click the orb to talk to Keak AI hands-free.")}</p>
+
+          <div style={{ marginTop: 16, borderTop: "1px solid #DECFB0", paddingTop: 16 }}>
+            <label className="cx-field-label">{t("Say \"{phrase}\" instead of clicking").replace("{phrase}", wp)}</label>
+            <p className="cx-help" style={{ marginTop: 4, marginBottom: 12 }}>{t("Train it on your own voice once. It listens on your machine only, nothing is sent anywhere.")}</p>
+            <button
+              onClick={trainWake}
+              style={{ padding: "9px 18px", borderRadius: 10, border: "none", background: "#D4A49A", color: "#2C1508", fontWeight: 700, cursor: "pointer" }}
+            >
+              {(wakeTrained ? t("Re-train \"{phrase}\"") : t("Train \"{phrase}\"")).replace("{phrase}", wp)}
+            </button>
+            <label className="cx-check-row" style={{ marginTop: 26 }}>
+              <input type="checkbox" checked={wakeOn} onChange={(e) => toggleWake(e.target.checked)} />
+              <span>{t("Wake when I say \"{phrase}\"").replace("{phrase}", wp)}</span>
+            </label>
+            {wakeStatus && <p className="cx-help" style={{ marginTop: 8, color: "#C68B7E", fontWeight: 600 }}>{wakeStatus}</p>}
           </div>
             </section>
             )}
@@ -1971,21 +2463,6 @@ export default function Connect() {
             </section>
             )}
 
-            {activeSection === "settings" && (
-            <section className="cx-card">
-          <p className="cx-eyebrow">{t("Keak AI")}</p>
-          <h2 className="cx-h">{t("Where answers come from")}</h2>
-          <div className="cx-seg cx-seg--2">
-            <button className={`cx-seg-btn${useOwnAi ? " cx-seg-btn--on" : ""}`} onClick={() => toggleUseOwnAi(true)}>{t("My AI")}</button>
-            <button className={`cx-seg-btn${!useOwnAi ? " cx-seg-btn--on" : ""}`} onClick={() => toggleUseOwnAi(false)}>{t("Keak's AI")}</button>
-          </div>
-          <p className="cx-help" style={{ marginTop: 12 }}>
-            {useOwnAi
-              ? t("Keak AI answers run on your connected AI. Unlimited, no extra cost.")
-              : t("Keak AI answers use Keak's built-in AI. Counts against your plan.")}
-          </p>
-            </section>
-            )}
 
             {activeSection === "settings" && (
             <section className="cx-card">
@@ -2061,6 +2538,33 @@ export default function Connect() {
 
             {activeSection === "settings" && (
             <section className="cx-card">
+          <p className="cx-eyebrow">{t("Voice")}</p>
+          <h2 className="cx-h">{t("Live voice")}</h2>
+          <p className="cx-lead" style={{ marginBottom: 10 }}>{t("Keak AI talks back the instant you stop, instead of the record-then-answer wait. When it's on, holding Ctrl and Alt (or saying Hey Keak) starts a live conversation that knows your Second Brain and Memory. It runs on the AI you connected under Your AI, with Gemini or OpenAI.")}</p>
+          <label className="cx-check-row">
+            <input type="checkbox" checked={liveMode} onChange={(e) => toggleLiveMode(e.target.checked)} />
+            <span>{t("Use live voice for Keak AI (recommended). Turn off to use the classic record-then-answer flow.")}</span>
+          </label>
+          <p className="cx-help" style={{ marginTop: 10 }}>{t("Gemini is free with a Gemini key. OpenAI needs a real sk- key with a little credit. Other AIs use the classic flow automatically.")}</p>
+            </section>
+            )}
+
+            {activeSection === "settings" && (
+            <section className="cx-card">
+          <p className="cx-eyebrow">{t("Display")}</p>
+          <h2 className="cx-h">{t("Show captions")}</h2>
+          <div className="cx-seg cx-seg--2">
+            <button className={`cx-seg-btn${showCaptions ? " cx-seg-btn--on" : ""}`} onClick={() => toggleCaptions(true)}>{t("On")}</button>
+            <button className={`cx-seg-btn${!showCaptions ? " cx-seg-btn--on" : ""}`} onClick={() => toggleCaptions(false)}>{t("Off")}</button>
+          </div>
+          <p className="cx-help" style={{ marginTop: 12 }}>
+            {showCaptions ? t("When Keak talks, the words show under the orb.") : t("Keak talks out loud but won't print the words.")}
+          </p>
+            </section>
+            )}
+
+            {activeSection === "settings" && (
+            <section className="cx-card">
           <p className="cx-eyebrow">{t("Background")}</p>
           <h2 className="cx-h">{t("Keep Keak running for routines")}</h2>
           <p className="cx-lead" style={{ marginBottom: 12 }}>
@@ -2087,6 +2591,7 @@ export default function Connect() {
                       <span className="cx-agent-desc">{t(meta?.description || "Agent")}{meta?.personality ? ` · ${t(meta.personality)}` : ""}</span>
                     </div>
                   </div>
+                  <p className="cx-help" style={{ marginTop: 12 }}>{t("To use this agent by voice, say \"Hey Keak\" and ask Keak to use it, like \"use {name} to…\".").replace("{name}", detailAgent || "")}</p>
                   <h2 className="cx-h" style={{ marginTop: 16 }}>{t("What")} {detailAgent} {t("has done")}</h2>
                   {runs.length === 0 ? (
                     <p className="cx-help">{t("Nothing yet. When")} {detailAgent} {t("works on a job, it shows up here.")}</p>
@@ -2347,9 +2852,10 @@ export default function Connect() {
             )}
 
             {activeSection === "connections" && (
-            <section className="cx-card">
+            <section className="cx-card" ref={connSecRef} onClick={onConnHeadClick}>
               <p className="cx-eyebrow">{t("Connections")}</p>
               <h2 className="cx-h">{t("Connect your apps")}</h2>
+              <p className="cx-help" style={{ marginTop: -6, marginBottom: 10 }}>{t("Click a connector to open its setup.")}</p>
               <p className="cx-lead" style={{ marginBottom: 14 }}>
                 {t("Link your own accounts so Keak acts directly through them, no clicking on screen. It runs on your accounts, so it costs nothing extra.")}
               </p>
@@ -2399,6 +2905,24 @@ export default function Connect() {
                 ) : (
                   <button className="cx-btn cx-btn--ghost cx-btn--sm" onClick={() => setMcpForm({ ...mcpForm, open: true })}>+ {t("Add MCP server")}</button>
                 )}
+              </div>
+
+              <div className="cx-conn">
+                <div className="cx-conn-head">
+                  <span className="cx-conn-name"><LogoBadge id="zapier" name="Zapier" brand="#FF4A00" />Zapier <span className="cx-field-tag">{t("9000+ apps via MCP")}</span></span>
+                  {mcpServers.some((s) => s.name.toLowerCase() === "zapier") && <span className="cx-status"><i className="cx-dot" />{t("Connected")}</span>}
+                </div>
+                <p className="cx-help">{t("Connect Zapier once and Keak can use any of your Zapier actions across 9000+ apps. How to get your URL:")}</p>
+                <ol className="cx-help" style={{ margin: "2px 0 10px 18px", lineHeight: 1.7 }}>
+                  <li>{t("In Zapier, open MCP (zapier.com/mcp) and click New MCP server.")}</li>
+                  <li>{t("Under \"Choose your AI assistant\", click See all, then choose Other.")}</li>
+                  <li>{t("Open the Connect tab, Generate a token and copy the Server URL.")}</li>
+                  <li>{t("Paste that URL below. Pick the apps and actions you want inside Zapier — even ones Keak has no connector for.")}</li>
+                </ol>
+                <input className="cx-input" type="password" placeholder={t("Zapier MCP Server URL")} value={zapierUrl} onChange={(e) => setZapierUrl(e.target.value)} />
+                <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+                  <button className="cx-btn" onClick={connectZapier}>{t("Connect Zapier")}</button>
+                </div>
               </div>
 
               <div className="cx-conn">
@@ -2731,6 +3255,44 @@ export default function Connect() {
                           </>
                         )}
                       </>
+                    ) : tool.id === "bluesky" ? (
+                      <>
+                        <ol className="cx-help" style={{ margin: "6px 0 12px 18px", lineHeight: 1.8 }}>
+                          <li>{t("In Bluesky, go to Settings, then Privacy and security, then App passwords.")}</li>
+                          <li>{t("Tap Add app password, name it something like Keak, and copy the password it shows (you only see it once).")}</li>
+                          <li>{t("Enter your handle and that app password below. Always the app password, never your real login password.")}</li>
+                        </ol>
+                        <input className="cx-input" placeholder={t("Your handle (like name.bsky.social)")} value={bskyHandle} onChange={(e) => setBskyHandle(e.target.value)} />
+                        <input className="cx-input" type="password" placeholder={t("App password")} value={bskyAppPw} onChange={(e) => setBskyAppPw(e.target.value)} />
+                        <div className="cx-edit-actions">
+                          <button className="cx-btn cx-btn--sm" onClick={saveBluesky}>{bskyConnected ? t("Update") : t("Connect")}</button>
+                          {bskyConnected && <button className="cx-btn cx-btn--ghost cx-btn--sm" onClick={disconnectBluesky}>{t("Disconnect")}</button>}
+                          {tool.getUrl && <button className="cx-btn cx-btn--ghost cx-btn--sm" onClick={() => openUrl(tool.getUrl!)}>{t("Open Bluesky settings")}</button>}
+                        </div>
+                      </>
+                    ) : tool.id === "x" ? (
+                      <>
+                        <ol className="cx-help" style={{ margin: "6px 0 12px 18px", lineHeight: 1.8 }}>
+                          <li>{t("Go to developer.x.com and create a Project and an App.")}</li>
+                          <li>{t("X asks for a payment method and a small deposit (about $5) to activate the API for posting.")}</li>
+                          <li>{t("In the app's User authentication settings, turn on OAuth 1.0a and set App permissions to Read and write.")}</li>
+                          <li>{t("Open Keys and tokens. Copy the API Key and API Key Secret.")}</li>
+                          <li>{t("Generate the Access Token and Access Token Secret, and copy both. Do this AFTER setting Read and write, or regenerate them, otherwise posting fails.")}</li>
+                        </ol>
+                        <input className="cx-input" type="password" placeholder={t("X API Key")} value={xApiKey} onChange={(e) => setXApiKey(e.target.value)} />
+                        <input className="cx-input" type="password" placeholder={t("X API Key Secret")} value={xApiSecret} onChange={(e) => setXApiSecret(e.target.value)} />
+                        <input className="cx-input" type="password" placeholder={t("Access Token")} value={xAccessToken} onChange={(e) => setXAccessToken(e.target.value)} />
+                        <input className="cx-input" type="password" placeholder={t("Access Token Secret")} value={xAccessSecret} onChange={(e) => setXAccessSecret(e.target.value)} />
+                        <div className="cx-edit-actions">
+                          <button className="cx-btn cx-btn--sm" onClick={saveX}>{xConnected ? t("Update") : t("Connect")}</button>
+                          {xConnected && <button className="cx-btn cx-btn--ghost cx-btn--sm" onClick={disconnectX}>{t("Disconnect")}</button>}
+                          {tool.getUrl && <button className="cx-btn cx-btn--ghost cx-btn--sm" onClick={() => openUrl(tool.getUrl!)}>{t("Open X developer portal")}</button>}
+                        </div>
+                      </>
+                    ) : tool.auth === "oauth" ? (
+                      <>
+                        <button className="cx-btn" onClick={() => tool.id === "canva" ? connectCanva() : openUrl(tool.getUrl || "")}>{t("Sign in with")} {tool.name}</button>
+                      </>
                     ) : (
                       <>
                         <input
@@ -2943,29 +3505,55 @@ export default function Connect() {
             bands={[t("Very casual"), t("Relaxed"), t("Fairly polished"), t("Formal")]} />
           <Dial label={t("Directness")} value={directness} onChange={(v) => setDial("keak_directness", setDirectness, v)}
             bands={[t("Gentle and diplomatic"), t("Clear and straightforward"), t("Direct"), t("Blunt, no sugar-coating")]} />
+          <div style={{ marginTop: 24, borderTop: "1px solid #DECFB0", paddingTop: 18 }}>
+            <p className="cx-eyebrow">{t("Memory")}</p>
+            <h2 className="cx-h" style={{ fontSize: 22 }}>{t("What Keak remembers about you")}</h2>
+            <p className="cx-lead" style={{ marginBottom: 10 }}>{t("With this on, Keak quietly remembers durable facts from your talks (your projects, the people you mention, how you like things) so it gets more personal over time. It all stays on your computer, never on Keak's side, and you can edit or delete anything here.")}</p>
+            <div className="cx-seg cx-seg--2" style={{ maxWidth: 260 }}>
+              <button className={`cx-seg-btn${memoryOn ? " cx-seg-btn--on" : ""}`} onClick={() => toggleMemory(true)}>{t("On")}</button>
+              <button className={`cx-seg-btn${!memoryOn ? " cx-seg-btn--on" : ""}`} onClick={() => toggleMemory(false)}>{t("Off")}</button>
+            </div>
+            {memoryOn && (
+              <>
+                <div style={{ display: "flex", gap: 8, marginTop: 14 }}>
+                  <input className="cx-input" style={{ flex: 1 }} placeholder={t("Add something you want Keak to remember")} value={newMemory} onChange={(e) => setNewMemory(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") addMemory(); }} />
+                  <button onClick={addMemory} style={{ padding: "0 18px", borderRadius: 10, border: "none", background: "#D4A49A", color: "#2C1508", fontWeight: 700, cursor: "pointer" }}>{t("Add")}</button>
+                </div>
+                {memories.length === 0 ? (
+                  <p className="cx-help" style={{ marginTop: 12 }}>{t("Nothing yet. Keak starts remembering as you talk to it, or add something above.")}</p>
+                ) : (
+                  <div style={{ marginTop: 14 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+                      <label className="cx-field-label">{t("Remembered")} ({memories.length})</label>
+                      <button className="cx-btn cx-btn--ghost cx-btn--sm" onClick={clearMemories}>{t("Clear all")}</button>
+                    </div>
+                    {memories.slice(0, 100).map((m) => (
+                      <div key={m.id} style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", padding: "7px 0", borderBottom: "1px solid #EDE4CC" }}>
+                        <div style={{ color: "#2C1508" }}>{m.text}</div>
+                        <button className="cx-btn cx-btn--ghost cx-btn--sm" onClick={() => deleteMemory(m.id)} title={t("Forget this")}>{t("Forget")}</button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </>
+            )}
+          </div>
             </section>
             )}
 
-            {activeSection === "settings" && (
-            <section className="cx-card">
-          <p className="cx-eyebrow">{t("Display")}</p>
-          <h2 className="cx-h">{t("Show captions")}</h2>
-          <div className="cx-seg cx-seg--2">
-            <button className={`cx-seg-btn${showCaptions ? " cx-seg-btn--on" : ""}`} onClick={() => toggleCaptions(true)}>{t("On")}</button>
-            <button className={`cx-seg-btn${!showCaptions ? " cx-seg-btn--on" : ""}`} onClick={() => toggleCaptions(false)}>{t("Off")}</button>
-          </div>
-          <p className="cx-help" style={{ marginTop: 12 }}>
-            {showCaptions ? t("When Keak talks, the words show under the orb.") : t("Keak talks out loud but won't print the words.")}
-          </p>
-            </section>
-            )}
 
             {activeSection === "help" && (
             <section className="cx-card cx-howto">
           <p className="cx-eyebrow">{t("Getting started")}</p>
           <h2 className="cx-h">{t("How to use it")}</h2>
           <p className="cx-help" style={{ marginTop: 8 }}>
-            {t("Hold")} <span className="cx-kbd">Ctrl</span> + <span className="cx-kbd">Alt</span> {t("anywhere and say \"take over and...\" then what you want, like \"take over and open YouTube and search for lofi.\" Keak asks first, then does it. Press")} <span className="cx-kbd">Esc</span> {t("to stop it any time.")}
+            <strong>{t("Dictate")}:</strong> {t("Hold")} <span className="cx-kbd">Ctrl</span> + <span className="cx-kbd">Win</span> {t("anywhere and just talk. Keak drops clean text right where your cursor is, in any app and any language.")}
+          </p>
+          <p className="cx-help" style={{ marginTop: 12 }}>
+            <strong>{t("Translate")}:</strong> {t("Hold")} <span className="cx-kbd">Ctrl</span> + <span className="cx-kbd">Space</span> {t("instead, and Keak writes what you say in the language you picked in Settings.")}
+          </p>
+          <p className="cx-help" style={{ marginTop: 12 }}>
+            <strong>{t("Keak AI")}:</strong> {t("Hold")} <span className="cx-kbd">Ctrl</span> + <span className="cx-kbd">Alt</span> {t("anywhere and say \"take over and...\" then what you want, like \"take over and open YouTube and search for lofi.\" Keak asks first, then does it. Press")} <span className="cx-kbd">Esc</span> {t("to stop it any time.")}
           </p>
             </section>
             )}

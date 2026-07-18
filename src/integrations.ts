@@ -10,7 +10,7 @@
 // Per-agent access: an agent's `tools` array lists the tool ids it's allowed to use, so a research agent can
 // be pointed at Perplexity, a video agent at HeyGen, etc.
 
-export type ToolAuth = "apikey" | "token";
+export type ToolAuth = "apikey" | "token" | "oauth";
 
 export type ToolDef = {
   id: string;
@@ -83,6 +83,21 @@ export const AI_TOOLS: ToolDef[] = [
   { id: "railway", name: "Railway", category: "Dev", auth: "token",
     keyLabel: "Railway API token", getUrl: "https://railway.app/account/tokens",
     hint: "Deploy and manage your Railway services.", icon: "", brand: "#0B0D0E" },
+  { id: "clay", name: "Clay", category: "Data", auth: "apikey",
+    keyLabel: "Clay API key", getUrl: "https://app.clay.com",
+    hint: "Push and enrich data in your Clay tables.", icon: "", brand: "#3B82F6" },
+  { id: "x", name: "X", category: "Social", auth: "token",
+    keyLabel: "", getUrl: "https://developer.x.com/en/portal/dashboard",
+    hint: "Post and read on X (Twitter). Needs a free read-and-write developer app (4 keys, steps below).", icon: "x", brand: "#000000" },
+  { id: "semrush", name: "Semrush", category: "Research", auth: "apikey",
+    keyLabel: "Semrush API key", getUrl: "https://www.semrush.com/api-analytics/",
+    hint: "SEO, keyword and competitor research.", icon: "semrush", brand: "#FF642D" },
+  { id: "bluesky", name: "Bluesky", category: "Social", auth: "token",
+    keyLabel: "", getUrl: "https://bsky.app/settings/app-passwords",
+    hint: "Post to Bluesky automatically. Just your handle and a free app password (steps below).", icon: "bluesky", brand: "#0085FF" },
+  { id: "blotato", name: "Blotato", category: "Social", auth: "apikey",
+    keyLabel: "Blotato API key", getUrl: "https://my.blotato.com/settings/api",
+    hint: "Post to all your social accounts at once (X, Instagram, TikTok, LinkedIn, and more) through Blotato.", icon: "", brand: "#6C4CF1" },
 ];
 
 // Brand logo slug + colour for the OAuth/token connections (Google, Microsoft, Notion, …).
