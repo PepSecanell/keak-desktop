@@ -2790,6 +2790,28 @@ async fn telegram_poll(args: TgPollArgs) -> Result<String, String> {
     let text = res.text().await.map_err(|e| e.to_string())?;
     Ok(text)
 }
+// Download a Telegram voice note (getFile -> download the OGG bytes) and return it base64 so the frontend
+// can transcribe it like any other audio. Done in Rust because api.telegram.org has no CORS for the WebView.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TgFileArgs { token: String, file_id: String }
+#[tauri::command]
+async fn telegram_get_voice(args: TgFileArgs) -> Result<String, String> {
+    use base64::Engine;
+    let token = args.token.trim();
+    if token.is_empty() { return Err("no telegram token".into()); }
+    let client = reqwest::Client::new();
+    let meta = client.get(format!("https://api.telegram.org/bot{}/getFile?file_id={}", token, args.file_id.trim()))
+        .send().await.map_err(|e| e.to_string())?
+        .text().await.map_err(|e| e.to_string())?;
+    let v: serde_json::Value = serde_json::from_str(&meta).map_err(|e| e.to_string())?;
+    let file_path = v.get("result").and_then(|r| r.get("file_path")).and_then(|p| p.as_str())
+        .ok_or("Telegram getFile returned no file_path")?;
+    let bytes = client.get(format!("https://api.telegram.org/file/bot{}/{}", token, file_path))
+        .send().await.map_err(|e| e.to_string())?
+        .bytes().await.map_err(|e| e.to_string())?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(&bytes))
+}
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct TgSendArgs { token: String, chat_id: String, text: String }
@@ -3761,7 +3783,7 @@ pub fn run() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![open_url, inject_text, hide_overlay, show_main, show_agents, hide_agents, save_artifact, restore_clipboard, capture_selection, capture_screen, send_browser_command, capture_screen_full, mouse_click, mouse_move, cursor_pos, type_text, mouse_scroll, press_key, openai_login_start, openai_login_poll, cu_step, cu_chat, copilot_read_cli_token, ollama_list_models, pick_folder, set_autostart, get_autostart, whatsapp_send, sb_tree, sb_read, sb_write, sb_mkdir, sb_delete, sb_search, sb_graph, openai_tts, gemini_tts, google_connect, google_refresh, google_calendar_create, youtube_get, gmail_list, gmail_send, drive_create, ms_connect, ms_refresh, ms_calendar_create, ms_mail_send, ms_drive_create, notion_connect, notion_create_page, slack_connect, slack_test, slack_post, perplexity_ask, elevenlabs_tts, elevenlabs_speak, gamma_generate, heygen_video, webhook_post, manus_task, higgsfield_generate, heygen_assets, figma_connect, resend_send, supabase_rest, supabase_schema, figma_api, github_device_start, github_device_poll, github_api, shopify_api, gumloop_start, telegram_poll, telegram_send, mcp_rpc, claude_verify, claude_read_cli_token, make_scenarios, make_run, stt_status, stt_start, stt_stop, stt_download_engine, orb_talk_start, orb_talk_stop, orb_show, orb_hide, set_standby, wake_start, wake_stop, wake_save_sample, wake_clear, wake_has_samples, recap_start, recap_stop, recap_status, recap_chunk_count, recap_chunk_b64, recap_cancel, stream_type, stream_replace])
+        .invoke_handler(tauri::generate_handler![open_url, inject_text, hide_overlay, show_main, show_agents, hide_agents, save_artifact, restore_clipboard, capture_selection, capture_screen, send_browser_command, capture_screen_full, mouse_click, mouse_move, cursor_pos, type_text, mouse_scroll, press_key, openai_login_start, openai_login_poll, cu_step, cu_chat, copilot_read_cli_token, ollama_list_models, pick_folder, set_autostart, get_autostart, whatsapp_send, sb_tree, sb_read, sb_write, sb_mkdir, sb_delete, sb_search, sb_graph, openai_tts, gemini_tts, google_connect, google_refresh, google_calendar_create, youtube_get, gmail_list, gmail_send, drive_create, ms_connect, ms_refresh, ms_calendar_create, ms_mail_send, ms_drive_create, notion_connect, notion_create_page, slack_connect, slack_test, slack_post, perplexity_ask, elevenlabs_tts, elevenlabs_speak, gamma_generate, heygen_video, webhook_post, manus_task, higgsfield_generate, heygen_assets, figma_connect, resend_send, supabase_rest, supabase_schema, figma_api, github_device_start, github_device_poll, github_api, shopify_api, gumloop_start, telegram_poll, telegram_send, telegram_get_voice, mcp_rpc, claude_verify, claude_read_cli_token, make_scenarios, make_run, stt_status, stt_start, stt_stop, stt_download_engine, orb_talk_start, orb_talk_stop, orb_show, orb_hide, set_standby, wake_start, wake_stop, wake_save_sample, wake_clear, wake_has_samples, recap_start, recap_stop, recap_status, recap_chunk_count, recap_chunk_b64, recap_cancel, stream_type, stream_replace])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

@@ -24,7 +24,8 @@ export type LiveHandlers = {
   onResponding?: () => void;                        // first audio coming back
   onUserText?: (text: string) => void;              // running transcript of what the user said
   onKeakText?: (text: string) => void;              // running transcript of Keak's spoken reply
-  onDone?: (userText: string, keakText: string) => void; // turn finished
+  onDone?: (userText: string, keakText: string) => void; // one turn finished (may be followed by more)
+  onClosed?: () => void; // the whole conversation ended (mic + socket torn down)
   onError?: (msg: string) => void;
   // The live model can call a tool mid-turn to look something up (e.g. search the Second Brain). Return the
   // result as a short string; the model then keeps talking with it. Providing this enables the search tool.
@@ -76,6 +77,8 @@ class AudioPlayer {
     this.nextStart = startAt + buffer.duration;
   }
   stop() { this.stopped = true; try { this.ctx.close(); } catch { /* already closed */ } }
+  // How many seconds of queued audio are still to play (so we can wait before re-opening the mic).
+  remaining(): number { try { return Math.max(0, this.nextStart - this.ctx.currentTime); } catch { return 0; } }
 }
 
 export class LiveKeak {
@@ -104,6 +107,7 @@ export class LiveKeak {
     private apiKey: string,
     private instructions: string,
     private handlers: LiveHandlers,
+    private conversation: boolean = false, // keep listening after each reply for a natural back-and-forth
   ) {}
 
   private inRate(): number { return this.provider === "gemini" ? 16000 : 24000; }
@@ -262,12 +266,14 @@ export class LiveKeak {
         sum += s * s;
       }
       this.sendAudio(pcm);
-      // Handsfree (wake word): no release signal, so end the turn after a short pause once the user has spoken.
+      // Handsfree (wake word, or any follow-up turn in a conversation): no release signal, so end the turn
+      // after a short pause once the user has spoken. If they say nothing back in a conversation, end it.
       if (this.mode === "handsfree") {
         const rms = Math.sqrt(sum / input.length);
         const now = performance.now();
         if (rms > 0.010) { this.spoke = true; this.silenceStart = now; }
-        else if (this.spoke && now - this.silenceStart > 650) { this.finishTurn(); }
+        else if (this.spoke && now - this.silenceStart > 650) { this.finishTurn(); return; }
+        if (this.conversation && !this.spoke && now - this.startedAt > 9000) { this.close(); return; } // no reply, end the chat
         if (now - this.startedAt > 14000) this.finishTurn(); // hard cap
       }
     };
@@ -303,7 +309,17 @@ export class LiveKeak {
   private finishDone(): void {
     const u = this.userText.trim(), k = this.keakText.trim();
     this.handlers.onDone?.(u, k);
-    this.close();
+    // Conversation mode: keep the session open and listen again for the follow-up, so the user can just
+    // answer without pressing Ctrl+Alt. Wait for the reply to finish playing first (avoids echo).
+    if (this.conversation && !this.closed) {
+      const wait = Math.min(6000, Math.max(300, (this.player?.remaining() || 0) * 1000 + 250));
+      this.finished = false; this.spoke = false; this.firstAudio = false;
+      this.userText = ""; this.keakText = ""; this.pendingCall = null; this.toolInFlight = false;
+      this.wantFinish = false; this.micReady = false; this.mode = "handsfree";
+      setTimeout(() => { if (!this.closed) this.startMic(); }, wait);
+    } else {
+      this.close();
+    }
   }
 
   private stopMic(): void {
@@ -319,6 +335,7 @@ export class LiveKeak {
     this.stopMic();
     this.player?.stop(); this.player = null;
     if (this.ws) { try { this.ws.close(); } catch { /* noop */ } this.ws = null; }
+    this.handlers.onClosed?.();
   }
 }
 

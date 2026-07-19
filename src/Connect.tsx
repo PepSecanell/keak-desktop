@@ -1,7 +1,15 @@
-import { useState, useEffect, useRef, type ReactNode } from "react";
+import { useState, useEffect, useRef, type ReactNode, type CSSProperties } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import keakLogo from "./assets/icon_keak_2.png";
+// Real AI-provider logos (Pep's own files). Gemini keeps its inline SVG spark.
+import provClaude from "./assets/providers/claude.png";
+import provOpenai from "./assets/providers/openai.png";
+import provCopilot from "./assets/providers/copilot.png";
+import provGrok from "./assets/providers/grok.png";
+import provDeepseek from "./assets/providers/deepseek.png";
+import provMistral from "./assets/providers/mistral.png";
+import provOllama from "./assets/providers/ollama.png";
 import { effectiveDefaults, saveDefaultOverride, resetDefaultOverride, readDefaultOverrides, type EffectiveAgent } from "./agents-defaults";
 import { AI_TOOLS, getToolKey, setToolKey, toolConnected, assignableForAgents, CONN_ICON } from "./integrations";
 import { readRoutines, upsertRoutine, removeRoutine, newRoutineId, nextRunLabel, type Routine } from "./routines";
@@ -65,6 +73,159 @@ function LogoBadge({ id, slug, name, brand }: { id: string; slug?: string; name:
       loading="lazy"
       onError={() => setI((n) => n + 1)}
     />
+  );
+}
+
+// ------------------------------------------------------------------ *
+//  Logo celebrations — purely presentational. The moment a connector
+//  or AI tool becomes connected its logo comes alive for a second with
+//  a brand-appropriate move (the Octocat waves, the Telegram plane
+//  flies off and swoops back, the Google G scatters into its four
+//  colour arcs and recomposes…). Connected
+//  logos replay on hover/click so you can enjoy them anytime.
+//  Every play is a ONE-SHOT that self-cleans (classes, particle nodes,
+//  timers), particles are capped, transforms/opacity only, and
+//  prefers-reduced-motion reduces everything to a gentle pulse.
+// ------------------------------------------------------------------ *
+type FxPartSpec = { kind: "burst" | "rise" | "firefly" | "ring" | "line" | "drop" | "dart" | "bolt" | "trail" | "drip"; n?: number; colors?: string[] };
+// `pieces` spawns N brand-drawn overlay shapes (.cx-fxq--<cls> .cx-fxq--i<N>) whose
+// geometry/colours/choreography live entirely in Connect.css — used for effects that
+// need the logo's COLOURED PARTS (Google G arcs, Microsoft squares, Figma shapes…).
+type FxSpec = { cls: string; dur: number; parts?: FxPartSpec[]; pieces?: number };
+
+const FX_WARM = ["#D4A49A", "#C68B7E", "#E8C9A0"]; // Keak rose/cream — default particle palette
+
+const LOGO_FX: Record<string, FxSpec> = {
+  // Bespoke signature moves
+  github:     { cls: "wave", dur: 1350 },                                                       // Octocat waves hello (little arm overlay), cat bobs
+  telegram:   { cls: "fly", dur: 1500, parts: [{ kind: "trail", n: 3, colors: ["#26A5E4"] }] },  // plane launches off, swoops back
+  elevenlabs: { cls: "playmorph", dur: 1450 },                                                   // pause bars → play triangle → back to pause
+  manus:      { cls: "fingers", dur: 1150 },                                                     // the hand's fingers wiggle, grip, release
+  granola:    { cls: "drawspin", dur: 1200 },                                                    // the spiral draws itself in
+  bluesky:    { cls: "flutter", dur: 1300 },                                                     // butterfly wing-flap + bob
+  railway:    { cls: "zip", dur: 1200, parts: [{ kind: "line", n: 3, colors: ["#C68B7E"] }] },   // train zips through, speed lines
+  supabase:   { cls: "crackle", dur: 1000, parts: [{ kind: "bolt", n: 4, colors: ["#3FCF8E", "#E8C9A0"] }] }, // bolt crackles with sparks
+  shopify:    { cls: "bagfill", dur: 1500, parts: [{ kind: "drop", n: 3, colors: ["#7AB55C", "#E8C9A0", "#5E8E3E"] }] }, // items drop in one by one, bag plumps
+  stripe:     { cls: "swipe", dur: 1000 },                                                       // quick card-swipe shine
+  x:          { cls: "spinfast", dur: 900 },                                                     // fast spin
+  slack:      { cls: "slackspin", dur: 1350 },                                                   // spins so fast it blurs into its 4 colours (conic swirl overlay), settles
+  // Everyone else gets a tasteful signature move too — nobody stays static
+  google:     { cls: "gparts", dur: 1600, pieces: 4 },                                           // the 4 brand-colour arcs of the G scatter apart, then recompose
+  microsoft:  { cls: "mswin", dur: 1750, pieces: 4 },                                            // red/green/blue/yellow squares pop up ONE AT A TIME to build the window
+  notion:     { cls: "scribble", dur: 1000 },                                                    // pencil-write wiggle
+  figma:      { cls: "figparts", dur: 1650, pieces: 5 },                                         // its 5 coloured shapes fly in and assemble into the Figma mark
+  perplexity: { cls: "breath", dur: 1200 },                                                      // springy shrink-then-grow breath
+  heygen:     { cls: "throw", dur: 1250 },                                                       // winds up and hurls a projectile from its centre
+  gamma:      { cls: "space", dur: 1800, parts: [{ kind: "rise", n: 2, colors: ["#9C6BFF", "#E8C9A0"] }] }, // zero-gravity float + slow tumble
+  higgsfield: { cls: "slither", dur: 1300 },                                                     // the mark slithers like a snake (undulating wave)
+  n8n:        { cls: "branch", dur: 1700, pieces: 5 },                                           // node dots + branch lines grow and connect into the mark
+  make:       { cls: "mfall", dur: 1650, pieces: 3 },                                            // its three bolts fall away, then reassemble in formation
+  gumloop:    { cls: "orbit", dur: 1300 },                                                      // a little loop-de-loop
+  resend:     { cls: "tiltsend", dur: 1000, parts: [{ kind: "dart", n: 1, colors: ["#2C1508"] }] }, // letter whooshes off
+  clickup:    { cls: "hophop", dur: 1100 },                                                     // cheerful double hop (it's an up-arrow)
+  tavily:     { cls: "pulse", dur: 1100, parts: [{ kind: "ring", n: 2, colors: ["#1F6FEB"] }] }, // search sonar
+  firecrawl:  { cls: "flare", dur: 1350, parts: [{ kind: "rise", n: 4, colors: ["#F97316", "#FDBA74"] }] }, // flame flares outward, embers rise, settles
+  fireflies:  { cls: "riseup", dur: 1500, parts: [{ kind: "firefly", n: 3, colors: ["#FFE9A8"] }] }, // rises up, hovers, floats back to its spot
+  vercel:     { cls: "launch", dur: 1100, parts: [{ kind: "burst", n: 3 }] },                    // the triangle lifts off
+  pinecone:   { cls: "pendulum", dur: 1400 },                                                   // hangs and swings like a pinecone
+  clay:       { cls: "melt", dur: 1450, parts: [{ kind: "drip", n: 2, colors: ["#C68B7E", "#D4A49A"] }] }, // melts/drips down, then reforms
+  semrush:    { cls: "fireball", dur: 1550 },                                                   // rolls while its fireball keeps orbiting a beat
+  blotato:    { cls: "pop", dur: 1100, parts: [{ kind: "burst", n: 4, colors: ["#6C4CF1", "#D4A49A"] }] }, // posts everywhere at once
+  brain:      { cls: "pulse", dur: 1300, parts: [{ kind: "rise", n: 3 }] },                     // a warm think-pulse
+  zapier:     { cls: "crackle", dur: 900, parts: [{ kind: "bolt", n: 3, colors: ["#FF4A00"] }] }, // zap!
+  mcp:        { cls: "plug", dur: 1000 },                                                       // plugs in with a click
+};
+
+const FX_ELS = new Map<string, HTMLElement>();
+const FX_BUSY = new Set<string>();
+
+function fxSpawnParts(host: HTMLElement, spec: FxPartSpec): HTMLElement[] {
+  const made: HTMLElement[] = [];
+  const n = Math.min(spec.n ?? 3, 6); // hard cap per pattern
+  const colors = spec.colors && spec.colors.length ? spec.colors : FX_WARM;
+  for (let i = 0; i < n; i++) {
+    const s = document.createElement("span");
+    s.className = `cx-fxp cx-fxp--${spec.kind}`;
+    s.style.setProperty("--c", colors[i % colors.length]);
+    let dx = 0, dy = 0, delay = 0;
+    if (spec.kind === "burst") {
+      const a = (Math.PI * 2 * i) / n - Math.PI / 2 + (Math.random() - 0.5) * 0.7;
+      const r = 14 + Math.random() * 9;
+      dx = Math.cos(a) * r; dy = Math.sin(a) * r;
+    } else if (spec.kind === "rise" || spec.kind === "firefly") {
+      dx = (i - (n - 1) / 2) * 7 + (Math.random() - 0.5) * 5;
+      delay = i * (spec.kind === "firefly" ? 160 : 100);
+    } else if (spec.kind === "bolt") {
+      dx = -11 + Math.random() * 22; dy = -11 + Math.random() * 22; delay = i * 90;
+    } else if (spec.kind === "drop") {
+      dx = (i - (n - 1) / 2) * 5; delay = i * 260;
+    } else if (spec.kind === "drip") {
+      dx = (i - (n - 1) / 2) * 8; delay = 220 + i * 190;
+    } else if (spec.kind === "line") {
+      dy = (i - (n - 1) / 2) * 7; delay = i * 70;
+    } else if (spec.kind === "trail") {
+      delay = i * 110;
+    } else if (spec.kind === "ring") {
+      delay = i * 180;
+    }
+    s.style.setProperty("--dx", `${dx.toFixed(1)}px`);
+    s.style.setProperty("--dy", `${dy.toFixed(1)}px`);
+    s.style.setProperty("--fd", `${delay}ms`);
+    host.appendChild(s);
+    made.push(s);
+  }
+  return made;
+}
+
+// One-shot play; guards against overlapping plays, self-cleans everything.
+// Third-party brand-logo animations (the AI-provider "attacks" + the connector logo moves).
+// OFF until Keak has permission/partnership to animate those marks. The full animation code
+// below is intact and never runs while this is false (users never see it, so no trademark use).
+// To restore EXACTLY as built: flip this to true and rebuild. Nothing else changes.
+const LOGO_FX_ENABLED = false;
+
+function playLogoFx(id: string) {
+  if (!LOGO_FX_ENABLED) return;
+  const el = FX_ELS.get(id);
+  if (!el || FX_BUSY.has(id)) return;
+  const reduced = typeof window.matchMedia === "function" && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const spec = LOGO_FX[id] || { cls: "pop", dur: 1000 };
+  const cls = reduced ? "pulse" : spec.cls; // reduced motion → gentle pop, no projectiles
+  const dur = reduced ? 600 : spec.dur;
+  FX_BUSY.add(id);
+  el.classList.add("cx-fx--play", `cx-fx--${cls}`);
+  let made: HTMLElement[] = [];
+  if (!reduced && spec.parts) for (const p of spec.parts) made = made.concat(fxSpawnParts(el, p));
+  if (!reduced && spec.pieces) {
+    // Brand-drawn overlay shapes (coloured logo parts); all styling lives in CSS.
+    for (let i = 0; i < Math.min(spec.pieces, 6); i++) {
+      const s = document.createElement("span");
+      s.className = `cx-fxq cx-fxq--${spec.cls} cx-fxq--i${i + 1}`;
+      el.appendChild(s);
+      made.push(s);
+    }
+  }
+  window.setTimeout(() => {
+    el.classList.remove("cx-fx--play", `cx-fx--${cls}`);
+    made.forEach((nd) => nd.remove());
+    FX_BUSY.delete(id);
+  }, dur + 80);
+}
+
+// Presentational wrapper around LogoBadge: registers the element so a fresh
+// connect can celebrate it, and lets an already-CONNECTED logo replay its
+// animation on hover or click (debounced; the play itself is guarded too).
+function FxLogo({ id, slug, name, brand, on }: { id: string; slug?: string; name: string; brand?: string; on?: boolean }) {
+  const lastHover = useRef(0);
+  return (
+    <span
+      className={`cx-fx${on && LOGO_FX_ENABLED ? " cx-fx--on" : ""}`}
+      ref={(el) => { if (el) FX_ELS.set(id, el); else FX_ELS.delete(id); }}
+      onMouseEnter={() => { const now = Date.now(); if (now - lastHover.current < 450) return; lastHover.current = now; playLogoFx(id); }}
+      onClick={() => { playLogoFx(id); }}
+    >
+      <LogoBadge id={id} slug={slug} name={name} brand={brand} />
+    </span>
   );
 }
 
@@ -417,9 +578,10 @@ function connectedModelChoices(): { value: string; label: string }[] {
 function Dial({ label, value, onChange, bands }: { label: string; value: number; onChange: (v: number) => void; bands: [string, string, string, string] }) {
   const desc = value < 16 ? bands[0] : value < 41 ? bands[1] : value < 71 ? bands[2] : bands[3];
   return (
-    <div className="cx-dial">
+    // --kx-dial (0..1) drives the little mood orb: its size + glow grow with the value.
+    <div className="cx-dial" style={{ "--kx-dial": value / 100 } as CSSProperties}>
       <div className="cx-dial-head">
-        <span className="cx-dial-name">{label}</span>
+        <span className="cx-dial-name"><i className="cx-dial-orb" aria-hidden="true" />{label}</span>
         <span className="cx-dial-val">{value}</span>
       </div>
       <input
@@ -431,7 +593,8 @@ function Dial({ label, value, onChange, bands }: { label: string; value: number;
         onChange={(e) => onChange(parseInt(e.target.value, 10))}
         style={{ background: `linear-gradient(to right, #CE968A 0%, #D8A093 ${value}%, rgba(44,21,8,0.12) ${value}%, rgba(44,21,8,0.12) 100%)` }}
       />
-      <span className="cx-dial-desc">{desc}</span>
+      {/* keyed by the band text so crossing into a new band replays the shimmer-in */}
+      <span className="cx-dial-desc" key={desc}>{desc}</span>
     </div>
   );
 }
@@ -441,6 +604,357 @@ const CheckIcon = () => (
     <path d="M20 6L9 17l-5-5" />
   </svg>
 );
+
+/* ------------------------------------------------------------------ *
+   Visual system — inline SVG icon sets (nav, providers, settings) and
+   the section hero / medallion shells. Pure presentation: no state, no
+   handlers, no i18n of its own — every t() call stays where it was.
+ * ------------------------------------------------------------------ */
+
+// One crisp hairline icon per sidebar section, keyed by SECTIONS id.
+const NAV_ICONS: Record<string, ReactNode> = {
+  ai: (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M12 3v4.2M12 16.8V21M3 12h4.2M16.8 12H21" />
+      <path d="M12 8.9c.55 1.5 1.55 2.5 3.1 3.1-1.55.6-2.55 1.6-3.1 3.1-.55-1.5-1.55-2.5-3.1-3.1 1.55-.6 2.55-1.6 3.1-3.1z" fill="currentColor" stroke="none" />
+    </svg>
+  ),
+  agents: (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" aria-hidden="true">
+      <path d="M7.6 15L10.9 8.2M14 7.6l3.5 4.9M8.3 17.1h8" opacity="0.55" />
+      <circle cx="6.2" cy="17.2" r="2.3" fill="currentColor" stroke="none" />
+      <circle cx="12" cy="5.8" r="2.3" fill="currentColor" stroke="none" />
+      <circle cx="18.4" cy="14.4" r="2.3" fill="currentColor" stroke="none" />
+    </svg>
+  ),
+  brain: (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M3.5 7.3c0-1.1.9-2 2-2h3.9l2 2.4h7.1c1.1 0 2 .9 2 2v7.9c0 1.1-.9 2-2 2h-13c-1.1 0-2-.9-2-2V7.3z" />
+      <path d="M3.5 11h17" opacity="0.45" />
+    </svg>
+  ),
+  routines: (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <circle cx="12" cy="12" r="8.2" />
+      <path d="M12 7.4V12l3.2 2.1" />
+    </svg>
+  ),
+  connections: (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M9.2 6.8V3.4M14.8 6.8V3.4" />
+      <path d="M7.4 6.8h9.2v3.6a4.6 4.6 0 01-9.2 0V6.8z" />
+      <path d="M12 15v2.6a3.1 3.1 0 01-3.1 3.1" />
+    </svg>
+  ),
+  recap: (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" aria-hidden="true">
+      <path d="M4 10v4M8 7.2v9.6M12 4.4v15.2M16 7.2v9.6M20 10v4" />
+    </svg>
+  ),
+  team: (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <circle cx="9" cy="8.6" r="3.1" />
+      <path d="M3.6 19.2c.7-3 2.9-4.7 5.4-4.7s4.7 1.7 5.4 4.7" />
+      <circle cx="16.6" cy="9.4" r="2.4" opacity="0.6" />
+      <path d="M15.6 14.7c2.2.1 4 1.6 4.7 4.1" opacity="0.6" />
+    </svg>
+  ),
+  work: (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M4 7.2c0-1.4 1.1-2.5 2.5-2.5h11c1.4 0 2.5 1.1 2.5 2.5v7c0 1.4-1.1 2.5-2.5 2.5H10l-4.2 3.4v-3.4H6.5C5.1 16.7 4 15.6 4 14.2v-7z" />
+      <path d="M8.4 9.6h7.2M8.4 12.6h4.6" opacity="0.5" />
+    </svg>
+  ),
+  personality: (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" aria-hidden="true">
+      <path d="M4 7.4h16M4 12h16M4 16.6h16" opacity="0.4" />
+      <circle cx="9.4" cy="7.4" r="2" fill="currentColor" stroke="none" />
+      <circle cx="15.2" cy="12" r="2" fill="currentColor" stroke="none" />
+      <circle cx="7.2" cy="16.6" r="2" fill="currentColor" stroke="none" />
+    </svg>
+  ),
+  settings: (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" aria-hidden="true">
+      <circle cx="12" cy="12" r="3.1" />
+      <path d="M12 2.9v2.5M12 18.6v2.5M2.9 12h2.5M18.6 12h2.5M5.6 5.6l1.7 1.7M16.7 16.7l1.7 1.7M18.4 5.6l-1.7 1.7M7.3 16.7l-1.7 1.7" />
+    </svg>
+  ),
+  help: (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <circle cx="12" cy="12" r="8.6" />
+      <path d="M9.6 9.4c.2-1.3 1.2-2.2 2.5-2.2 1.4 0 2.5 1 2.5 2.3 0 1.9-2.6 2-2.6 3.9" />
+      <circle cx="12" cy="16.7" r="1.05" fill="currentColor" stroke="none" />
+    </svg>
+  ),
+};
+
+// Simple, recognizable brand marks for the "Your AI" picker — drawn in-house,
+// monochrome (currentColor) so they always sit in the Keak palette.
+const PROVIDER_MARKS: Record<string, ReactNode> = {
+  // Real brand logos from Pep's files, shown in white app-icon tiles (see .cx-provider-logo).
+  claude: <img className="cx-provider-logo" src={provClaude} alt="" />,
+  openai: <img className="cx-provider-logo" src={provOpenai} alt="" />,
+  gemini: ( // four-point spark — kept as SVG (Pep confirmed this one is good)
+    <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+      <path d="M12 2.4c.85 5.1 4.5 8.75 9.6 9.6-5.1.85-8.75 4.5-9.6 9.6-.85-5.1-4.5-8.75-9.6-9.6 5.1-.85 8.75-4.5 9.6-9.6z" />
+    </svg>
+  ),
+  copilot: <img className="cx-provider-logo" src={provCopilot} alt="" />,
+  xai: <img className="cx-provider-logo" src={provGrok} alt="" />,
+  deepseek: <img className="cx-provider-logo" src={provDeepseek} alt="" />,
+  mistral: <img className="cx-provider-logo" src={provMistral} alt="" />,
+  ollama: <img className="cx-provider-logo" src={provOllama} alt="" />,
+};
+
+// The provider cards in "Your AI" — same ids the pickProvider handler expects.
+const PROVIDER_CARDS: { id: string; name: string }[] = [
+  { id: "claude", name: "Claude" },
+  { id: "openai", name: "ChatGPT" },
+  { id: "gemini", name: "Gemini" },
+  { id: "copilot", name: "Copilot" },
+  { id: "xai", name: "Grok" },
+  { id: "deepseek", name: "DeepSeek" },
+  { id: "mistral", name: "Mistral" },
+  { id: "ollama", name: "Local" },
+];
+
+// ================= PROVIDER ATTACK SHOW (presentational only) ================
+// When the chosen provider changes, its card plays a playful signature move and
+// brand-matched cartoon projectiles fly to the other cards, which react. This
+// never touches pickProvider / provider state — it only *watches* the change.
+// Every node and class self-cleans in ~2s; the whole show is skippable (calm
+// glow only) under prefers-reduced-motion.
+const ATK_FX_CLASSES = [
+  "cx-atk-win", "cx-atk-calm",
+  "cx-atk-win--lunge", "cx-atk-win--burst", "cx-atk-win--spin", "cx-atk-win--shoot",
+  "cx-atk-win--slam", "cx-atk-win--jab", "cx-atk-win--fling", "cx-atk-win--wave",
+  "cx-hit-splat", "cx-hit-crush", "cx-hit-bonk", "cx-hit-recoil",
+  "cx-hit-jab", "cx-hit-weight", "cx-hit-flood",
+];
+const ATK_WIND_UP: Record<string, string> = {
+  ollama: "lunge", claude: "burst", openai: "spin", gemini: "shoot",
+  copilot: "slam", xai: "jab", mistral: "fling", deepseek: "wave",
+};
+
+function playProviderAttack(grid: HTMLElement | null, id: string): () => void {
+  const noop = () => {};
+  if (!LOGO_FX_ENABLED || !grid) return noop;
+  const cards = Array.from(grid.querySelectorAll<HTMLElement>(".cx-provider-card"));
+  const idx = PROVIDER_CARDS.findIndex((p) => p.id === id);
+  const winner = cards[idx];
+  if (!winner || cards.length < 2) return noop;
+
+  const timers: number[] = [];
+  const anims: Animation[] = [];
+  const later = (fn: () => void, ms: number) => { timers.push(window.setTimeout(fn, ms)); };
+
+  // Calm mode: no projectiles — just a gentle glow on the chosen card.
+  if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+    winner.classList.add("cx-atk-calm");
+    later(() => winner.classList.remove("cx-atk-calm"), 900);
+    return () => { timers.forEach(clearTimeout); winner.classList.remove("cx-atk-calm"); };
+  }
+
+  // Overlay over the grid: projectiles live here, never inside the buttons.
+  const layer = document.createElement("div");
+  layer.className = "cx-attack-layer";
+  grid.appendChild(layer);
+
+  const gr = grid.getBoundingClientRect();
+  const spot = (el: HTMLElement) => {
+    const r = el.getBoundingClientRect();
+    return { x: r.left - gr.left + r.width / 2, y: r.top - gr.top + r.height / 2, w: r.width, h: r.height, left: r.left - gr.left, top: r.top - gr.top };
+  };
+  const from = spot(winner);
+  const targets = cards
+    .map((card, i) => ({ card, i }))
+    .filter((e) => e.i !== idx)
+    .slice(0, 7) // hard cap on victims → capped projectile count
+    .map((e) => ({ card: e.card, at: spot(e.card) }));
+
+  const hit = (card: HTMLElement, cls: string, ms: number) => {
+    card.classList.add(cls);
+    later(() => card.classList.remove(cls), ms);
+  };
+  // Park a short-lived aftermath element at a spot; look + exit is pure CSS.
+  const leave = (cls: string, x: number, y: number, life: number, rot = 0) => {
+    const el = document.createElement("i");
+    el.className = `cx-proj ${cls}`;
+    el.style.left = `${x}px`; el.style.top = `${y}px`;
+    if (rot) el.style.setProperty("--proj-rot", `${rot}deg`);
+    layer.appendChild(el);
+    later(() => el.remove(), life);
+  };
+  // Fly a projectile from the winner to (x, y) with the Web Animations API.
+  const fly = (
+    cls: string,
+    to: { x: number; y: number },
+    o: { delay?: number; dur?: number; rot?: number; spin?: number; arc?: number },
+    onHit?: () => void,
+  ) => {
+    const el = document.createElement("i");
+    el.className = `cx-proj ${cls}`;
+    el.style.left = `${from.x}px`; el.style.top = `${from.y}px`;
+    layer.appendChild(el);
+    const dx = to.x - from.x, dy = to.y - from.y;
+    const rot = o.rot ?? 0, spin = o.spin ?? 0, arc = o.arc ?? 0;
+    const a = el.animate([
+      { transform: `translate(-50%, -50%) rotate(${rot}deg) scale(0.5)`, opacity: 0 },
+      { opacity: 1, offset: 0.15 },
+      { transform: `translate(-50%, -50%) translate(${(dx * 0.5).toFixed(1)}px, ${(dy * 0.5 - arc).toFixed(1)}px) rotate(${rot + spin * 0.5}deg) scale(1)`, offset: 0.5 },
+      { transform: `translate(-50%, -50%) translate(${dx.toFixed(1)}px, ${dy.toFixed(1)}px) rotate(${rot + spin}deg) scale(1)`, opacity: 1 },
+    ], { duration: o.dur ?? 420, delay: o.delay ?? 0, easing: "cubic-bezier(0.35, 0, 0.75, 1)", fill: "backwards" });
+    anims.push(a);
+    a.onfinish = () => { el.remove(); onHit?.(); };
+  };
+
+  winner.classList.add("cx-atk-win", `cx-atk-win--${ATK_WIND_UP[id] || "burst"}`);
+
+  switch (id) {
+    case "ollama": // the llama juts forward and SPITS — droplets dribble down the rivals
+      targets.forEach(({ card, at }, i) => {
+        fly("cx-proj--spit", { x: at.x, y: at.y - 12 }, { delay: 240 + i * 50, dur: 380, arc: 30 }, () => {
+          hit(card, "cx-hit-splat", 520);
+          leave("cx-proj--dribble", at.x + (i % 2 ? 5 : -4), at.y - 10, 1150);
+        });
+      });
+      break;
+    case "claude": // rose sun-ray shards burst out and gently CRUSH the rivals
+      targets.forEach(({ card, at }, i) => {
+        const ang = Math.round((Math.atan2(at.y - from.y, at.x - from.x) * 180) / Math.PI);
+        fly("cx-proj--shard", at, { delay: 170 + i * 40, dur: 340, rot: ang }, () => hit(card, "cx-hit-crush", 620));
+      });
+      break;
+    case "openai": // spins up fast and flings knot-loops that BONK the rivals
+      targets.forEach(({ card, at }, i) => {
+        fly("cx-proj--ring", at, { delay: 260 + i * 45, dur: 400, spin: 540, arc: 18 }, () => hit(card, "cx-hit-bonk", 560));
+      });
+      break;
+    case "gemini": // twirls, then quick-draws its 4-point star — pew pew pew
+      targets.forEach(({ card, at }, i) => {
+        fly("cx-proj--star", at, { delay: 330 + i * 85, dur: 240, spin: 360 }, () => {
+          hit(card, "cx-hit-recoil", 420);
+          leave("cx-proj--pop", at.x, at.y - 8, 400);
+        });
+      });
+      break;
+    case "copilot": // strikes DOWN — the slam quakes every other card
+      later(() => {
+        grid.classList.add("cx-quake");
+        later(() => grid.classList.remove("cx-quake"), 720);
+      }, 430);
+      break;
+    case "xai": // jabs its two slashes out; they stick upright as warning marks, then fade
+      targets.forEach(({ card, at }, i) => {
+        ([-1, 1] as const).forEach((s, k) => {
+          fly("cx-proj--slash", { x: at.x + s * 17, y: at.y - 8 }, { delay: 180 + i * 40 + k * 60, dur: 300, rot: s * 9 }, () => {
+            if (k === 0) hit(card, "cx-hit-jab", 380);
+            leave("cx-proj--slashmark", at.x + s * 17, at.y - 8, 950, s * 9);
+          });
+        });
+      });
+      break;
+    case "mistral": // flings little orange squares that stack on everyone's head, then drop off
+      targets.forEach(({ card, at }, i) => {
+        const headY = at.top + 10;
+        ([-1, 1] as const).forEach((s, k) => {
+          fly("cx-proj--brick", { x: at.x + s * 5, y: headY - (k ? 8 : 0) }, { delay: 220 + i * 45 + k * 90, dur: 360, arc: 34, spin: 180 }, () => {
+            if (k === 0) hit(card, "cx-hit-weight", 520);
+            leave("cx-proj--brickrest", at.x + s * 5, headY - (k ? 8 : 0), 1000);
+          });
+        });
+      });
+      break;
+    case "deepseek": { // a wave rolls out — rivals get gently flooded and their logos bob
+      const sorted = [...targets].sort((a, b) =>
+        (Math.abs(a.at.x - from.x) + Math.abs(a.at.y - from.y)) - (Math.abs(b.at.x - from.x) + Math.abs(b.at.y - from.y)));
+      sorted.forEach(({ card, at }, i) => {
+        later(() => {
+          const fl = document.createElement("i");
+          fl.className = "cx-flood";
+          fl.style.left = `${at.left}px`; fl.style.top = `${at.top}px`;
+          fl.style.width = `${at.w}px`; fl.style.height = `${at.h}px`;
+          layer.appendChild(fl);
+          hit(card, "cx-hit-flood", 1350);
+          later(() => fl.remove(), 1400);
+        }, 260 + i * 110);
+      });
+      break;
+    }
+    default:
+      break;
+  }
+
+  const cleanup = () => {
+    timers.forEach(clearTimeout); timers.length = 0;
+    anims.forEach((a) => { try { a.cancel(); } catch { /* already done */ } });
+    layer.remove();
+    grid.classList.remove("cx-quake");
+    cards.forEach((c) => c.classList.remove(...ATK_FX_CLASSES));
+  };
+  later(cleanup, 2600); // the whole show self-cleans even if nothing interrupts it
+  return cleanup;
+}
+
+// Small duotone icons for the Settings cards, so each group reads at a glance.
+const SET_ICONS: Record<string, ReactNode> = {
+  globe: (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" aria-hidden="true">
+      <circle cx="12" cy="12" r="8.4" />
+      <path d="M3.6 12h16.8M12 3.6c2.3 2.2 3.5 5.1 3.5 8.4s-1.2 6.2-3.5 8.4c-2.3-2.2-3.5-5.1-3.5-8.4s1.2-6.2 3.5-8.4z" opacity="0.6" />
+    </svg>
+  ),
+  mic: (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <rect x="9.2" y="3.4" width="5.6" height="10.2" rx="2.8" />
+      <path d="M5.8 11.4a6.2 6.2 0 0012.4 0M12 17.6v3" />
+    </svg>
+  ),
+  shield: (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M12 3.4l7 2.6v5.3c0 4.4-2.9 7.6-7 9.3-4.1-1.7-7-4.9-7-9.3V6z" />
+      <path d="M9.2 12l2 2 3.6-3.8" opacity="0.7" />
+    </svg>
+  ),
+  speaker: (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M4 9.4v5.2h3.4L12.4 19V5L7.4 9.4H4z" />
+      <path d="M15.4 9.2a4 4 0 010 5.6M18 6.8a7.4 7.4 0 010 10.4" opacity="0.6" />
+    </svg>
+  ),
+  captions: (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <rect x="3.4" y="5.4" width="17.2" height="13.2" rx="3" />
+      <path d="M10.4 10.6c-.5-.6-1.2-.9-2-.9-1.5 0-2.6 1-2.6 2.3s1.1 2.3 2.6 2.3c.8 0 1.5-.3 2-.9M18.2 10.6c-.5-.6-1.2-.9-2-.9-1.5 0-2.6 1-2.6 2.3s1.1 2.3 2.6 2.3c.8 0 1.5-.3 2-.9" opacity="0.7" />
+    </svg>
+  ),
+  power: (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" aria-hidden="true">
+      <path d="M12 3.6v7.4" />
+      <path d="M7.2 6.6a7.6 7.6 0 109.6 0" />
+    </svg>
+  ),
+};
+
+// A section's opening spread: rose medallion + the (unchanged) eyebrow/title/lead.
+function SectionHero({ id, children }: { id: string; children: ReactNode }) {
+  return (
+    <header className={`cx-secthero cx-secthero--${id}`}>
+      <span className="cx-medallion" aria-hidden="true">{NAV_ICONS[id] || NAV_ICONS.ai}</span>
+      <div className="cx-secthero-text">{children}</div>
+    </header>
+  );
+}
+
+// Compact header row for the Settings cards — small medallion, same type.
+function MiniHead({ icon, children }: { icon: ReactNode; children: ReactNode }) {
+  return (
+    <header className="cx-secthero cx-secthero--row">
+      <span className="cx-medallion cx-medallion--sm" aria-hidden="true">{icon}</span>
+      <div className="cx-secthero-text">{children}</div>
+    </header>
+  );
+}
 
 // Native "Connect your AI" window (opened from the Keak tray). It lives at the same origin as the
 // overlay, so everything it writes to localStorage (provider, tokens, action mode, captions) is read
@@ -1394,6 +1908,8 @@ export default function Connect() {
   const [routines, setRoutines] = useState<Routine[]>(() => readRoutines());
   const [rtEditing, setRtEditing] = useState<Routine | null>(null);
   function refreshRoutines() { setRoutines(readRoutines()); }
+  // Refresh the list when a routine is created elsewhere (by voice or from Telegram), so it shows up here.
+  useEffect(() => { const un = listen("routines-updated", refreshRoutines); return () => { un.then((f) => f()); }; }, []);
   function blankRoutine(): Routine { return { id: newRoutineId(), name: "", freq: "daily", hour: 9, minute: 0, instructions: "", output: "telegram", tools: [], enabled: true }; }
   function startAddRoutine() {
     if (routines.length >= MAX_ROUTINES) { setConnectMsg(t("You've reached the limit of routines. Delete one to create a new one.")); return; }
@@ -1634,6 +2150,8 @@ export default function Connect() {
     if (!root) return;
     Array.from(root.querySelectorAll(".cx-conn")).forEach((el, i) => (el as HTMLElement).classList.toggle("cx-conn--open", i === openConn));
   });
+  // Logo animations now play on hover / select of any tool or connection (see FxLogo),
+  // not on connect — so you can browse and enjoy them without connecting anything.
   const recapBusyRef = useRef(false);
   useEffect(() => { recapBusyRef.current = recapBusy; }, [recapBusy]);
   // Reflect the REAL capture state. A recap can be started/stopped BY VOICE from the overlay (not just this
@@ -1844,17 +2362,6 @@ export default function Connect() {
     }, intervalMs);
   }
 
-  const cuConnected =
-    cuProvider === "claude" ? !!claudeToken.trim()
-    : cuProvider === "openai" ? !!(openaiKey.trim() || openaiToken.trim())
-    : cuProvider === "ollama" ? !!ollamaModel.trim()
-    : cuProvider === "gemini" ? !!geminiKey.trim()
-    : cuProvider === "copilot" ? !!copilotToken.trim()
-    : cuProvider === "deepseek" ? !!deepseekKey.trim()
-    : cuProvider === "mistral" ? !!mistralKey.trim()
-    : cuProvider === "xai" ? !!xaiKey.trim()
-    : false;
-
   const SWATCHES = ["#D4A49A", "#C9A24A", "#8FA47D", "#B08A72", "#9A7060", "#C68B7E", "#D8B86A", "#6E8FA0"];
   // The shared edit form for an agent (default or custom). `showModel` adds the per-agent model picker.
   function editForm(showModel: boolean, onReset?: () => void) {
@@ -1913,43 +2420,228 @@ export default function Connect() {
     return out;
   }
 
+  // ==== Keak Planet interactivity (purely presentational) ================
+  // One rAF-throttled pointermove listener drives three things:
+  //  1. cosmos parallax  — sets --kx-mx / --kx-my (-1..1) on .kx-cosmos;
+  //     each dust/nebula layer translates by a different small amount in CSS.
+  //  2. planet proximity — sets --kx-near / --kx-tx / --kx-ty on the planet
+  //     scene (tilt toward cursor, glow up, moons surge) + .kx-scene--near.
+  //  3. stardust trail   — spawns tiny fading motes into .kx-trail; each
+  //     removes itself on animationend (finite, hard-capped at 26 nodes).
+  // Fully disabled under prefers-reduced-motion. Remove this effect + the
+  // kx-trail div + the .kx-mote CSS to drop the trail feature.
+  const kxCosmosRef = useRef<HTMLDivElement | null>(null);
+  const kxSceneRef = useRef<HTMLDivElement | null>(null);
+  const kxTrailRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+    let raf = 0;
+    let px = 0, py = 0, seen = false;
+    let lastMote = 0, lastMx = -1e4, lastMy = -1e4;
+    const apply = () => {
+      raf = 0;
+      if (!seen) return;
+      const w = window.innerWidth || 1, h = window.innerHeight || 1;
+      const cosmos = kxCosmosRef.current;
+      if (cosmos) {
+        cosmos.style.setProperty("--kx-mx", ((px / w) * 2 - 1).toFixed(3));
+        cosmos.style.setProperty("--kx-my", ((py / h) * 2 - 1).toFixed(3));
+      }
+      const scene = kxSceneRef.current;
+      if (scene) {
+        const r = scene.getBoundingClientRect();
+        const dx = px - (r.left + r.width / 2);
+        const dy = py - (r.top + r.height / 2);
+        const near = Math.max(0, 1 - Math.hypot(dx, dy) / 340);
+        scene.style.setProperty("--kx-near", near.toFixed(3));
+        scene.style.setProperty("--kx-tx", Math.max(-1, Math.min(1, dx / 340)).toFixed(3));
+        scene.style.setProperty("--kx-ty", Math.max(-1, Math.min(1, dy / 340)).toFixed(3));
+        scene.classList.toggle("kx-scene--near", near > 0.32);
+      }
+    };
+    const onMove = (e: PointerEvent) => {
+      px = e.clientX; py = e.clientY; seen = true;
+      if (!raf) raf = requestAnimationFrame(apply);
+      const trail = kxTrailRef.current;
+      const now = performance.now();
+      const dx = e.clientX - lastMx, dy = e.clientY - lastMy;
+      if (trail && now - lastMote > 46 && dx * dx + dy * dy > 140) {
+        lastMote = now; lastMx = e.clientX; lastMy = e.clientY;
+        const mote = document.createElement("i");
+        mote.className = Math.random() < 0.3 ? "kx-mote kx-mote--rose" : "kx-mote";
+        const s = 2.5 + Math.random() * 3;
+        mote.style.left = `${e.clientX + (Math.random() - 0.5) * 14}px`;
+        mote.style.top = `${e.clientY + (Math.random() - 0.5) * 14}px`;
+        mote.style.width = `${s}px`;
+        mote.style.height = `${s}px`;
+        mote.addEventListener("animationend", () => mote.remove());
+        trail.appendChild(mote);
+        while (trail.childElementCount > 26) trail.firstElementChild?.remove();
+      }
+    };
+    const onLeave = () => {
+      kxCosmosRef.current?.style.setProperty("--kx-mx", "0");
+      kxCosmosRef.current?.style.setProperty("--kx-my", "0");
+      const scene = kxSceneRef.current;
+      if (scene) { scene.style.setProperty("--kx-near", "0"); scene.classList.remove("kx-scene--near"); }
+    };
+    window.addEventListener("pointermove", onMove, { passive: true });
+    document.documentElement.addEventListener("pointerleave", onLeave);
+    return () => {
+      window.removeEventListener("pointermove", onMove);
+      document.documentElement.removeEventListener("pointerleave", onLeave);
+      if (raf) cancelAnimationFrame(raf);
+      onLeave();
+    };
+  }, []);
+
+  // Provider attack show — purely presentational. We only WATCH cuProvider
+  // change (pickProvider and its logic are untouched); the newly chosen card
+  // then plays its signature move over the grid. Debounced; self-cleaning.
+  const cxGridRef = useRef<HTMLDivElement | null>(null);
+  const atkPrevRef = useRef<string | null>(null);
+  const atkStopRef = useRef<(() => void) | null>(null);
+  const atkLastRef = useRef<number>(0);
+  useEffect(() => {
+    const prev = atkPrevRef.current;
+    atkPrevRef.current = cuProvider;
+    if (prev === null || prev === cuProvider) return; // initial mount / no change
+    const now = Date.now();
+    if (now - atkLastRef.current < 350) return; // debounce rapid re-picks
+    atkLastRef.current = now;
+    atkStopRef.current?.();
+    atkStopRef.current = playProviderAttack(cxGridRef.current, cuProvider);
+    return () => { atkStopRef.current?.(); atkStopRef.current = null; };
+  }, [cuProvider]);
+
+  // Reasoning effort → moon orbit speed (presentational, read-only on state):
+  // higher effort spins the agent moons faster around the Keak planet. The
+  // multiplier lands on .kx-planet-scene as --kx-orbit-mult; the moons' CSS
+  // divides their animation-duration by it. "" / other providers → 1 (as now).
+  const kxOrbitMult = cuProvider === "claude"
+    ? (({ low: 0.65, medium: 1, high: 1.6, max: 2.4 } as Record<string, number>)[claudeEffort] ?? 1)
+    : 1;
+
   return (
     <div className="connect-scroll">
+      {/* Keak Planet cosmos — purely presentational, sits behind everything.
+          Warm edition: whisper-faint rose/gold dust drifting over the cream. */}
+      <div className="kx-cosmos" aria-hidden="true" ref={kxCosmosRef}>
+        <i className="kx-nebula kx-nebula--a" />
+        <i className="kx-nebula kx-nebula--b" />
+        <i className="kx-nebula kx-nebula--c" />
+        <i className="kx-stars kx-stars--far" />
+        <i className="kx-stars kx-stars--mid" />
+        <i className="kx-stars kx-stars--near" />
+        <i className="kx-stars kx-stars--rose" />
+        <i className="kx-aurora" />
+        <i className="kx-shoot" />
+        <i className="kx-shoot kx-shoot--b" />
+        <i className="kx-vignette" />
+      </div>
+      {/* cursor stardust trail — motes are spawned by the pointer effect and
+          remove themselves on animationend; delete this div + the effect +
+          the .kx-mote CSS to drop the feature entirely */}
+      <div className="kx-trail" aria-hidden="true" ref={kxTrailRef} />
       <div className="connect-view connect-view--full">
-        <header className="cx-topbar">
-          <img src={keakLogo} alt="Keak" className="cx-logo" />
-          <div className="cx-headtext">
-            <h1 className="cx-title">{t("Connect your AI")}</h1>
-            <span className="cx-sub">{t("You talk, we write.")}</span>
-          </div>
-          {cuConnected && <span className="cx-status"><i className="cx-dot" />{t("Connected")}</span>}
-        </header>
-
         <div className="connect-layout">
-          <nav className="connect-nav">
-            {SECTIONS.map((s) => (
-              <button key={s.id} className={`cx-nav-item${activeSection === s.id ? " cx-nav-item--on" : ""}`} onClick={() => setActiveSection(s.id)}>
-                {t(s.label)}
-              </button>
-            ))}
-          </nav>
+          <aside className="cx-sidebar">
+            <div className="cx-lockup">
+              <img src={keakLogo} alt="Keak" className="cx-logo" />
+              <div className="cx-headtext">
+                <span className="cx-wordmark">Keak</span>
+                <span className="cx-sub">{t("You talk, we write.")}</span>
+              </div>
+            </div>
 
-          <div className="connect-main connect-main--wide">
+            {/* The Keak planet — a glowing rose world on the cream sky.
+                The user's agents orbit it as small coloured moons: hover a
+                moon to see the agent's name, click it to open that agent.
+                Purely presentational — data mirrors the Agents section. */}
+            <div className="kx-planet-scene" ref={kxSceneRef} style={{ "--kx-orbit-mult": kxOrbitMult } as CSSProperties}>
+              <i className="kx-planet-glow" aria-hidden="true" />
+              <i className="kx-planet-halo" aria-hidden="true" />
+              <div className="kx-planet" aria-hidden="true" />
+              {(() => {
+                // LIVE mirror of the Agents section: same [...defaults, ...roster]
+                // state arrays, so colour edits, new agents and deletions all
+                // re-render the moons automatically. Capped at 12; radii, sizes,
+                // phases and periods spread by index + count so the whole set
+                // fits the sidebar without crowding.
+                const moons = [
+                  ...defaults.map((d) => ({ name: d.name, color: d.color })),
+                  ...roster.map((r) => ({ name: r.name, color: r.color })),
+                ].slice(0, 12);
+                const n = Math.max(1, moons.length);
+                const bands = n <= 4 ? 2 : n <= 8 ? 3 : 4;
+                return moons.map((m, i) => {
+                  const band = i % bands;
+                  const radius = 48 + band * (n > 8 ? 12 : 15);
+                  const size = Math.max(5, (n > 8 ? 8 : 9) - band);
+                  const phase = Math.round((i * 360) / n + band * 19) % 360;
+                  const dur = 26 + band * 9 + (i % 3) * 4;
+                  return (
+                    <button
+                      key={`${m.name}-${i}`}
+                      type="button"
+                      className="kx-moon"
+                      title={m.name}
+                      aria-label={m.name}
+                      style={{
+                        "--moon-color": m.color,
+                        "--moon-r": `${radius}px`,
+                        "--moon-dur": `${dur}s`,
+                        "--moon-delay": `${-((phase / 360) * dur).toFixed(2)}s`,
+                        "--moon-size": `${size}px`,
+                        "--moon-phase": `${phase}deg`,
+                      } as CSSProperties}
+                      onClick={() => { setActiveSection("agents"); setDetailAgent(m.name); }}
+                    >
+                      <span className="kx-moon-hold">
+                        <span className="kx-moon-dot" />
+                        <span className="kx-moon-tip">{m.name}</span>
+                      </span>
+                    </button>
+                  );
+                });
+              })()}
+            </div>
+
+            <h1 className="cx-title">{t("Connect your AI")}</h1>
+
+            <nav className="connect-nav">
+              {SECTIONS.map((s) => (
+                <button key={s.id} className={`cx-nav-item${activeSection === s.id ? " cx-nav-item--on" : ""}`} onClick={() => setActiveSection(s.id)}>
+                  <span className="cx-nav-ico" aria-hidden="true">{NAV_ICONS[s.id]}</span>
+                  <span className="cx-nav-label">{t(s.label)}</span>
+                </button>
+              ))}
+            </nav>
+
+          </aside>
+
+          <div className="connect-main connect-main--wide" key={activeSection}>
             {activeSection === "ai" && (
             <section className="cx-card cx-hero">
-          <p className="cx-eyebrow">{t("Your AI")}</p>
-          <h2 className="cx-h">{t("Bring your own intelligence")}</h2>
-          <p className="cx-lead">{t("Keak runs on your own Claude, ChatGPT, Gemini, or a local model. It powers both Keak AI and screen control, so there's no extra cost per action.")}</p>
+          <SectionHero id="ai">
+            <p className="cx-eyebrow">{t("Your AI")}</p>
+            <h2 className="cx-h">{t("Bring your own intelligence")}</h2>
+            <p className="cx-lead">{t("Keak runs on your own Claude, ChatGPT, Gemini, or a local model. It powers both Keak AI and screen control, so there's no extra cost per action.")}</p>
+          </SectionHero>
 
-          <div className="cx-seg cx-seg--providers">
-            <button className={`cx-seg-btn${cuProvider === "claude" ? " cx-seg-btn--on" : ""}`} onClick={() => pickProvider("claude")}>Claude</button>
-            <button className={`cx-seg-btn${cuProvider === "openai" ? " cx-seg-btn--on" : ""}`} onClick={() => pickProvider("openai")}>ChatGPT</button>
-            <button className={`cx-seg-btn${cuProvider === "gemini" ? " cx-seg-btn--on" : ""}`} onClick={() => pickProvider("gemini")}>Gemini</button>
-            <button className={`cx-seg-btn${cuProvider === "copilot" ? " cx-seg-btn--on" : ""}`} onClick={() => pickProvider("copilot")}>Copilot</button>
-            <button className={`cx-seg-btn${cuProvider === "xai" ? " cx-seg-btn--on" : ""}`} onClick={() => pickProvider("xai")}>Grok</button>
-            <button className={`cx-seg-btn${cuProvider === "deepseek" ? " cx-seg-btn--on" : ""}`} onClick={() => pickProvider("deepseek")}>DeepSeek</button>
-            <button className={`cx-seg-btn${cuProvider === "mistral" ? " cx-seg-btn--on" : ""}`} onClick={() => pickProvider("mistral")}>Mistral</button>
-            <button className={`cx-seg-btn${cuProvider === "ollama" ? " cx-seg-btn--on" : ""}`} onClick={() => pickProvider("ollama")}>Local</button>
+          <div className="cx-provider-grid" role="group" aria-label={t("Your AI")} ref={cxGridRef}>
+            {PROVIDER_CARDS.map((p) => (
+              <button
+                key={p.id}
+                type="button"
+                className={`cx-provider-card${cuProvider === p.id ? " cx-provider-card--on" : ""}`}
+                onClick={() => pickProvider(p.id)}
+              >
+                <span className="cx-provider-mark" aria-hidden="true">{PROVIDER_MARKS[p.id]}</span>
+                <span className="cx-provider-name">{p.name}</span>
+                {cuProvider === p.id && <span className="cx-provider-check" aria-hidden="true"><CheckIcon /></span>}
+              </button>
+            ))}
           </div>
 
           {cuProvider === "claude" && (
@@ -2252,17 +2944,29 @@ export default function Connect() {
 
             {activeSection === "team" && (
             <section className="cx-card">
-          <p className="cx-eyebrow">{t("Keak AI")}</p>
-          <h2 className="cx-h">{t("Team")}</h2>
-          <p className="cx-lead" style={{ marginBottom: 12 }}>{t("Put your Keak in a Telegram group with your teammates. Write \"<name>, do X\" in the group and that person's Keak does it and posts the result back for everyone to see. Each Keak runs on that person's own AI.")}</p>
+          <SectionHero id="team">
+            <p className="cx-eyebrow">{t("Keak AI")}</p>
+            <h2 className="cx-h">{t("Team")}</h2>
+            <p className="cx-lead" style={{ marginBottom: 12 }}>{t("Put your Keak in a Telegram group with your teammates. Write \"<name>, do X\" in the group and that person's Keak does it and posts the result back for everyone to see. Each Keak runs on that person's own AI.")}</p>
+          </SectionHero>
           {!localStorage.getItem("keak_telegram_token") ? (
-            <p className="cx-help">{t("First connect Telegram in Connections (paste your bot token), then come back here.")}</p>
+            <>
+              <p className="cx-help" style={{ marginBottom: 8 }}>{t("First you need your own Telegram bot. It takes a minute:")}</p>
+              <ol className="cx-help cx-steps">
+                <li>{t("In Telegram, open a chat with @BotFather.")}</li>
+                <li>{t("Send /newbot, give it a name and a username, and copy the token it gives you (a long code).")}</li>
+                <li>{t("In Keak, go to Connections, open Telegram, and paste that token.")}</li>
+                <li>{t("Come back to this Team tab to set up the group.")}</li>
+              </ol>
+              <button className="cx-btn cx-btn--ghost cx-btn--sm" onClick={() => openUrl("https://t.me/BotFather")}>{t("Open BotFather")}</button>
+            </>
           ) : (
             <>
-              <ol className="cx-help" style={{ margin: "0 0 12px 18px", lineHeight: 1.8 }}>
-                <li>{t("Create a Telegram group with your teammates.")}</li>
-                <li>{t("Add your Keak bot to the group. In BotFather, /setprivacy → Disable, so your bot can read group messages.")}</li>
-                <li>{t("Each teammate adds their own Keak bot to the same group and does the same.")}</li>
+              <ol className="cx-help cx-steps">
+                <li>{t("Make sure you created your bot with @BotFather and pasted its token in Connections → Telegram.")}</li>
+                <li>{t("In @BotFather, send /setprivacy, pick your bot, and choose Disable so it can read group messages.")}</li>
+                <li>{t("Create a Telegram group with your teammates and add your Keak bot to it.")}</li>
+                <li>{t("Each teammate does the same with their own bot (their own @BotFather bot, privacy Disabled, added to the group).")}</li>
                 <li>{t("Send any message in the group so Keak learns it. Then write \"<your name>, …\" to give your Keak a task in front of everyone.")}</li>
               </ol>
               <div className="cx-field">
@@ -2299,8 +3003,13 @@ export default function Connect() {
 
             {activeSection === "recap" && (
             <section className="cx-card">
-          <p className="cx-eyebrow">{t("Keak AI")}</p>
-          <h2 className="cx-h">{t("Recap a meeting")}</h2>
+          <SectionHero id="recap">
+            <p className="cx-eyebrow">{t("Keak AI")}</p>
+            <h2 className="cx-h">{t("Recap a meeting")}</h2>
+          </SectionHero>
+          <div className={`cx-wave${recapOn ? " cx-wave--live" : ""}`} aria-hidden="true">
+            {Array.from({ length: 28 }).map((_, i) => <i key={i} style={{ "--kxi": i } as CSSProperties} />)}
+          </div>
           <p className="cx-help" style={{ marginTop: 4 }}>{t("Keak records the audio playing on your computer (a call, a meeting, a video) and writes you a clean recap: summary, key points, decisions and action items. It captures what you hear and transcribes on your own setup.")}</p>
           <p className="cx-help" style={{ marginTop: 6 }}>{t("You can also just say \"Hey Keak, start a recap\" and later \"finish the recap\".")}</p>
           {!recapOn && (
@@ -2311,18 +3020,18 @@ export default function Connect() {
           )}
           <div style={{ marginTop: 12, display: "flex", alignItems: "center", gap: 14 }}>
             {!recapOn ? (
-              <button onClick={startRecap} disabled={recapBusy} style={{ padding: "10px 20px", borderRadius: 10, border: "none", background: recapBusy ? "#E7D9C2" : "#D4A49A", color: "#2C1508", fontWeight: 700, cursor: recapBusy ? "default" : "pointer" }}>{recapBusy ? t("Working…") : t("Start recap")}</button>
+              <button className="cx-recbtn" onClick={startRecap} disabled={recapBusy} style={{ padding: "10px 20px", borderRadius: 10, border: "none", background: recapBusy ? "#E7D9C2" : "#D4A49A", color: "#2C1508", fontWeight: 700, cursor: recapBusy ? "default" : "pointer" }}>{recapBusy ? t("Working…") : t("Start recap")}</button>
             ) : (
               <>
-                <button onClick={stopRecap} style={{ padding: "10px 20px", borderRadius: 10, border: "none", background: "#C68B7E", color: "#fff", fontWeight: 700, cursor: "pointer" }}>{t("Stop & recap")}</button>
+                <button className="cx-recbtn cx-recbtn--stop" onClick={stopRecap} style={{ padding: "10px 20px", borderRadius: 10, border: "none", background: "#C68B7E", color: "#fff", fontWeight: 700, cursor: "pointer" }}>{t("Stop & recap")}</button>
                 <button onClick={cancelRecap} className="cx-btn cx-btn--ghost cx-btn--sm" title={t("Throw this recording away")}>{t("Discard")}</button>
               </>
             )}
-            {recapOn && <span className="cx-help" style={{ color: "#C68B7E", fontWeight: 700 }}>● {t("Recording")} {Math.floor(recapSecs / 60)}:{String(Math.floor(recapSecs % 60)).padStart(2, "0")}</span>}
+            {recapOn && <span className="cx-help cx-reclive" style={{ color: "#C68B7E", fontWeight: 700 }}>● {t("Recording")} {Math.floor(recapSecs / 60)}:{String(Math.floor(recapSecs % 60)).padStart(2, "0")}</span>}
           </div>
           {recapStatus && <p className="cx-help" style={{ marginTop: 8, color: "#C68B7E", fontWeight: 600 }}>{recapStatus}</p>}
           {recapOut && (
-            <div style={{ marginTop: 14, borderTop: "1px solid #DECFB0", paddingTop: 14 }}>
+            <div className="cx-recap-out" style={{ marginTop: 14, borderTop: "1px solid #DECFB0", paddingTop: 14 }}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
                 <label className="cx-field-label">{t("Recap")}</label>
                 <div style={{ display: "flex", gap: 8 }}>
@@ -2339,8 +3048,10 @@ export default function Connect() {
 
             {activeSection === "settings" && (
             <section className="cx-card">
-          <p className="cx-eyebrow">{t("Language")}</p>
-          <h2 className="cx-h">{t("Interface language")}</h2>
+          <MiniHead icon={SET_ICONS.globe}>
+            <p className="cx-eyebrow">{t("Language")}</p>
+            <h2 className="cx-h">{t("Interface language")}</h2>
+          </MiniHead>
           <div className="cx-field">
             <select className="cx-select" value={uiLang} onChange={(e) => { const l = e.target.value as typeof uiLang; setUiLangState(l); localStorage.setItem("keak_ui_lang_ai", UI_LANG_AI_NAME[l]); }}>
               {UI_LANGS.map((l) => <option key={l.code} value={l.code}>{l.label}</option>)}
@@ -2352,8 +3063,10 @@ export default function Connect() {
 
             {activeSection === "settings" && (
             <section className="cx-card">
-          <p className="cx-eyebrow">{t("Dictation")}</p>
-          <h2 className="cx-h">{t("Dictation language")}</h2>
+          <MiniHead icon={SET_ICONS.mic}>
+            <p className="cx-eyebrow">{t("Dictation")}</p>
+            <h2 className="cx-h">{t("Dictation language")}</h2>
+          </MiniHead>
           <div className="cx-field">
             <select className="cx-select" value={dictLang} onChange={(e) => chooseDictLang(e.target.value)}>
               <option value="auto">{t("Auto-detect")}</option>
@@ -2366,8 +3079,10 @@ export default function Connect() {
 
             {activeSection === "settings" && (
             <section className="cx-card">
-          <p className="cx-eyebrow">{t("Dictation")}</p>
-          <h2 className="cx-h">{t("Live dictation")}</h2>
+          <MiniHead icon={SET_ICONS.mic}>
+            <p className="cx-eyebrow">{t("Dictation")}</p>
+            <h2 className="cx-h">{t("Live dictation")}</h2>
+          </MiniHead>
           <div className="cx-field">
             <select className="cx-select" value={streamMode} onChange={(e) => chooseStreamMode(e.target.value)}>
               <option value="pill">{t("Show my words live in the Keak pill")}</option>
@@ -2380,8 +3095,10 @@ export default function Connect() {
 
             {activeSection === "settings" && (
             <section className="cx-card">
-          <p className="cx-eyebrow">{t("Dictation")}</p>
-          <h2 className="cx-h">{t("Translate my speech into")}</h2>
+          <MiniHead icon={SET_ICONS.globe}>
+            <p className="cx-eyebrow">{t("Dictation")}</p>
+            <h2 className="cx-h">{t("Translate my speech into")}</h2>
+          </MiniHead>
           <div className="cx-field">
             <select className="cx-select" value={translateTo} onChange={(e) => chooseTranslateTo(e.target.value)}>
               {UI_LANGS.map((l) => <option key={l.code} value={l.code}>{l.label}</option>)}
@@ -2395,8 +3112,10 @@ export default function Connect() {
 
             {activeSection === "settings" && (
             <section className="cx-card">
-          <p className="cx-eyebrow">{t("Keak AI")}</p>
-          <h2 className="cx-h">{t("Hey Keak (Standby)")}</h2>
+          <MiniHead icon={NAV_ICONS.ai}>
+            <p className="cx-eyebrow">{t("Keak AI")}</p>
+            <h2 className="cx-h">{t("Hey Keak (Standby)")}</h2>
+          </MiniHead>
           <label className="cx-check-row">
             <input type="checkbox" checked={standby} onChange={(e) => toggleStandby(e.target.checked)} />
             <span>{t("Show the Keak orb in the corner so you can talk to Keak AI without a hotkey")}</span>
@@ -2434,8 +3153,10 @@ export default function Connect() {
 
             {activeSection === "settings" && (
             <section className="cx-card">
-          <p className="cx-eyebrow">{t("Agents")}</p>
-          <h2 className="cx-h">{t("Agent names")}</h2>
+          <MiniHead icon={NAV_ICONS.agents}>
+            <p className="cx-eyebrow">{t("Agents")}</p>
+            <h2 className="cx-h">{t("Agent names")}</h2>
+          </MiniHead>
           <label className="cx-check-row">
             <input type="checkbox" checked={agentLabels} onChange={(e) => toggleAgentLabels(e.target.checked)} />
             <span>{t("Show each agent's name under its orb on screen")}</span>
@@ -2446,8 +3167,10 @@ export default function Connect() {
 
             {activeSection === "settings" && (
             <section className="cx-card">
-          <p className="cx-eyebrow">{t("Control")}</p>
-          <h2 className="cx-h">{t("When Keak does an action")}</h2>
+          <MiniHead icon={SET_ICONS.shield}>
+            <p className="cx-eyebrow">{t("Control")}</p>
+            <h2 className="cx-h">{t("When Keak does an action")}</h2>
+          </MiniHead>
           <div className="cx-seg cx-seg--3">
             <button className={`cx-seg-btn${actionMode === "full" ? " cx-seg-btn--on" : ""}`} onClick={() => chooseActionMode("full")}>{t("Full access")}</button>
             <button className={`cx-seg-btn${actionMode === "ask" ? " cx-seg-btn--on" : ""}`} onClick={() => chooseActionMode("ask")}>{t("Ask first")}</button>
@@ -2466,8 +3189,10 @@ export default function Connect() {
 
             {activeSection === "settings" && (
             <section className="cx-card">
-          <p className="cx-eyebrow">{t("Voice")}</p>
-          <h2 className="cx-h">{t("How Keak sounds out loud")}</h2>
+          <MiniHead icon={SET_ICONS.speaker}>
+            <p className="cx-eyebrow">{t("Voice")}</p>
+            <h2 className="cx-h">{t("How Keak sounds out loud")}</h2>
+          </MiniHead>
           <p className="cx-lead" style={{ marginBottom: 12 }}>
             {t("The voice is separate from the AI. Claude has no voice of its own, so the voice runs on your own Gemini or OpenAI key (a free Gemini key works), which means it costs nothing extra.")}
           </p>
@@ -2538,8 +3263,10 @@ export default function Connect() {
 
             {activeSection === "settings" && (
             <section className="cx-card">
-          <p className="cx-eyebrow">{t("Voice")}</p>
-          <h2 className="cx-h">{t("Live voice")}</h2>
+          <MiniHead icon={SET_ICONS.speaker}>
+            <p className="cx-eyebrow">{t("Voice")}</p>
+            <h2 className="cx-h">{t("Live voice")}</h2>
+          </MiniHead>
           <p className="cx-lead" style={{ marginBottom: 10 }}>{t("Keak AI talks back the instant you stop, instead of the record-then-answer wait. When it's on, holding Ctrl and Alt (or saying Hey Keak) starts a live conversation that knows your Second Brain and Memory. It runs on the AI you connected under Your AI, with Gemini or OpenAI.")}</p>
           <label className="cx-check-row">
             <input type="checkbox" checked={liveMode} onChange={(e) => toggleLiveMode(e.target.checked)} />
@@ -2551,8 +3278,10 @@ export default function Connect() {
 
             {activeSection === "settings" && (
             <section className="cx-card">
-          <p className="cx-eyebrow">{t("Display")}</p>
-          <h2 className="cx-h">{t("Show captions")}</h2>
+          <MiniHead icon={SET_ICONS.captions}>
+            <p className="cx-eyebrow">{t("Display")}</p>
+            <h2 className="cx-h">{t("Show captions")}</h2>
+          </MiniHead>
           <div className="cx-seg cx-seg--2">
             <button className={`cx-seg-btn${showCaptions ? " cx-seg-btn--on" : ""}`} onClick={() => toggleCaptions(true)}>{t("On")}</button>
             <button className={`cx-seg-btn${!showCaptions ? " cx-seg-btn--on" : ""}`} onClick={() => toggleCaptions(false)}>{t("Off")}</button>
@@ -2565,8 +3294,10 @@ export default function Connect() {
 
             {activeSection === "settings" && (
             <section className="cx-card">
-          <p className="cx-eyebrow">{t("Background")}</p>
-          <h2 className="cx-h">{t("Keep Keak running for routines")}</h2>
+          <MiniHead icon={SET_ICONS.power}>
+            <p className="cx-eyebrow">{t("Background")}</p>
+            <h2 className="cx-h">{t("Keep Keak running for routines")}</h2>
+          </MiniHead>
           <p className="cx-lead" style={{ marginBottom: 12 }}>
             {t("Closing the window keeps Keak in the tray, so your routines still run. Turn this on to also start Keak automatically when you log in, so routines fire even after a restart.")}
           </p>
@@ -2617,14 +3348,16 @@ export default function Connect() {
 
             {activeSection === "agents" && !detailAgent && (
             <section className="cx-card">
-          <p className="cx-eyebrow">{t("Agents")}</p>
-          <h2 className="cx-h">{t("Your team")}</h2>
-          <p className="cx-lead" style={{ marginBottom: 12 }}>
-            {t("Say \"use your team to…\" and Keak splits the work across these agents, each on its own model and personality. Call one by name (\"Sirius, research the best video apps\") to run just that one. Click any agent to see what it has done.")} {t("You have")} {defaults.length} {t("default agents")}{roster.length > 0 ? ` ${t("plus")} ${roster.length} ${t("of your own")}` : ""}{editedCount > 0 ? ` (${editedCount} ${t("edited")})` : ""}.
-          </p>
+          <SectionHero id="agents">
+            <p className="cx-eyebrow">{t("Agents")}</p>
+            <h2 className="cx-h">{t("Your team")}</h2>
+            <p className="cx-lead" style={{ marginBottom: 12 }}>
+              {t("Say \"use your team to…\" and Keak splits the work across these agents, each on its own model and personality. Call one by name (\"Sirius, research the best video apps\") to run just that one. Click any agent to see what it has done.")} {t("You have")} {defaults.length} {t("default agents")}{roster.length > 0 ? ` ${t("plus")} ${roster.length} ${t("of your own")}` : ""}{editedCount > 0 ? ` (${editedCount} ${t("edited")})` : ""}.
+            </p>
+          </SectionHero>
 
           <p className="cx-field-label" style={{ marginBottom: 8 }}>{t("Default agents")} <span className="cx-field-tag">{t("tap Edit to rename, re-tone, or recolour")}</span></p>
-          <div className="cx-agent-list" style={{ marginBottom: 14 }}>
+          <div className="cx-agent-list cx-agent-gallery" style={{ marginBottom: 14 }}>
             {defaults.map((a) => (
               <div key={a.base}>
                 <div className="cx-agent-row cx-agent-row--click">
@@ -2643,7 +3376,7 @@ export default function Connect() {
           {roster.length > 0 && (
             <>
               <p className="cx-field-label" style={{ marginBottom: 8 }}>{t("Your agents")}</p>
-              <div className="cx-agent-list" style={{ marginTop: 6 }}>
+              <div className="cx-agent-list cx-agent-gallery" style={{ marginTop: 6 }}>
                 {roster.map((a, i) => (
                   <div key={i}>
                     <div className="cx-agent-row cx-agent-row--click">
@@ -2683,17 +3416,23 @@ export default function Connect() {
 
             {activeSection === "brain" && (
             <section className="cx-card">
-              <p className="cx-eyebrow">Second Brain OS</p>
-              <h2 className="cx-h">{t("Connect Keak to your Second Brain")}</h2>
-              <p className="cx-lead" style={{ marginBottom: 14 }}>
-                {t("Point Keak at a folder on your computer, the same one you use with Claude Code or VS Code. Keak can then read all of it, know your projects, and (with your permission) create skills, files and folders, edit them, or clean things up. It runs on your own AI, so it costs nothing extra.")}
-              </p>
+              <SectionHero id="brain">
+                <p className="cx-eyebrow">Second Brain OS</p>
+                <h2 className="cx-h">{t("Connect Keak to your Second Brain")}</h2>
+                <p className="cx-lead" style={{ marginBottom: 14 }}>
+                  {t("Point Keak at a folder on your computer, the same one you use with Claude Code or VS Code. Keak can then read all of it, know your projects, and (with your permission) create skills, files and folders, edit them, or clean things up. It runs on your own AI, so it costs nothing extra.")}
+                </p>
+              </SectionHero>
 
               {brainConnected ? (
                 <>
-                  <div className="cx-connected" style={{ textAlign: "left", alignItems: "flex-start" }}>
+                  <div className="cx-connected cx-brainbox" style={{ textAlign: "left", alignItems: "flex-start" }}>
+                    <span className="cx-brainbox-folder" aria-hidden="true">{NAV_ICONS.brain}</span>
                     <div className="cx-connected-name">{t("Connected to your Second Brain")}</div>
                     <div className="cx-connected-hint" style={{ wordBreak: "break-all" }}>{brainPath}</div>
+                    <span className="cx-permchip">
+                      {({ read: t("Read only"), create: t("Create only"), edit: t("Edit only"), full: t("Full access") } as Record<string, string>)[brainPerm] || brainPerm}
+                    </span>
                     <button className="cx-btn cx-btn--ghost cx-btn--sm" onClick={disconnectBrain} style={{ marginTop: 10 }}>{t("Disconnect")}</button>
                   </div>
 
@@ -2758,14 +3497,16 @@ export default function Connect() {
 
             {activeSection === "routines" && (
             <section className="cx-card">
-              <p className="cx-eyebrow">{t("Routines")}</p>
-              <h2 className="cx-h">{t("Schedule tasks that run on their own")}</h2>
-              <p className="cx-lead" style={{ marginBottom: 14 }}>
-                {t("Give Keak a job and a time. It runs on your own AI and sends you the result. Great for a daily competitor check, watching for new AI models, or a weekly market summary. You can also just say \"schedule a routine every day at 5am to…\" and Keak sets it up.")}
-              </p>
+              <SectionHero id="routines">
+                <p className="cx-eyebrow">{t("Routines")}</p>
+                <h2 className="cx-h">{t("Schedule tasks that run on their own")}</h2>
+                <p className="cx-lead" style={{ marginBottom: 14 }}>
+                  {t("Give Keak a job and a time. It runs on your own AI and sends you the result. Great for a daily competitor check, watching for new AI models, or a weekly market summary. You can also just say \"schedule a routine every day at 5am to…\" and Keak sets it up.")}
+                </p>
+              </SectionHero>
 
               {routines.length > 0 && (
-                <div className="cx-agent-list" style={{ marginBottom: 12 }}>
+                <div className="cx-agent-list cx-routines-timeline" style={{ marginBottom: 12 }}>
                   {routines.map((r) => (
                     <div key={r.id} className="cx-agent-row">
                       <div className="cx-agent-meta">
@@ -2853,16 +3594,18 @@ export default function Connect() {
 
             {activeSection === "connections" && (
             <section className="cx-card" ref={connSecRef} onClick={onConnHeadClick}>
-              <p className="cx-eyebrow">{t("Connections")}</p>
-              <h2 className="cx-h">{t("Connect your apps")}</h2>
-              <p className="cx-help" style={{ marginTop: -6, marginBottom: 10 }}>{t("Click a connector to open its setup.")}</p>
-              <p className="cx-lead" style={{ marginBottom: 14 }}>
-                {t("Link your own accounts so Keak acts directly through them, no clicking on screen. It runs on your accounts, so it costs nothing extra.")}
-              </p>
+              <SectionHero id="connections">
+                <p className="cx-eyebrow">{t("Connections")}</p>
+                <h2 className="cx-h">{t("Connect your apps")}</h2>
+                <p className="cx-help" style={{ marginBottom: 4 }}>{t("Click a connector to open its setup.")}</p>
+                <p className="cx-lead" style={{ marginBottom: 14 }}>
+                  {t("Link your own accounts so Keak acts directly through them, no clicking on screen. It runs on your accounts, so it costs nothing extra.")}
+                </p>
+              </SectionHero>
 
               <div className="cx-conn">
                 <div className="cx-conn-head">
-                  <span className="cx-conn-name"><LogoBadge id="mcp" name="MCP" brand="#6E56CF" />{t("MCP servers")} <span className="cx-field-tag">{t("Plugins")}</span></span>
+                  <span className="cx-conn-name"><FxLogo id="mcp" name="MCP" brand="#6E56CF" on={mcpServers.length > 0} />{t("MCP servers")} <span className="cx-field-tag">{t("Plugins")}</span></span>
                 </div>
                 <p className="cx-help">{t("Model Context Protocol servers give Keak whole new tool sets. Local servers run on your computer (like npx …, needs Node.js); remote servers connect over a URL. Their tools become usable right in the chat.")}</p>
                 {mcpServers.map((s) => (
@@ -2909,11 +3652,11 @@ export default function Connect() {
 
               <div className="cx-conn">
                 <div className="cx-conn-head">
-                  <span className="cx-conn-name"><LogoBadge id="zapier" name="Zapier" brand="#FF4A00" />Zapier <span className="cx-field-tag">{t("9000+ apps via MCP")}</span></span>
+                  <span className="cx-conn-name"><FxLogo id="zapier" name="Zapier" brand="#FF4A00" on={mcpServers.some((s) => s.name.toLowerCase() === "zapier")} />Zapier <span className="cx-field-tag">{t("9000+ apps via MCP")}</span></span>
                   {mcpServers.some((s) => s.name.toLowerCase() === "zapier") && <span className="cx-status"><i className="cx-dot" />{t("Connected")}</span>}
                 </div>
                 <p className="cx-help">{t("Connect Zapier once and Keak can use any of your Zapier actions across 9000+ apps. How to get your URL:")}</p>
-                <ol className="cx-help" style={{ margin: "2px 0 10px 18px", lineHeight: 1.7 }}>
+                <ol className="cx-help cx-steps">
                   <li>{t("In Zapier, open MCP (zapier.com/mcp) and click New MCP server.")}</li>
                   <li>{t("Under \"Choose your AI assistant\", click See all, then choose Other.")}</li>
                   <li>{t("Open the Connect tab, Generate a token and copy the Server URL.")}</li>
@@ -2927,7 +3670,7 @@ export default function Connect() {
 
               <div className="cx-conn">
                 <div className="cx-conn-head">
-                  <span className="cx-conn-name"><LogoBadge id="google" slug={CONN_ICON.google.icon} name="Google" brand={CONN_ICON.google.brand} />Google <span className="cx-field-tag">{t("Calendar, Gmail, Drive")}</span></span>
+                  <span className="cx-conn-name"><FxLogo id="google" slug={CONN_ICON.google.icon} name="Google" brand={CONN_ICON.google.brand} on={gConnected} />Google <span className="cx-field-tag">{t("Calendar, Gmail, Drive")}</span></span>
                   {gConnected && <span className="cx-status"><i className="cx-dot" />{t("Connected")}</span>}
                 </div>
                 {gConnected ? (
@@ -2964,7 +3707,7 @@ export default function Connect() {
 
               <div className="cx-conn">
                 <div className="cx-conn-head">
-                  <span className="cx-conn-name"><LogoBadge id="microsoft" slug={CONN_ICON.microsoft.icon} name="Microsoft" brand={CONN_ICON.microsoft.brand} />Microsoft <span className="cx-field-tag">{t("Outlook Calendar, Mail, OneDrive")}</span></span>
+                  <span className="cx-conn-name"><FxLogo id="microsoft" slug={CONN_ICON.microsoft.icon} name="Microsoft" brand={CONN_ICON.microsoft.brand} on={msConnected} />Microsoft <span className="cx-field-tag">{t("Outlook Calendar, Mail, OneDrive")}</span></span>
                   {msConnected && <span className="cx-status"><i className="cx-dot" />{t("Connected")}</span>}
                 </div>
                 {msConnected ? (
@@ -3001,7 +3744,7 @@ export default function Connect() {
 
               <div className="cx-conn">
                 <div className="cx-conn-head">
-                  <span className="cx-conn-name"><LogoBadge id="notion" slug={CONN_ICON.notion.icon} name="Notion" brand={CONN_ICON.notion.brand} />Notion <span className="cx-field-tag">{t("Pages, notes")}</span></span>
+                  <span className="cx-conn-name"><FxLogo id="notion" slug={CONN_ICON.notion.icon} name="Notion" brand={CONN_ICON.notion.brand} on={notionConnected} />Notion <span className="cx-field-tag">{t("Pages, notes")}</span></span>
                   {notionConnected && <span className="cx-status"><i className="cx-dot" />{t("Connected")}</span>}
                 </div>
                 {notionConnected ? (
@@ -3035,7 +3778,7 @@ export default function Connect() {
 
               <div className="cx-conn">
                 <div className="cx-conn-head">
-                  <span className="cx-conn-name"><LogoBadge id="slack" slug={CONN_ICON.slack.icon} name="Slack" brand={CONN_ICON.slack.brand} />Slack <span className="cx-field-tag">{t("Post messages")}</span></span>
+                  <span className="cx-conn-name"><FxLogo id="slack" slug={CONN_ICON.slack.icon} name="Slack" brand={CONN_ICON.slack.brand} on={slackConnected} />Slack <span className="cx-field-tag">{t("Post messages")}</span></span>
                   {slackConnected && <span className="cx-status"><i className="cx-dot" />{t("Connected")}</span>}
                 </div>
                 {slackConnected ? (
@@ -3062,7 +3805,7 @@ export default function Connect() {
 
               <div className="cx-conn">
                 <div className="cx-conn-head">
-                  <span className="cx-conn-name"><LogoBadge id="figma" slug={CONN_ICON.figma.icon} name="Figma" brand={CONN_ICON.figma.brand} />Figma <span className="cx-field-tag">{t("Design files")}</span></span>
+                  <span className="cx-conn-name"><FxLogo id="figma" slug={CONN_ICON.figma.icon} name="Figma" brand={CONN_ICON.figma.brand} on={figmaConnected} />Figma <span className="cx-field-tag">{t("Design files")}</span></span>
                   {figmaConnected && <span className="cx-status"><i className="cx-dot" />{t("Connected")}</span>}
                 </div>
                 {figmaConnected ? (
@@ -3091,7 +3834,7 @@ export default function Connect() {
 
               <div className="cx-conn">
                 <div className="cx-conn-head">
-                  <span className="cx-conn-name"><LogoBadge id="supabase" slug={CONN_ICON.supabase.icon} name="Supabase" brand={CONN_ICON.supabase.brand} />Supabase <span className="cx-field-tag">{t("Your database")}</span></span>
+                  <span className="cx-conn-name"><FxLogo id="supabase" slug={CONN_ICON.supabase.icon} name="Supabase" brand={CONN_ICON.supabase.brand} on={supabaseConnected} />Supabase <span className="cx-field-tag">{t("Your database")}</span></span>
                   {supabaseConnected && <span className="cx-status"><i className="cx-dot" />{t("Connected")}</span>}
                 </div>
                 {supabaseConnected ? (
@@ -3114,7 +3857,7 @@ export default function Connect() {
 
               <div className="cx-conn">
                 <div className="cx-conn-head">
-                  <span className="cx-conn-name"><LogoBadge id="github" slug={CONN_ICON.github.icon} name="GitHub" brand={CONN_ICON.github.brand} />GitHub <span className="cx-field-tag">{t("Repos, issues, PRs")}</span></span>
+                  <span className="cx-conn-name"><FxLogo id="github" slug={CONN_ICON.github.icon} name="GitHub" brand={CONN_ICON.github.brand} on={githubConnected} />GitHub <span className="cx-field-tag">{t("Repos, issues, PRs")}</span></span>
                   {githubConnected && <span className="cx-status"><i className="cx-dot" />{t("Connected")}</span>}
                 </div>
                 {githubConnected ? (
@@ -3157,7 +3900,7 @@ export default function Connect() {
 
               <div className="cx-conn">
                 <div className="cx-conn-head">
-                  <span className="cx-conn-name"><LogoBadge id="shopify" slug={CONN_ICON.shopify.icon} name="Shopify" brand={CONN_ICON.shopify.brand} />Shopify <span className="cx-field-tag">{t("Products, orders")}</span></span>
+                  <span className="cx-conn-name"><FxLogo id="shopify" slug={CONN_ICON.shopify.icon} name="Shopify" brand={CONN_ICON.shopify.brand} on={shopifyConnected} />Shopify <span className="cx-field-tag">{t("Products, orders")}</span></span>
                   {shopifyConnected && <span className="cx-status"><i className="cx-dot" />{t("Connected")}</span>}
                 </div>
                 {shopifyConnected ? (
@@ -3180,7 +3923,7 @@ export default function Connect() {
 
               <div className="cx-conn">
                 <div className="cx-conn-head">
-                  <span className="cx-conn-name"><LogoBadge id="telegram" slug={CONN_ICON.telegram.icon} name="Telegram" brand={CONN_ICON.telegram.brand} />Telegram <span className="cx-field-tag">{t("Talk to Keak from your phone")}</span></span>
+                  <span className="cx-conn-name"><FxLogo id="telegram" slug={CONN_ICON.telegram.icon} name="Telegram" brand={CONN_ICON.telegram.brand} on={telegramConnected} />Telegram <span className="cx-field-tag">{t("Talk to Keak from your phone")}</span></span>
                   {telegramConnected && <span className="cx-status"><i className="cx-dot" />{t("Connected")}</span>}
                 </div>
                 {telegramConnected ? (
@@ -3208,7 +3951,7 @@ export default function Connect() {
                 {AI_TOOLS.map((tool) => (
                   <div className="cx-conn cx-tool" key={tool.id}>
                     <div className="cx-conn-head">
-                      <span className="cx-conn-name"><LogoBadge id={tool.id} slug={tool.icon} name={tool.name} brand={tool.brand} />{tool.name} <span className="cx-field-tag">{t(tool.category)}</span></span>
+                      <span className="cx-conn-name"><FxLogo id={tool.id} slug={tool.icon} name={tool.name} brand={tool.brand} on={toolConnected(tool.id)} />{tool.name} <span className="cx-field-tag">{t(tool.category)}</span></span>
                       {toolConnected(tool.id) && <span className="cx-status"><i className="cx-dot" />{t("Connected")}</span>}
                     </div>
                     <p className="cx-help">{t(tool.hint)}</p>
@@ -3257,7 +4000,7 @@ export default function Connect() {
                       </>
                     ) : tool.id === "bluesky" ? (
                       <>
-                        <ol className="cx-help" style={{ margin: "6px 0 12px 18px", lineHeight: 1.8 }}>
+                        <ol className="cx-help cx-steps">
                           <li>{t("In Bluesky, go to Settings, then Privacy and security, then App passwords.")}</li>
                           <li>{t("Tap Add app password, name it something like Keak, and copy the password it shows (you only see it once).")}</li>
                           <li>{t("Enter your handle and that app password below. Always the app password, never your real login password.")}</li>
@@ -3272,7 +4015,7 @@ export default function Connect() {
                       </>
                     ) : tool.id === "x" ? (
                       <>
-                        <ol className="cx-help" style={{ margin: "6px 0 12px 18px", lineHeight: 1.8 }}>
+                        <ol className="cx-help cx-steps">
                           <li>{t("Go to developer.x.com and create a Project and an App.")}</li>
                           <li>{t("X asks for a payment method and a small deposit (about $5) to activate the API for posting.")}</li>
                           <li>{t("In the app's User authentication settings, turn on OAuth 1.0a and set App permissions to Read and write.")}</li>
@@ -3341,16 +4084,19 @@ export default function Connect() {
 
             {activeSection === "work" && (
             <section className="cx-card">
-              <p className="cx-eyebrow">{t("Work")}</p>
-              <h2 className="cx-h">{t("What Keak and your agents made")}</h2>
-              <p className="cx-lead" style={{ marginBottom: 12 }}>
-                {t("Your chats and your team's jobs live here. Click one to keep chatting by text on your own AI, or start a new chat.")}
-              </p>
+              <SectionHero id="work">
+                <p className="cx-eyebrow">{t("Work")}</p>
+                <h2 className="cx-h">{t("What Keak and your agents made")}</h2>
+                <p className="cx-lead" style={{ marginBottom: 12 }}>
+                  {t("Your chats and your team's jobs live here. Click one to keep chatting by text on your own AI, or start a new chat.")}
+                </p>
+              </SectionHero>
               {history.length === 0 ? (
-                <>
+                <div className="cx-empty">
+                  <span className="cx-medallion cx-medallion--lg" aria-hidden="true">{NAV_ICONS.work}</span>
                   <button className="cx-btn" onClick={newChat}>{t("New chat")}</button>
                   <p className="cx-help" style={{ marginTop: 10 }}>{t("Nothing yet. Ask Keak AI something, or say \"use your team to…\" and it lands here.")}</p>
-                </>
+                </div>
               ) : (
                 <div className={`cx-work${chatsHidden ? " cx-work--full" : ""}`}>
                   {!chatsHidden && (
@@ -3494,9 +4240,11 @@ export default function Connect() {
 
             {activeSection === "personality" && (
             <section className="cx-card cx-persona">
-          <p className="cx-eyebrow">{t("Personality")}</p>
-          <h2 className="cx-h">{t("How Keak sounds")}</h2>
-          <p className="cx-lead" style={{ marginBottom: 8 }}>{t("Tune it here, or just tell Keak out loud, like \"be funnier\" or \"less formal.\"")}</p>
+          <SectionHero id="personality">
+            <p className="cx-eyebrow">{t("Personality")}</p>
+            <h2 className="cx-h">{t("How Keak sounds")}</h2>
+            <p className="cx-lead" style={{ marginBottom: 8 }}>{t("Tune it here, or just tell Keak out loud, like \"be funnier\" or \"less formal.\"")}</p>
+          </SectionHero>
           <Dial label={t("Humor")} value={humor} onChange={(v) => setDial("keak_humor", setHumor, v)}
             bands={[t("Professional, no jokes"), t("A light touch of humor"), t("Playful and witty"), t("Very funny, jokes a lot")]} />
           <Dial label={t("Warmth")} value={warmth} onChange={(v) => setDial("keak_warmth", setWarmth, v)}
@@ -3544,8 +4292,10 @@ export default function Connect() {
 
             {activeSection === "help" && (
             <section className="cx-card cx-howto">
-          <p className="cx-eyebrow">{t("Getting started")}</p>
-          <h2 className="cx-h">{t("How to use it")}</h2>
+          <SectionHero id="help">
+            <p className="cx-eyebrow">{t("Getting started")}</p>
+            <h2 className="cx-h">{t("How to use it")}</h2>
+          </SectionHero>
           <p className="cx-help" style={{ marginTop: 8 }}>
             <strong>{t("Dictate")}:</strong> {t("Hold")} <span className="cx-kbd">Ctrl</span> + <span className="cx-kbd">Win</span> {t("anywhere and just talk. Keak drops clean text right where your cursor is, in any app and any language.")}
           </p>

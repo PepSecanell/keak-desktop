@@ -43,6 +43,34 @@ function b64ToBlob(b64: string, type: string): Blob {
   return new Blob([arr], { type });
 }
 
+// Encode mono Float32 PCM as a 16-bit WAV blob (the format the transcribe endpoint reliably accepts).
+function encodeWav(samples: Float32Array, rate: number): Blob {
+  const buf = new ArrayBuffer(44 + samples.length * 2);
+  const view = new DataView(buf);
+  const w = (o: number, s: string) => { for (let i = 0; i < s.length; i++) view.setUint8(o + i, s.charCodeAt(i)); };
+  w(0, "RIFF"); view.setUint32(4, 36 + samples.length * 2, true); w(8, "WAVE"); w(12, "fmt ");
+  view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true);
+  view.setUint32(24, rate, true); view.setUint32(28, rate * 2, true); view.setUint16(32, 2, true); view.setUint16(34, 16, true);
+  w(36, "data"); view.setUint32(40, samples.length * 2, true);
+  let off = 44;
+  for (let i = 0; i < samples.length; i++) { const s = Math.max(-1, Math.min(1, samples[i])); view.setInt16(off, s < 0 ? s * 0x8000 : s * 0x7fff, true); off += 2; }
+  return new Blob([view], { type: "audio/wav" });
+}
+// Telegram voice notes are OGG/Opus. Decode them in the app to 16k mono WAV so transcription is reliable.
+async function oggB64ToWav(b64: string): Promise<Blob | null> {
+  try {
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    const ctx = new AudioContext({ sampleRate: 16000 });
+    const audio = await ctx.decodeAudioData(bytes.buffer.slice(0));
+    const data = audio.getChannelData(0);
+    const out = new Float32Array(data.length); out.set(data);
+    try { await ctx.close(); } catch { /* ignore */ }
+    return encodeWav(out, audio.sampleRate || 16000);
+  } catch { return null; }
+}
+
 function userIdFromToken(token: string): string | null {
   try {
     return JSON.parse(atob(token.split(".")[1])).sub ?? null;
@@ -1048,6 +1076,7 @@ async function parseRoutineCommand(question: string): Promise<string | null> {
     enabled: true,
   };
   upsertRoutine(r);
+  emitTo("connect", "routines-updated", {}).catch(() => { /* Connect window may be closed */ });
   return `Done. I scheduled "${r.name}", ${nextRunLabel(r)}.`;
 }
 
@@ -1729,49 +1758,38 @@ export default function Overlay() {
     const stopP = listen("ptt-stop", () => {
       if (stateRef.current === "recording") stopRecording();
     });
-    // Ctrl+Alt — decide Keak AI vs Thought Dump from the saved setting.
+    // Ctrl+Alt is ALWAYS Keak AI. (Thought Dump was removed as a Ctrl+Alt mode; it lives on only as the TD
+    // button on the dictation pill.) We ignore any old keak_alt_mode value so a stale "thought_dump" from an
+    // earlier install can never make Ctrl+Alt behave like dictation on a fresh machine.
     const altStartP = listen("alt-start", () => {
-      const alt = localStorage.getItem("keak_alt_mode") || "keak_ai";
       // Allow interrupting the AI mid-response to ask a follow-up in the same conversation.
-      // Only skip if we're actively recording or processing a different mode (dictate/rewrite).
-      const interruptable = alt !== "thought_dump"
-        && assistantVisibleRef.current
+      const interruptable = assistantVisibleRef.current
         && (stateRef.current === "responding" || stateRef.current === "processing" || stateRef.current === "result");
       if (stateRef.current !== "idle" && !interruptable) return;
       if (interruptable) {
         stopSpeaking();
         setStateSafe("idle");
       }
-      if (alt === "thought_dump") {
-        modeRef.current = "dictate";
-        thoughtDumpRef.current = true;
-        setThoughtDump(true);
-        startRecording();
+      modeRef.current = "assistant";
+      liveModeRef.current = "ptt"; // Ctrl+Alt / orb: ends when you release (or click the orb again)
+      if (assistantVisibleRef.current) {
+        // Overlay still visible (or was interrupted mid-response) — continue the conversation.
+        cancelAssistantClose();
       } else {
-        modeRef.current = "assistant";
-        liveModeRef.current = "ptt"; // Ctrl+Alt / orb: ends when you release (or click the orb again)
-        if (assistantVisibleRef.current) {
-          // Overlay still visible (or was interrupted mid-response) — continue the conversation.
-          // Cancel the auto-close and keep history so this feels like a natural follow-up.
-          cancelAssistantClose();
-        } else {
-          // Overlay was already closed — start a fresh Keak AI conversation (not an agent).
-          setActiveAgent(null);
-          assistantVisibleRef.current = true;
-          setAssistant(true);
-          setAiReply("");
-          historyRef.current = [];
-        }
-        setAttachedScreen(false);
-        screenOffThisTurnRef.current = false;
-        // Screen is OFF by default every question. Keak only looks at your screen when you deliberately
-        // tap "See screen" for that question, so ordinary questions never send a screenshot.
-        seeScreenRef.current = false;
-        setSeeScreen(false);
-        // Refresh the permission from the account so the "See screen" button shows for eligible users.
-        refreshScreenPermission();
-        startRecording();
+        // Overlay was already closed — start a fresh Keak AI conversation (not an agent).
+        setActiveAgent(null);
+        assistantVisibleRef.current = true;
+        setAssistant(true);
+        setAiReply("");
+        historyRef.current = [];
       }
+      setAttachedScreen(false);
+      screenOffThisTurnRef.current = false;
+      // Screen is OFF by default every question; Keak only looks when you tap "See screen".
+      seeScreenRef.current = false;
+      setSeeScreen(false);
+      refreshScreenPermission();
+      startRecording();
     });
     const altStopP = listen("alt-stop", () => {
       if (stateRef.current === "recording") stopRecording();
@@ -3173,7 +3191,39 @@ export default function Overlay() {
           if (data.ok && Array.isArray(data.result)) {
             for (const upd of data.result) {
               offset = Math.max(offset, (upd.update_id || 0) + 1);
-              const msg = upd.message; const chatId = msg?.chat?.id; const textIn = msg?.text;
+              const msg = upd.message; const chatId = msg?.chat?.id; let textIn = msg?.text;
+              // Voice notes: download the OGG from Telegram, decode it to WAV, transcribe it, and use it as the
+              // message text. If it can't be understood, reply so the user isn't left with silence.
+              if (!textIn && (msg?.voice?.file_id || msg?.audio?.file_id) && chatId) {
+                const fileId = msg?.voice?.file_id || msg?.audio?.file_id;
+                try {
+                  const b64 = await invoke<string>("telegram_get_voice", { args: { token: tk, fileId } });
+                  if (b64) {
+                    // Refresh the token first — an expired session (~1h) is the #1 reason a voice note silently
+                    // fails while a typed message works (typed text never hits transcribe).
+                    let sess = getSession();
+                    if (sess) sess = await ensureFreshSession(sess);
+                    const lang = localStorage.getItem("keak_language");
+                    const doTranscribe = async (blob: Blob, name: string): Promise<string> => {
+                      const form = new FormData();
+                      form.append("file", blob, name);
+                      if (lang && lang !== "auto") form.append("language", lang);
+                      const rr = await fetch(`${SUPABASE_URL}/functions/v1/transcribe`, { method: "POST", headers: { Authorization: `Bearer ${sess?.access_token || ""}` }, body: form });
+                      const dd = await rr.json().catch(() => ({} as { text?: string }));
+                      return dd.text ? String(dd.text).trim() : "";
+                    };
+                    // Telegram voice notes are OGG/Opus and Whisper accepts them directly, so send the raw bytes
+                    // (exactly like dictation sends raw webm). No fragile in-webview decode on the happy path.
+                    try { textIn = await doTranscribe(b64ToBlob(b64, "audio/ogg"), "voice.ogg"); } catch { /* try the wav fallback */ }
+                    // Only if the raw upload comes back empty, decode to WAV in-app and retry once.
+                    if (!textIn) { const wav = await oggB64ToWav(b64); if (wav) { try { textIn = await doTranscribe(wav, "voice.wav"); } catch { /* ignore */ } } }
+                  }
+                } catch { /* fall through to the failure reply below */ }
+                if (!textIn) {
+                  try { await invoke("telegram_send", { args: { token: tk, chatId: String(chatId), text: "I couldn't understand that voice note. Try again or type it." } }); } catch { /* ignore */ }
+                  continue;
+                }
+              }
               if (!chatId || !textIn) continue;
               const isGroup = msg?.chat?.type === "group" || msg?.chat?.type === "supergroup";
               if (isGroup) {
@@ -3201,7 +3251,10 @@ export default function Overlay() {
               if (!owner) { owner = String(chatId); localStorage.setItem("keak_telegram_chat", owner); }
               if (String(chatId) !== owner) continue; // only the linked phone
               let reply = "";
-              try { reply = await answerForTelegram(textIn); } catch (e) { reply = `Error: ${String(e).slice(0, 140)}`; }
+              // Let the phone know Keak is working on anything slow (search, research, an agent step), so you
+              // never sit in silence wondering if it heard you. The final answer follows when it's ready.
+              const notify = (m: string) => { invoke("telegram_send", { args: { token: tk, chatId: String(chatId), text: m } }).catch(() => { /* ignore */ }); };
+              try { reply = await answerForTelegram(textIn, notify); } catch (e) { reply = `Error: ${String(e).slice(0, 140)}`; }
               try { await invoke("telegram_send", { args: { token: tk, chatId: String(chatId), text: (reply || "Done.").slice(0, 3900) } }); } catch { /* ignore */ }
             }
           }
@@ -3394,18 +3447,22 @@ export default function Overlay() {
           return hits.slice(0, 8).map((h) => `${h.path || ""}: ${h.snippet || ""}`).join("\n").slice(0, 3000);
         } catch (e) { return "Could not search the Second Brain: " + String(e).slice(0, 100); }
       } : undefined,
-      onListening: () => { setStateSafe("recording"); },
+      onListening: () => { setStateSafe("recording"); }, // listening again for your reply (conversation)
       onResponding: () => { setStateSafe("responding"); },
       onKeakText: (t) => { if (localStorage.getItem("keak_show_captions") !== "0") setAiReply(t); },
       onDone: (userText, keakText) => {
-        liveActiveRef.current = false;
+        // One turn finished. In conversation mode the session keeps listening, so just record the turn here;
+        // the panel/state cleanup happens in onClosed when the whole conversation ends.
         if (keakText) {
           historyRef.current.push({ role: "user", text: userText || "(spoken)" }, { role: "assistant", text: keakText });
           void captureMemories(userText || "", keakText); // Keak Memory learns from live turns too
         }
+      },
+      onClosed: () => {
+        liveActiveRef.current = false;
         emitTo("orb", "orb-idle").catch(() => {});
         setStateSafe("idle");
-        scheduleAssistantClose(9000); // keep the panel up briefly for a follow-up
+        scheduleAssistantClose(6000);
       },
       onError: (msg) => {
         liveActiveRef.current = false;
@@ -3413,7 +3470,7 @@ export default function Overlay() {
         emitTo("orb", "orb-idle").catch(() => {});
         scheduleAssistantClose(6000);
       },
-    });
+    }, true); // conversation mode: keep the chat going without pressing Ctrl+Alt again
     liveRef.current = session;
     setStateSafe("recording");
     await session.open();
@@ -3863,31 +3920,86 @@ export default function Overlay() {
 
   // Answer a Telegram message from the phone. Uses the API tools (which return URLs/text) when named, else
   // answers with the connected AI. Returns the text to send back. (Screen control + agents stay desktop-only.)
-  async function answerForTelegram(text: string): Promise<string> {
+  // A small tool-using agent so Telegram Keak can DO things like the orb: search, read and create files in the
+  // connected Second Brain, and search the web. The model replies with ONLY a JSON tool call to act, or plain
+  // text when it's done. Runs a few steps, then answers.
+  async function runTelegramAgent(task: string, ai: OwnAI, notify?: (m: string) => void): Promise<string> {
+    const say = (m: string) => { try { notify?.(m); } catch { /* ignore */ } };
+    const root = localStorage.getItem("keak_brain_path") || "";
+    const userName = localStorage.getItem("keak_user_name") || "the user";
+    const hasWeb = !!toolKey("perplexity");
+    const toolDocs: string[] = [];
+    if (root) {
+      toolDocs.push('{"tool":"search_brain","query":"..."} search their Second Brain files');
+      toolDocs.push('{"tool":"read_brain","path":"relative/path"} read one file');
+      toolDocs.push('{"tool":"write_brain","path":"relative/path.md","content":"..."} create or overwrite a file');
+    }
+    if (hasWeb) toolDocs.push('{"tool":"web","query":"..."} search the live web');
+    const sys = `You are Keak, helping ${userName} over Telegram from their computer. You can use tools to actually get things done. ${root ? "Their Second Brain folder IS connected, so you CAN search, read and create files in it. Never say it is not connected." : "No Second Brain folder is connected."} To use a tool, reply with ONLY a single JSON object and nothing else. Available tools: ${toolDocs.join(" ; ") || "(none)"}. When you have what you need, reply with the final answer as plain text, no JSON, no markdown, no ** or ##. Keep it short.${memoryBlock()}`;
+    let convo = `User: ${task}`;
+    for (let step = 0; step < 6; step++) {
+      let raw = "";
+      try { raw = await askOwnAIRaw(ai, sys, convo); } catch (e) { return `Error: ${String(e).slice(0, 140)}`; }
+      const j = extractJsonObject(raw) as { tool?: string; query?: string; path?: string; content?: string } | null;
+      if (!j || !j.tool) return raw; // plain text = final answer
+      let result = "";
+      try {
+        if (j.tool === "search_brain" && root) {
+          say(`Searching your Second Brain for "${String(j.query || "").slice(0, 60)}"...`);
+          const hits = JSON.parse(await invoke<string>("sb_search", { args: { root, query: String(j.query || ""), maxResults: 8 } })) as Array<{ path?: string; snippet?: string }>;
+          result = Array.isArray(hits) && hits.length ? hits.map((h) => `${h.path || ""}: ${h.snippet || ""}`).join("\n").slice(0, 3000) : "No matches in the Second Brain.";
+        } else if (j.tool === "read_brain" && root) {
+          say(`Reading ${String(j.path || "").slice(0, 80)}...`);
+          result = (await invoke<string>("sb_read", { args: { root, path: String(j.path || "") } })).slice(0, 4000);
+        } else if (j.tool === "write_brain" && root) {
+          say(`Saving ${String(j.path || "").slice(0, 80)}...`);
+          const perm = localStorage.getItem("keak_brain_perm") || "full";
+          await invoke("sb_write", { args: { root, path: String(j.path || ""), content: String(j.content || ""), perm } });
+          result = `Saved ${j.path}.`;
+        } else if (j.tool === "web" && hasWeb) {
+          say(`Searching the web for "${String(j.query || "").slice(0, 60)}"...`);
+          result = (await askPerplexity(String(j.query || ""))) || "No web result.";
+        } else {
+          result = "That tool is not available.";
+        }
+      } catch (e) { result = "Tool failed: " + String(e).slice(0, 120); }
+      convo += `\nKeak(tool): ${raw}\nTool result: ${result}`;
+    }
+    return "I looked into it but could not finish in a few steps. Try asking more specifically.";
+  }
+
+  async function answerForTelegram(text: string, notify?: (m: string) => void): Promise<string> {
     const ai = resolveOwnAI();
+    const say = (m: string) => { try { notify?.(m); } catch { /* ignore */ } };
+    // Actually DO things from your phone, exactly like the voice assistant does: create a routine (persists +
+    // shows in the desktop), or change a setting / a dial / an agent. cleanReply strips markdown for Telegram.
+    try { const r = await parseRoutineCommand(text); if (r) return cleanReply(r); } catch { /* fall through */ }
+    try { const s = await parseAndApplySettings(text); if (s) return cleanReply(s); } catch { /* fall through */ }
     if (toolKey("perplexity") && (/^\s*(research|look up|investiga|busca)/i.test(text) || /\bperplexity\b/i.test(text))) {
+      say("On it, researching that now...");
       const r = await askPerplexity(text); return r || "Couldn't reach Perplexity.";
     }
     if (toolKey("gamma") && /\b(deck|slides?|presentation|gamma)\b/i.test(text)) {
+      say("On it, building the deck. This takes a minute...");
       const u = await makeDeck(text.slice(0, 1500)); return looksLikeUrl(u) ? `Deck ready: ${u}` : `Couldn't build the deck. ${u || ""}`;
     }
     if (toolKey("heygen") && (/\bhey ?gen\b/i.test(text) || /\bvideo\b/i.test(text))) {
+      say("On it, making the video. This takes a few minutes...");
       let s = text; if (ai) { try { s = await askOwnAIRaw(ai, "Write a 40-70 word spoken video script. Topic follows.", text) || text; } catch { /* keep */ } }
       const u = await makeVideo(s.slice(0, 1200)); return looksLikeUrl(u) ? `Video ready: ${u}` : `Couldn't make the video. ${u || ""}`;
     }
     if (toolKey("higgsfield") && /\b(higgsfield|cinematic)\b/i.test(text)) {
+      say("On it, generating that now...");
       const u = await runHiggsfield(text.slice(0, 1000)); return looksLikeUrl(u) ? u! : `Couldn't generate. ${u || ""}`;
     }
     if (toolKey("manus") && /\bmanus\b/i.test(text)) {
+      say("On it, handing this to Manus...");
       const u = await runManus(text.replace(/\bmanus\b/i, "").trim() || text); return looksLikeUrl(u) ? `Manus is on it: ${u}` : `Couldn't start Manus. ${u || ""}`;
     }
     if ((toolKey("n8n") || toolKey("make")) && /\b(automation|workflow|scenario|webhook)\b/i.test(text)) {
       const ok = await fireAutomation(text); return ok ? "Triggered your automation." : "Couldn't reach the webhook.";
     }
-    if (ai) {
-      try { return await askOwnAIRaw(ai, "You are Keak, answering the user over Telegram from their computer. Be concise and helpful.", text); }
-      catch (e) { return `Error: ${String(e).slice(0, 140)}`; }
-    }
+    if (ai) return cleanReply(await runTelegramAgent(text, ai, notify));
     return "Connect your own AI in Keak first so I can answer from your phone.";
   }
 
@@ -4441,15 +4553,6 @@ export default function Overlay() {
               >
                 {state === "recording" ? <IconStop /> : <IconMic />}
               </button>
-              {state === "idle" && (
-                <button
-                  className={`dump-btn${thoughtDump ? " dump-btn--on" : ""}`}
-                  onClick={() => setThoughtDump((v) => { thoughtDumpRef.current = !v; return !v; })}
-                  title="Thought Dump: restructures messy speech into clean text"
-                >
-                  TD
-                </button>
-              )}
             </>
           )}
 
