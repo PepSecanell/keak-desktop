@@ -2826,6 +2826,32 @@ async fn telegram_send(args: TgSendArgs) -> Result<String, String> {
     Ok(text)
 }
 
+// Set the bot's OWN profile picture to the Keak logo, so a freshly created Keak bot shows the brand instead
+// of a blank avatar. Best-effort: called right after the user connects their token; if Telegram rejects it
+// the connect still succeeds (the user can always set it via BotFather). Hand-rolled multipart/form-data
+// because reqwest's `multipart` feature isn't enabled. The jpg is embedded at compile time.
+#[tauri::command]
+async fn telegram_set_photo(token: String) -> Result<String, String> {
+    const PHOTO: &[u8] = include_bytes!("../keak-bot-photo.jpg");
+    let boundary = "----keakbotphoto7f3a9c2e";
+    let mut body: Vec<u8> = Vec::new();
+    body.extend_from_slice(
+        format!("--{b}\r\nContent-Disposition: form-data; name=\"photo\"\r\n\r\n{{\"type\":\"static\",\"photo\":\"attach://pic\"}}\r\n", b = boundary).as_bytes(),
+    );
+    body.extend_from_slice(
+        format!("--{b}\r\nContent-Disposition: form-data; name=\"pic\"; filename=\"keak.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n", b = boundary).as_bytes(),
+    );
+    body.extend_from_slice(PHOTO);
+    body.extend_from_slice(format!("\r\n--{b}--\r\n", b = boundary).as_bytes());
+    let res = reqwest::Client::new()
+        .post(format!("https://api.telegram.org/bot{}/setMyProfilePhoto", token.trim()))
+        .header("Content-Type", format!("multipart/form-data; boundary={}", boundary))
+        .body(body)
+        .send().await.map_err(|e| e.to_string())?;
+    let text = res.text().await.map_err(|e| e.to_string())?;
+    Ok(text)
+}
+
 #[tauri::command]
 fn hide_overlay(app: AppHandle) -> Result<(), String> {
     if let Some(overlay) = app.get_webview_window("overlay") {
@@ -3783,7 +3809,7 @@ pub fn run() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![open_url, inject_text, hide_overlay, show_main, show_agents, hide_agents, save_artifact, restore_clipboard, capture_selection, capture_screen, send_browser_command, capture_screen_full, mouse_click, mouse_move, cursor_pos, type_text, mouse_scroll, press_key, openai_login_start, openai_login_poll, cu_step, cu_chat, copilot_read_cli_token, ollama_list_models, pick_folder, set_autostart, get_autostart, whatsapp_send, sb_tree, sb_read, sb_write, sb_mkdir, sb_delete, sb_search, sb_graph, openai_tts, gemini_tts, google_connect, google_refresh, google_calendar_create, youtube_get, gmail_list, gmail_send, drive_create, ms_connect, ms_refresh, ms_calendar_create, ms_mail_send, ms_drive_create, notion_connect, notion_create_page, slack_connect, slack_test, slack_post, perplexity_ask, elevenlabs_tts, elevenlabs_speak, gamma_generate, heygen_video, webhook_post, manus_task, higgsfield_generate, heygen_assets, figma_connect, resend_send, supabase_rest, supabase_schema, figma_api, github_device_start, github_device_poll, github_api, shopify_api, gumloop_start, telegram_poll, telegram_send, telegram_get_voice, mcp_rpc, claude_verify, claude_read_cli_token, make_scenarios, make_run, stt_status, stt_start, stt_stop, stt_download_engine, orb_talk_start, orb_talk_stop, orb_show, orb_hide, set_standby, wake_start, wake_stop, wake_save_sample, wake_clear, wake_has_samples, recap_start, recap_stop, recap_status, recap_chunk_count, recap_chunk_b64, recap_cancel, stream_type, stream_replace])
+        .invoke_handler(tauri::generate_handler![open_url, inject_text, hide_overlay, show_main, show_agents, hide_agents, save_artifact, restore_clipboard, capture_selection, capture_screen, send_browser_command, capture_screen_full, mouse_click, mouse_move, cursor_pos, type_text, mouse_scroll, press_key, openai_login_start, openai_login_poll, cu_step, cu_chat, copilot_read_cli_token, ollama_list_models, pick_folder, set_autostart, get_autostart, whatsapp_send, sb_tree, sb_read, sb_write, sb_mkdir, sb_delete, sb_search, sb_graph, openai_tts, gemini_tts, google_connect, google_refresh, google_calendar_create, youtube_get, gmail_list, gmail_send, drive_create, ms_connect, ms_refresh, ms_calendar_create, ms_mail_send, ms_drive_create, notion_connect, notion_create_page, slack_connect, slack_test, slack_post, perplexity_ask, elevenlabs_tts, elevenlabs_speak, gamma_generate, heygen_video, webhook_post, manus_task, higgsfield_generate, heygen_assets, figma_connect, resend_send, supabase_rest, supabase_schema, figma_api, github_device_start, github_device_poll, github_api, shopify_api, gumloop_start, telegram_poll, telegram_send, telegram_get_voice, telegram_set_photo, mcp_rpc, claude_verify, claude_read_cli_token, make_scenarios, make_run, stt_status, stt_start, stt_stop, stt_download_engine, orb_talk_start, orb_talk_stop, orb_show, orb_hide, set_standby, wake_start, wake_stop, wake_save_sample, wake_clear, wake_has_samples, recap_start, recap_stop, recap_status, recap_chunk_count, recap_chunk_b64, recap_cancel, stream_type, stream_replace])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

@@ -32,16 +32,60 @@ export type LiveHandlers = {
   onToolCall?: (name: string, args: Record<string, unknown>) => Promise<string>;
 };
 
-// The one tool the live model can call: search the user's Second Brain for anything it needs to answer.
-const BRAIN_TOOL = {
-  name: "search_second_brain",
-  description: "Search the user's connected Second Brain (their notes, files, projects, people, facts) for anything you need to answer their question. Use it whenever they ask about their own stuff or something you don't already know.",
-  parameters: {
-    type: "object",
-    properties: { query: { type: "string", description: "what to look for" } },
-    required: ["query"],
+// The tools the live model can call to actually DO things (not just talk). The caller (Overlay) runs each one
+// against the real app and returns a short result string, which the model then speaks. Providing an onToolCall
+// handler enables the whole set. Keep names/shapes in sync with the dispatch in Overlay.startLiveTurn.
+const KEAK_TOOLS = [
+  {
+    name: "search_second_brain",
+    description: "Search the user's connected Second Brain (their notes, files, projects, people, facts). Use it whenever they ask about their own stuff or something you don't already know.",
+    parameters: {
+      type: "object",
+      properties: { query: { type: "string", description: "what to look for" } },
+      required: ["query"],
+    },
   },
-};
+  {
+    name: "schedule_routine",
+    description: "Create a scheduled routine that runs on its own at a time (once, daily, or weekly) and delivers a result. Use this whenever the user asks to schedule something, set a reminder, or run something every day/week/morning.",
+    parameters: {
+      type: "object",
+      properties: { request: { type: "string", description: "the full request in one line: when it runs, what it does, and where to deliver it (Keak, Telegram or email)" } },
+      required: ["request"],
+    },
+  },
+  {
+    name: "create_calendar_event",
+    description: "Add an event to the user's calendar. Use this whenever they ask to add, schedule or book a meeting, appointment, call or event at a specific time.",
+    parameters: {
+      type: "object",
+      properties: {
+        title: { type: "string", description: "short event title" },
+        start_iso: { type: "string", description: "start time as an ISO 8601 local datetime, e.g. 2026-07-20T15:00:00" },
+        end_iso: { type: "string", description: "optional end time as ISO 8601; if omitted the event is one hour" },
+      },
+      required: ["title", "start_iso"],
+    },
+  },
+  {
+    name: "web_search",
+    description: "Search the live web for current information, facts, news, prices or anything you don't know. Use it before answering when the answer could be out of date or you're unsure.",
+    parameters: {
+      type: "object",
+      properties: { query: { type: "string", description: "what to search for" } },
+      required: ["query"],
+    },
+  },
+  {
+    name: "do_task",
+    description: "Carry out any action that needs the computer, an app, the user's connected tools, their team of agents, email, or creating things (e.g. 'find the best app to make images and use it', 'open YouTube', 'reply to this email', 'have my agents research X and write it'). Pass the user's full request. This actually performs the work. Prefer this over saying you can't do something.",
+    parameters: {
+      type: "object",
+      properties: { request: { type: "string", description: "the user's full request, verbatim" } },
+      required: ["request"],
+    },
+  },
+];
 
 function b64FromInt16(samples: Int16Array): string {
   const bytes = new Uint8Array(samples.buffer);
@@ -135,7 +179,7 @@ export class LiveKeak {
           systemInstruction: { parts: [{ text: this.instructions }] },
           inputAudioTranscription: {},
           outputAudioTranscription: {},
-          ...(this.handlers.onToolCall ? { tools: [{ functionDeclarations: [BRAIN_TOOL] }] } : {}),
+          ...(this.handlers.onToolCall ? { tools: [{ functionDeclarations: KEAK_TOOLS }] } : {}),
         },
       }));
     };
@@ -188,7 +232,7 @@ export class LiveKeak {
             input: { format: { type: "audio/pcm", rate: 24000 }, turn_detection: null, transcription: { model: "gpt-4o-mini-transcribe" } },
             output: { format: { type: "audio/pcm", rate: 24000 }, voice: "alloy" },
           },
-          ...(this.handlers.onToolCall ? { tools: [{ type: "function", ...BRAIN_TOOL }], tool_choice: "auto" } : {}),
+          ...(this.handlers.onToolCall ? { tools: KEAK_TOOLS.map((t) => ({ type: "function", ...t })), tool_choice: "auto" } : {}),
         },
       }));
     };

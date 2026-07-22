@@ -3246,3 +3246,307 @@
   .cx-check-row input[type="checkbox"]::after { transition: left 120ms ease, background 120ms ease; }
   .cx-check-row input[type="checkbox"]:active::after { width: 17px; }
 }
+
+/* ============================================================================
+   MOON CURSOR — the pointer is a Sirius-coloured moon that orbits the Keak
+   planet when it drifts close (JS in Connect.tsx drives .kx-cursor-moon).
+   The native arrow is hidden across the window; text fields keep their caret.
+   ============================================================================ */
+.connect-scroll, .connect-scroll *, .connect-scroll *::before, .connect-scroll *::after { cursor: none !important; }
+.kx-cursor-moon {
+  position: fixed; left: 0; top: 0; width: 22px; height: 22px; border-radius: 50%;
+  /* Sirius = #D4A49A (same as the agent moon). Lit from top-left, shadowed bottom-right. */
+  background: radial-gradient(circle at 34% 30%, #F6DED4 0%, #DDAEA2 42%, #C68B7E 100%);
+  box-shadow: 0 0 10px rgba(212, 164, 154, 0.55), inset -3px -3px 6px rgba(120, 74, 66, 0.5);
+  pointer-events: none; z-index: 100000; opacity: 0; will-change: transform, opacity;
+  transition: box-shadow 200ms ease, opacity 220ms ease;
+}
+/* faint crater so it reads as a moon, not a dot */
+.kx-cursor-moon::before {
+  content: ""; position: absolute; left: 55%; top: 30%; width: 5px; height: 5px;
+  border-radius: 50%; background: rgba(120, 74, 66, 0.28);
+}
+.kx-cursor-moon--over { box-shadow: 0 0 15px rgba(212, 164, 154, 0.85), inset -3px -3px 6px rgba(120, 74, 66, 0.5); }
+.kx-cursor-moon--orbit {
+  box-shadow: 0 0 18px rgba(212, 164, 154, 0.9), 0 0 34px rgba(212, 164, 154, 0.4), inset -3px -3px 6px rgba(120, 74, 66, 0.5);
+}
+@media (prefers-reduced-motion: reduce) { .connect-scroll, .connect-scroll * { cursor: auto; } .kx-cursor-moon { display: none; } }
+
+/* ================================================================== *
+   KX ANIMATION LAYER v2 — Blur·Rise, Glow·Pulse, Spring, Shimmer
+   All appended; no existing rules touched.
+ * ================================================================== */
+
+/* ------------------------------------------------------------------
+   1. Section entrance — blur + rise combo
+   Overrides the plain kx-rise on .connect-main > * with a richer
+   entrance that adds scale and a quick de-blur.
+ * ------------------------------------------------------------------ */
+@keyframes kx-section-in {
+  0%   { opacity: 0; transform: translateY(14px) scale(0.988); filter: blur(3px); }
+  60%  { filter: blur(0); }
+  100% { opacity: 1; transform: translateY(0) scale(1); filter: blur(0); }
+}
+.connect-main > * {
+  animation: kx-section-in 380ms var(--kx-ease) both;
+}
+
+/* ------------------------------------------------------------------
+   2. Nav active indicator — glow pulse on the bar
+   The ::before bar on the active nav item now breathes with a rose glow.
+ * ------------------------------------------------------------------ */
+@keyframes kx-nav-bar-glow {
+  0%, 100% { box-shadow: 0 0 6px 1px rgba(198, 139, 126, 0.5); }
+  50%       { box-shadow: 0 0 14px 3px rgba(198, 139, 126, 0.85); }
+}
+.connect-view .cx-nav-item--on::before {
+  animation: kx-nav-bar-glow 2.4s ease-in-out infinite;
+}
+
+/* ------------------------------------------------------------------
+   3. Nav click ripple — the bar scaleY-ripples on press
+ * ------------------------------------------------------------------ */
+@keyframes kx-nav-ripple {
+  0%   { transform: translateY(-50%) scaleY(0.6); opacity: 0.9; }
+  60%  { transform: translateY(-50%) scaleY(1.25); opacity: 0.5; }
+  100% { transform: translateY(-50%) scaleY(1); opacity: 0; }
+}
+.connect-view .cx-nav-item:active::before {
+  animation: kx-nav-ripple 280ms var(--kx-ease) both;
+}
+
+/* ------------------------------------------------------------------
+   4. Agent cards — richer hover lift + action slide
+   Real class is .cx-agent-row (interactive variant: .cx-agent-row--click)
+   Actions container is .cx-edit-actions
+ * ------------------------------------------------------------------ */
+.cx-agent-gallery .cx-agent-row--click {
+  transition: transform var(--kx-t-med), box-shadow var(--kx-t-med), border-color var(--kx-t-med), background var(--kx-t-med);
+}
+.cx-agent-gallery .cx-agent-row--click:hover {
+  transform: translateY(-4px) scale(1.015);
+  box-shadow: 0 0 28px -6px rgba(212, 164, 154, 0.6), 0 18px 40px -22px rgba(44, 21, 8, 0.38);
+}
+.cx-agent-gallery .cx-agent-row--click:active {
+  transform: translateY(-1px) scale(1.005);
+}
+/* Agent actions: slide up on card hover */
+.cx-agent-gallery .cx-agent-row--click .cx-edit-actions {
+  opacity: 0;
+  transform: translateY(4px);
+  transition: opacity var(--kx-t-fast), transform var(--kx-t-fast);
+}
+.cx-agent-gallery .cx-agent-row--click:hover .cx-edit-actions {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+/* ------------------------------------------------------------------
+   5. Provider cards — shimmer sweep on hover + connected ring pulse
+ * ------------------------------------------------------------------ */
+.connect-view .cx-provider-card {
+  overflow: hidden;
+}
+.connect-view .cx-provider-card::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(105deg, transparent 30%, rgba(255, 253, 246, 0.65) 50%, transparent 70%);
+  transform: translateX(-120%);
+  transition: transform 0.55s ease;
+  pointer-events: none;
+  border-radius: inherit;
+}
+.connect-view .cx-provider-card:hover::after {
+  transform: translateX(130%);
+}
+@keyframes kx-connected-ring {
+  0%, 100% { box-shadow: 0 0 0 2px rgba(212, 164, 154, 0.25), 0 0 12px -4px rgba(198, 139, 126, 0.35); }
+  50%       { box-shadow: 0 0 0 3px rgba(212, 164, 154, 0.5),  0 0 22px -4px rgba(198, 139, 126, 0.6); }
+}
+.connect-view .cx-provider-card--on {
+  animation: kx-connected-ring 3s ease-in-out infinite;
+}
+
+/* ------------------------------------------------------------------
+   6. Send button — glow + launch animation on click
+ * ------------------------------------------------------------------ */
+@keyframes kx-send-launch {
+  0%   { transform: translateY(0) scale(1); }
+  30%  { transform: translateY(-4px) scale(1.1); }
+  60%  { transform: translateY(-2px) scale(1.06); }
+  100% { transform: translateY(0) scale(1); }
+}
+.connect-view .cx-sendbtn:hover {
+  background: var(--kx-rose-deep) !important;
+  box-shadow: 0 0 18px -4px rgba(198, 139, 126, 0.7), 0 6px 16px -8px rgba(44, 21, 8, 0.3);
+  transform: scale(1.06);
+  transition: transform 160ms var(--kx-ease), box-shadow 160ms var(--kx-ease), background 160ms var(--kx-ease);
+}
+.connect-view .cx-sendbtn:active svg {
+  animation: kx-send-launch 350ms var(--kx-ease) both;
+}
+
+/* ------------------------------------------------------------------
+   7. Input focus — border trace / bloom-in glow
+ * ------------------------------------------------------------------ */
+@keyframes kx-input-glow-in {
+  0%   { box-shadow: var(--kx-ring), 0 0 0px 0px rgba(212, 164, 154, 0); }
+  60%  { box-shadow: 0 0 0 4px rgba(212, 164, 154, 0.45), 0 0 22px -4px rgba(212, 164, 154, 0.7); }
+  100% { box-shadow: var(--kx-ring), 0 0 18px -6px rgba(212, 164, 154, 0.55); }
+}
+.connect-view .cx-input:focus,
+.connect-view textarea:focus {
+  animation: kx-input-glow-in 380ms var(--kx-ease) both;
+}
+
+/* ------------------------------------------------------------------
+   8. Chat bubble — spring overshoot entrance
+   Replaces the flat kxs-bubble-in with a springier feel.
+ * ------------------------------------------------------------------ */
+@keyframes kxs-bubble-spring {
+  0%   { opacity: 0; transform: translateY(10px) scale(0.96); }
+  60%  { opacity: 1; transform: translateY(-3px) scale(1.015); }
+  80%  { transform: translateY(1px) scale(0.998); }
+  100% { transform: translateY(0) scale(1); }
+}
+.cx-bubble {
+  animation: kxs-bubble-spring 300ms var(--kx-ease) both;
+}
+
+/* ------------------------------------------------------------------
+   9. Typing indicator — bouncier dots
+   .cx-bubble-typing is a single block-level element pulsed by kx-pulse.
+   We keep the existing animation and add a more expressive version
+   targeting the three inner dot spans if present.
+ * ------------------------------------------------------------------ */
+@keyframes kxs-dot-bounce {
+  0%, 80%, 100% { transform: translateY(0) scale(1); opacity: 0.55; }
+  40%           { transform: translateY(-6px) scale(1.2); opacity: 1; }
+}
+.cx-bubble-typing span {
+  animation: kxs-dot-bounce 1.1s ease-in-out infinite;
+}
+.cx-bubble-typing span:nth-child(2) { animation-delay: 0.15s; }
+.cx-bubble-typing span:nth-child(3) { animation-delay: 0.30s; }
+
+/* ------------------------------------------------------------------
+   10. Recording button — dramatic dual-ring outer pulse
+   kxs-rec-ping already runs; we add a wider secondary ring staggered.
+ * ------------------------------------------------------------------ */
+@keyframes kxs-rec-outer-ring {
+  0%   { box-shadow: 0 0 0 0 rgba(198, 139, 126, 0.6), 0 0 0 0 rgba(198, 139, 126, 0.3); }
+  50%  { box-shadow: 0 0 0 8px rgba(198, 139, 126, 0.15), 0 0 0 16px rgba(198, 139, 126, 0.05); }
+  100% { box-shadow: 0 0 0 16px rgba(198, 139, 126, 0), 0 0 0 30px rgba(198, 139, 126, 0); }
+}
+.cx-recbtn--stop {
+  animation: kxs-rec-ping 2.1s ease-out infinite, kxs-rec-outer-ring 2.1s ease-out infinite 0.4s;
+}
+
+/* ------------------------------------------------------------------
+   11. Personality range slider — thumb glow + active grow
+   Existing L1049 has :hover scale(1.12); we layer the glow on top.
+ * ------------------------------------------------------------------ */
+.cx-range::-webkit-slider-thumb:hover {
+  transform: scale(1.35);
+  box-shadow: 0 0 0 4px rgba(212, 164, 154, 0.35), 0 0 14px -2px rgba(198, 139, 126, 0.7);
+  background: var(--kx-rose-deep);
+  transition: transform 160ms var(--kx-ease), box-shadow 160ms var(--kx-ease), background 160ms var(--kx-ease);
+}
+.cx-range:focus-visible::-webkit-slider-thumb {
+  box-shadow: 0 0 0 5px rgba(212, 164, 154, 0.45);
+}
+
+/* ------------------------------------------------------------------
+   12. Help rows — enhanced left-border slide on hover
+   Existing L3180 has translateX(3px) + rose-dark border.
+   We add a border-left lead-in transition so it traces in smoothly.
+ * ------------------------------------------------------------------ */
+.cx-howto .cx-help {
+  border-left: 2px solid transparent;
+  transition: transform var(--kx-t-fast), border-color var(--kx-t-fast), background var(--kx-t-fast), box-shadow var(--kx-t-fast);
+}
+.cx-howto .cx-help:hover {
+  transform: translateX(4px);
+  border-left-color: var(--kx-rose);
+  background: rgba(212, 164, 154, 0.08);
+  box-shadow: -2px 0 12px -6px rgba(212, 164, 154, 0.5);
+}
+
+/* ------------------------------------------------------------------
+   13. Keyboard key press animation
+   Existing L3188 has translateY(1.5px) press-down.
+   We replace it with a spring keyframe that settles back up.
+ * ------------------------------------------------------------------ */
+@keyframes kx-kbd-press {
+  0%   { transform: translateY(0); box-shadow: 0 3px 0 rgba(44, 21, 8, 0.18); }
+  40%  { transform: translateY(2px); box-shadow: 0 1px 0 rgba(44, 21, 8, 0.12); }
+  100% { transform: translateY(0); box-shadow: 0 3px 0 rgba(44, 21, 8, 0.18); }
+}
+.cx-kbd:hover {
+  animation: kx-kbd-press 300ms ease both;
+}
+
+/* ------------------------------------------------------------------
+   14. Floating medallion — richer orbit float + sparkle rotation
+   Overrides kxs-float (simple translateY) with a float+rotate combo.
+   The ::before / ::after sparkles get rotation added.
+ * ------------------------------------------------------------------ */
+@keyframes kxs-medallion-float {
+  0%, 100% { transform: translateY(0) rotate(-1deg); }
+  25%      { transform: translateY(-8px) rotate(1deg); }
+  75%      { transform: translateY(-4px) rotate(-0.5deg); }
+}
+.cx-empty .cx-medallion--lg {
+  animation: kxs-medallion-float 7s ease-in-out infinite !important;
+}
+.cx-secthero--help .cx-medallion {
+  animation: kxs-medallion-float 7s ease-in-out infinite !important;
+}
+@keyframes kxs-empty-sparkle-a {
+  0%, 100% { opacity: 0; transform: translate(-50%, -50%) scale(0.5) rotate(0deg); }
+  25%      { opacity: 0.7; }
+  50%      { opacity: 0.3; transform: translate(-50%, -50%) scale(1.2) rotate(180deg); }
+}
+@keyframes kxs-empty-sparkle-b {
+  0%, 100% { opacity: 0; transform: translate(-50%, -50%) scale(0.3) rotate(45deg); }
+  40%      { opacity: 0.6; }
+  70%      { opacity: 0.2; transform: translate(-50%, -50%) scale(1.1) rotate(225deg); }
+}
+.cx-empty::before { animation: kxs-empty-sparkle-a 7s ease-in-out infinite !important; }
+.cx-empty::after  { animation: kxs-empty-sparkle-b 9s ease-in-out infinite 1.5s !important; }
+
+/* ------------------------------------------------------------------
+   15. Agent status dot — richer breathing glow
+   Existing L2788 has a basic animation; we redefine with glow layers
+   and stagger by nth-child position for a living-galaxy feel.
+ * ------------------------------------------------------------------ */
+@keyframes kxs-dot-breathe {
+  0%, 100% { transform: scale(1);    box-shadow: 0 0 0 2px rgba(212, 164, 154, 0.2); }
+  50%      { transform: scale(1.18); box-shadow: 0 0 0 5px rgba(212, 164, 154, 0.08), 0 0 12px rgba(212, 164, 154, 0.5); }
+}
+.cx-agent-dot {
+  animation: kxs-dot-breathe 4s ease-in-out infinite;
+}
+.cx-agent-gallery > div:nth-child(2n) .cx-agent-dot { animation-delay: 0.8s; }
+.cx-agent-gallery > div:nth-child(3n) .cx-agent-dot { animation-delay: 1.6s; }
+.cx-agent-gallery > div:nth-child(4n) .cx-agent-dot { animation-delay: 2.4s; }
+
+/* ---- reduced-motion guard for all new animations ---- */
+@media (prefers-reduced-motion: reduce) {
+  .connect-main > * { animation: none !important; filter: none !important; }
+  .connect-view .cx-nav-item--on::before,
+  .connect-view .cx-nav-item:active::before { animation: none !important; }
+  .connect-view .cx-provider-card--on { animation: none !important; }
+  .connect-view .cx-sendbtn:active svg { animation: none !important; }
+  .connect-view .cx-input:focus,
+  .connect-view textarea:focus { animation: none !important; }
+  .cx-bubble { animation: none !important; }
+  .cx-bubble-typing span { animation: none !important; }
+  .cx-recbtn--stop { animation: kxs-rec-ping 2.1s ease-out infinite !important; }
+  .cx-kbd:hover { animation: none !important; }
+  .cx-empty .cx-medallion--lg,
+  .cx-secthero--help .cx-medallion { animation: none !important; }
+  .cx-empty::before, .cx-empty::after { animation: none !important; }
+  .cx-agent-dot { animation: none !important; }
+}

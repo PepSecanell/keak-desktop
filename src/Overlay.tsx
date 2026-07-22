@@ -650,6 +650,22 @@ async function askPerplexity(query: string): Promise<string | null> {
   try { return await invoke<string>("perplexity_ask", { args: { apiKey: key, query, model: "" } }); }
   catch (e) { console.log("[KEAK] perplexity failed:", String(e)); return null; }
 }
+// Live web research via Tavily when Perplexity is not connected. Returns the answer text, or null.
+async function askTavily(query: string): Promise<string | null> {
+  const key = toolKey("tavily");
+  if (!key) return null;
+  try {
+    const r = await fetch("https://api.tavily.com/search", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ api_key: key, query, search_depth: "basic", max_results: 5 }),
+    });
+    if (!r.ok) return null;
+    const d = (await r.json()) as { results?: Array<{ title?: string; content?: string; url?: string }> };
+    if (!d.results?.length) return null;
+    return d.results.slice(0, 5).map((res) => `${res.title || ""}: ${res.content || ""} (${res.url || ""})`).join("\n").slice(0, 3000);
+  } catch (e) { console.log("[KEAK] tavily failed:", String(e)); return null; }
+}
 // Post a message to Slack with the user's connected token. Returns true on success.
 async function postToSlack(channel: string, text: string): Promise<boolean> {
   const token = localStorage.getItem("keak_slack_token") || "";
@@ -773,12 +789,58 @@ function resolveChoice(choice: string, fallback: OwnAI): OwnAI {
   return resolveProviderAI(provider, model || "") || fallback;
 }
 
+// A provider error that means "this AI is out of usage" (credits/quota gone) or "the login expired"
+// (subscription/session token dead). Either way, the fix is the same: switch to the free local model so
+// Keak keeps working instead of failing. Rate-limits (429) are NOT included — those clear on their own.
+function isExhaustedOrExpired(msg: string): boolean {
+  const m = msg.toLowerCase();
+  if (/\b429\b|rate.?limit|too many requests/.test(m)) return false; // temporary, don't burn the fallback
+  return /insufficient_quota|exceeded your current quota|out of (credits|quota|tokens)|credit balance|billing|payment required|\b402\b|balance too low|no credits|quota/.test(m)
+    || /\b401\b|\b403\b|unauthor|invalid_grant|token (?:has )?expired|expired|session expired|please (?:re)?connect|reconnect|not logged in|login expired|sign ?in again/.test(m);
+}
+// The user's local Ollama model, if they've set one up. Empty = no local fallback available.
+function localFallbackModel(): string {
+  return (localStorage.getItem("keak_cu_ollama_model") || "").trim();
+}
+// Cloud providers in fallback priority order (subscriptions/free-tier first, API-key last).
+const CLOUD_PROVIDER_ORDER = ["openai", "claude", "copilot", "gemini", "xai", "deepseek", "kimi", "mistral"];
+// Returns every connected cloud provider except the one that just failed, in priority order.
+function connectedFallbacks(skipProvider: string): OwnAI[] {
+  return CLOUD_PROVIDER_ORDER
+    .filter((p) => p !== skipProvider)
+    .map((p) => resolveProviderAI(p, ""))
+    .filter((ai): ai is OwnAI => ai !== null);
+}
+
 // One-shot call to the user's own model via the Rust cu_chat brain. Returns raw text (throws on error).
+// Fallback chain on exhausted/expired errors: primary → other connected cloud providers → local Ollama.
 async function askOwnAIRaw(ai: OwnAI, system: string, message: string): Promise<string> {
-  return await invoke<string>("cu_chat", { args: {
-    provider: ai.provider, credential: ai.credential, accountId: ai.accountId, isSubscription: ai.isSub,
-    model: ai.model, effort: ai.effort, system, history: [], message,
-  } });
+  const call = (a: OwnAI) =>
+    invoke<string>("cu_chat", { args: { provider: a.provider, credential: a.credential, accountId: a.accountId, isSubscription: a.isSub, model: a.model, effort: a.effort, system, history: [], message } });
+  try {
+    return await call(ai);
+  } catch (e) {
+    if (!isExhaustedOrExpired(String(e))) throw e;
+    console.log("[KEAK] provider exhausted/expired:", ai.provider, String(e).slice(0, 80));
+    if (ai.provider !== "ollama") {
+      for (const fb of connectedFallbacks(ai.provider)) {
+        try {
+          console.log("[KEAK] trying fallback provider:", fb.provider);
+          return await call(fb);
+        } catch (e2) {
+          if (!isExhaustedOrExpired(String(e2))) throw e2;
+          console.log("[KEAK] fallback also exhausted:", fb.provider);
+        }
+      }
+    }
+    // Last resort: local Ollama.
+    const lm = localFallbackModel();
+    if (lm) {
+      console.log("[KEAK] all cloud providers exhausted, falling back to local Ollama");
+      return await call({ provider: "ollama", credential: "local", accountId: "", isSub: false, model: lm, effort: "" });
+    }
+    throw e;
+  }
 }
 
 // ---- Translate-while-dictating -------------------------------------------------------------------
@@ -1049,8 +1111,8 @@ function looksLikeRoutineCommand(t: string): boolean {
 const ROUTINE_SYSTEM = `Convert the user's request into ONE scheduled routine as strict minified JSON and nothing else. Shape:
 {"name":"<short name>","freq":"once|daily|weekly","day":<0-6 Sun-Sat, only for weekly>,"hour":<0-23>,"minute":<0-59>,"onceDate":"<ISO datetime, only for freq once>","instructions":"<what to do on each run, self-contained>","output":"keak|telegram|email","outputTarget":"<email address if the output needs one, else empty>","tools":["perplexity"] if it needs live web research else []}
 Rules: default output "telegram" unless the user names keak/email. "5am" -> hour 5 minute 0; "5:30pm" -> hour 17 minute 30. "tomorrow at 3pm" or a specific date -> freq "once" with onceDate computed from the provided NOW. Repeats every day -> "daily"; a named weekday -> "weekly" + day (0=Sunday). Research / monitor / competitor / news / market tasks should include "perplexity" in tools. Return ONLY the JSON object.`;
-async function parseRoutineCommand(question: string): Promise<string | null> {
-  if (!looksLikeRoutineCommand(question)) return null;
+async function parseRoutineCommand(question: string, force = false): Promise<string | null> {
+  if (!force && !looksLikeRoutineCommand(question)) return null;
   const ai = resolveOwnAI();
   if (!ai) return null;
   let raw = "";
@@ -2156,8 +2218,9 @@ export default function Overlay() {
         ensureFillers(session.access_token); // refresh the cached clips for next time (no-op if unchanged)
 
         let image: string | undefined;
-        // Only capture when the user deliberately turned "See screen" on for THIS question.
-        const wantScreen = seeScreenRef.current;
+        // Capture when the user clicked "See screen" OR when their voice request clearly implies it.
+        const screenLookIntent = /\b(look at|see|check|read|what(?:'s| is) on|what do you see on|analyz[ae]|examine|capture|show me)\s*(my\s+)?(screen|display|desktop)\b|what'?s\s+on\s+(my\s+)?screen|look(ing)? at (my|the) screen/i.test(String(tData.text));
+        const wantScreen = seeScreenRef.current || (canSeeScreen && screenAllowed && screenLookIntent);
         if (wantScreen) {
           // Don't answer blind. If the screenshot fails, tell the user WHY instead of
           // silently pretending Keak has no eyes.
@@ -3419,7 +3482,12 @@ export default function Overlay() {
     try { const b = await getBrainContext(); if (b) ctx = `\n\nAbout ${userName} (use to be personal, never read aloud): ${b.slice(0, 700)}`; } catch { /* ignore */ }
     const mem = memoryBlock();
     const searchLine = localStorage.getItem("keak_brain_path") ? " If the user asks about their own notes, projects, people, or anything you are not sure of, call the search_second_brain tool to look it up before answering." : "";
-    return `You are ${assistantName}, ${userName}'s voice assistant, in a live spoken conversation. Reply in one or two short spoken sentences, warm and quick, plain text, no markdown.${searchLine}${langLine}${persona} ${personaLines()}${ctx}${mem ? mem.slice(0, 700) : ""}`;
+    // The live model must ACT, not just talk. Tell it exactly which tools do real work so it calls them instead
+    // of describing what it would do. do_task is the catch-all that runs the full assistant (screen, apps, agents).
+    const actLine = " You are not just a chatbot, you can take real actions with your tools. When the user asks you to DO something, actually call the tool instead of only talking about it: schedule_routine to schedule or set reminders, create_calendar_event to add calendar events, web_search for anything current or unknown, and do_task for anything that needs the computer, an app, their connected tools, their agents, email, or creating things (like finding and using an app to make images). Never say you can't do something, use do_task. After a tool runs, tell the user in one short sentence what you did.";
+    const teamRoster = [...effectiveDefaults(), ...readAgentRoster()];
+    const teamShort = teamRoster.length ? ` Your team of agents: ${teamRoster.map((a) => a.name).join(", ")}. Use do_task to put them to work, or the user can call one by name.` : "";
+    return `You are ${assistantName}, ${userName}'s voice assistant, in a live spoken conversation. Reply in one or two short spoken sentences, warm and quick, plain text, no markdown.${actLine}${teamShort}${searchLine}${langLine}${persona} ${personaLines()}${ctx}${mem ? mem.slice(0, 700) : ""}`;
   }
 
   // Start a REAL live Keak AI turn (Gemini Live / OpenAI Realtime): open the session, stream the mic, and
@@ -3434,19 +3502,71 @@ export default function Overlay() {
     liveFinishPendingRef.current = false;
     const instructions = await buildLiveSystem(); // lean prompt = faster first word
     const brainRoot = localStorage.getItem("keak_brain_path") || "";
+    // do_task hands the whole request to the full assistant engine (screen control, agents, email, apps,
+    // creating things) after this live turn. Guarded so it only fires once.
+    let handedOff = false;
+    const runHandoff = async (request: string, image?: string) => {
+      if (handedOff) return; handedOff = true;
+      let s = getSession(); if (s) s = await ensureFreshSession(s);
+      const tok = s?.access_token || "";
+      try { liveRef.current?.close(); } catch { /* noop */ }
+      liveActiveRef.current = false;
+      cancelAssistantClose();
+      await runAssistant(request, tok, image);
+    };
     const session = new LiveKeak(mode, info.provider, info.apiKey, instructions, {
-      // Let live Keak look things up in the Second Brain mid-answer (only when a folder is connected).
-      onToolCall: brainRoot ? async (name, args) => {
-        if (name !== "search_second_brain") return "Unknown tool.";
-        const q = String((args as { query?: unknown })?.query || "").trim();
-        if (localStorage.getItem("keak_show_captions") !== "0") setAiReply(`Searching your Second Brain for "${q}"...`);
+      // The live model can call tools mid-conversation to actually DO things. Each returns a short string that
+      // the model then speaks. Kept in sync with KEAK_TOOLS in liveKeak.ts.
+      onToolCall: async (name, args) => {
+        const A = (args || {}) as Record<string, unknown>;
+        const capOn = localStorage.getItem("keak_show_captions") !== "0";
         try {
-          const raw = await invoke<string>("sb_search", { args: { root: brainRoot, query: q, maxResults: 8 } });
-          const hits = JSON.parse(raw || "[]") as Array<{ path?: string; snippet?: string }>;
-          if (!Array.isArray(hits) || !hits.length) return `Nothing found in the Second Brain about "${q}".`;
-          return hits.slice(0, 8).map((h) => `${h.path || ""}: ${h.snippet || ""}`).join("\n").slice(0, 3000);
-        } catch (e) { return "Could not search the Second Brain: " + String(e).slice(0, 100); }
-      } : undefined,
+          if (name === "search_second_brain") {
+            if (!brainRoot) return "No Second Brain folder is connected, so I can't search it.";
+            const q = String(A.query || "").trim();
+            if (capOn) setAiReply(`Searching your Second Brain for "${q}"...`);
+            const raw = await invoke<string>("sb_search", { args: { root: brainRoot, query: q, maxResults: 8 } });
+            const hits = JSON.parse(raw || "[]") as Array<{ path?: string; snippet?: string }>;
+            if (!Array.isArray(hits) || !hits.length) return `Nothing found in the Second Brain about "${q}".`;
+            return hits.slice(0, 8).map((h) => `${h.path || ""}: ${h.snippet || ""}`).join("\n").slice(0, 3000);
+          }
+          if (name === "web_search") {
+            const q = String(A.query || "").trim();
+            if (capOn) setAiReply(`Searching the web for "${q}"...`);
+            const a = await askPerplexity(q) || await askTavily(q);
+            return a ? a.slice(0, 3000) : "Web search isn't connected. Add a Perplexity or Tavily key under AI tools to enable it.";
+          }
+          if (name === "schedule_routine") {
+            const req = String(A.request || "").trim();
+            if (capOn) setAiReply("Setting up that routine...");
+            const msg = await parseRoutineCommand(req, true);
+            return msg || "I couldn't set that up. Tell me when it should run and what it should do.";
+          }
+          if (name === "create_calendar_event") {
+            const title = String(A.title || "").trim() || "Event";
+            const start = new Date(String(A.start_iso || ""));
+            if (isNaN(start.getTime())) return "I need a valid date and time for the event.";
+            const end = A.end_iso && !isNaN(new Date(String(A.end_iso)).getTime()) ? new Date(String(A.end_iso)) : new Date(start.getTime() + 60 * 60 * 1000);
+            const ev = { title, start, end };
+            const whenTxt = start.toLocaleString(undefined, { weekday: "long", hour: "numeric", minute: "2-digit" });
+            if (capOn) setAiReply(`Adding ${title} to your calendar...`);
+            if (localStorage.getItem("keak_google_refresh") || msConnected()) {
+              const link = await createEventAnyProvider(ev);
+              if (link) return `Added "${title}" to the calendar for ${whenTxt}.`;
+            }
+            try { await invoke("open_url", { url: buildCalendarUrl(ev) }); return `Opened a prefilled calendar event, "${title}", for ${whenTxt}. Ask the user to hit save.`; }
+            catch { return "I couldn't open the calendar."; }
+          }
+          if (name === "do_task") {
+            const req = String(A.request || "").trim();
+            let shot = "";
+            try { shot = await invoke<string>("capture_screen"); } catch { /* ignore */ }
+            setTimeout(() => { void runHandoff(req, shot || undefined); }, 40);
+            return "On it, doing that now.";
+          }
+        } catch (e) { return "That didn't work: " + String(e).slice(0, 120); }
+        return "Unknown tool.";
+      },
       onListening: () => { setStateSafe("recording"); }, // listening again for your reply (conversation)
       onResponding: () => { setStateSafe("responding"); },
       onKeakText: (t) => { if (localStorage.getItem("keak_show_captions") !== "0") setAiReply(t); },
@@ -3461,6 +3581,7 @@ export default function Overlay() {
       onClosed: () => {
         liveActiveRef.current = false;
         emitTo("orb", "orb-idle").catch(() => {});
+        try { invoke("hide_agents"); } catch { /* ignore */ }
         setStateSafe("idle");
         scheduleAssistantClose(6000);
       },
@@ -3473,6 +3594,7 @@ export default function Overlay() {
     }, true); // conversation mode: keep the chat going without pressing Ctrl+Alt again
     liveRef.current = session;
     setStateSafe("recording");
+    try { await invoke("show_agents"); } catch { /* ignore */ }
     await session.open();
     if (liveFinishPendingRef.current) { liveFinishPendingRef.current = false; session.finishTurn(); } // release came during setup
     return true;
@@ -3504,7 +3626,18 @@ export default function Overlay() {
     // user can still raise it in Settings or by voice). This is the biggest speed win for Claude answers.
     const chatEffort = provider === "claude" ? (localStorage.getItem("keak_cu_claude_effort") || "low") : "";
 
-    const system = await buildAssistantSystem();
+    let system = await buildAssistantSystem();
+    // If the user says "use the [skill name] skill", inject its content into the system prompt.
+    const skillMatch = question.match(/\buse\s+(?:the\s+)?([a-zA-Z0-9 _-]+?)\s+skill\b/i);
+    if (skillMatch) {
+      const slug = skillMatch[1].trim().toLowerCase().replace(/\s+/g, "-");
+      let skillContent = localStorage.getItem(`keak_marketplace_skill_${slug}`) || "";
+      if (!skillContent) {
+        const root = localStorage.getItem("keak_brain_path") || "";
+        if (root) { try { skillContent = await invoke<string>("sb_read", { args: { root, path: `AI/skills/${slug}/SKILL.md` } }); } catch { /* not found */ } }
+      }
+      if (skillContent) system += `\n\nThe user wants you to use the "${slug}" skill. Follow its instructions:\n${skillContent.slice(0, 6000)}`;
+    }
     // Claude requires messages that start with "user" and strictly alternate. Trim any leading assistant
     // turn and trailing user turn from recent history before we append the new question, or Claude 400s.
     let hist = historyRef.current.slice(-4); // fewer turns = fewer tokens = it starts answering sooner
@@ -3513,6 +3646,10 @@ export default function Overlay() {
     const history = hist.map((h) => ({ role: h.role === "assistant" ? "assistant" : "user", content: h.text }));
     let reply = "";
     const callChat = (m: string) => invoke<string>("cu_chat", { args: { provider, credential, accountId, isSubscription: isSub, model: m, effort: chatEffort, system, history, message: question } });
+    // Free local model, used automatically if the connected AI runs out of usage or its login expires.
+    const localModel = localFallbackModel();
+    const callLocal = () => invoke<string>("cu_chat", { args: { provider: "ollama", credential: "local", accountId: "", isSubscription: false, model: localModel, effort: "", system, history, message: question } });
+    let usedLocal = false;
     try {
       reply = await callChat(chatModel);
     } catch (e) {
@@ -3521,11 +3658,21 @@ export default function Overlay() {
       // Haiku so even a basic question still gets answered instead of failing.
       if (/\b429\b|rate.?limit/i.test(msg) && provider === "claude" && !chatModel.includes("haiku")) {
         try { reply = await callChat("claude-haiku-4-5"); }
-        catch (e2) { return { answered: false, error: String(e2).slice(0, 180) }; }
+        catch (e2) {
+          if (localModel && isExhaustedOrExpired(String(e2))) {
+            try { reply = await callLocal(); usedLocal = true; } catch { return { answered: false, error: String(e2).slice(0, 180) }; }
+          } else return { answered: false, error: String(e2).slice(0, 180) };
+        }
+      } else if (provider !== "ollama" && localModel && isExhaustedOrExpired(msg)) {
+        // Out of credits / quota, or the login expired → keep working on the free local model.
+        console.log("[KEAK] Keak AI provider out/expired, switching to local model:", msg.slice(0, 120));
+        try { reply = await callLocal(); usedLocal = true; } catch { return { answered: false, error: msg.slice(0, 180) }; }
       } else {
         return { answered: false, error: msg.slice(0, 180) };
       }
     }
+    // Let the user know it quietly switched, so a change in answer quality isn't a mystery.
+    if (usedLocal) { try { emitTo("connect", "keak-toast", { text: "Your AI ran out, so I switched to your local model." }).catch(() => {}); } catch { /* noop */ } }
     reply = cleanReply(reply || "");
     if (!reply) return { answered: false, error: "your AI returned an empty reply" };
     historyRef.current.push({ role: "user", text: question }, { role: "assistant", text: reply });

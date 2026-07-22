@@ -2,14 +2,6 @@ import { useState, useEffect, useRef, type ReactNode, type CSSProperties } from 
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import keakLogo from "./assets/icon_keak_2.png";
-// Real AI-provider logos (Pep's own files). Gemini keeps its inline SVG spark.
-import provClaude from "./assets/providers/claude.png";
-import provOpenai from "./assets/providers/openai.png";
-import provCopilot from "./assets/providers/copilot.png";
-import provGrok from "./assets/providers/grok.png";
-import provDeepseek from "./assets/providers/deepseek.png";
-import provMistral from "./assets/providers/mistral.png";
-import provOllama from "./assets/providers/ollama.png";
 import { effectiveDefaults, saveDefaultOverride, resetDefaultOverride, readDefaultOverrides, type EffectiveAgent } from "./agents-defaults";
 import { AI_TOOLS, getToolKey, setToolKey, toolConnected, assignableForAgents, CONN_ICON } from "./integrations";
 import { readRoutines, upsertRoutine, removeRoutine, newRoutineId, nextRunLabel, type Routine } from "./routines";
@@ -301,7 +293,7 @@ function chatToolSystem(base: string, root: string, perm: string, tree: string, 
     : `No Second Brain folder is connected right now, but you can still create standalone artifact files for the user. `;
   return `${base}
 
-You are an agent with tools, and you CAN read files, search, create files, edit files${webOn ? ", search the live web" : ""}, and produce artifacts (HTML pages, documents, reports, notes, CSV/JSON data, SVG, etc.). NEVER tell the user you are unable to create a file, a document, a PDF, or a website. You create them with the tools below.
+You are an agent with tools, and you CAN read files, search, create files, edit files${webOn ? ", search the live web" : ""}, and produce artifacts (HTML pages, documents, reports, notes, CSV/JSON data, SVG, etc.). NEVER tell the user you are unable to create a file, a document, a PDF, or a website. You create them with the tools below. When the user names a skill (like /watch, or any skill saved in their Second Brain), FIRST use search + read to find that skill's SKILL.md in the connected folder, read it, and follow its steps with your tools. You can use ANYTHING in the connected folder: skills, notes, projects, files. If one step needs something you genuinely cannot do (download or watch a video, run code, control another app), do every part you CAN${webOn ? ", use web search where it helps," : ","} and clearly say the single part you couldn't, then still deliver a useful result. Never refuse and never dead-end.
 
 ${folder}To use a tool, reply with ONLY a single JSON object and nothing else (no prose, no code fences):
 {"tool":"list","path":"folder or empty for the root"}
@@ -502,6 +494,8 @@ const MODEL_CHOICES: { value: string; label: string }[] = [
   { value: "xai|grok-3", label: "Grok · 3" },
   { value: "deepseek|deepseek-chat", label: "DeepSeek · Chat" },
   { value: "deepseek|deepseek-reasoner", label: "DeepSeek · Reasoner" },
+  { value: "kimi|kimi-k3", label: "Kimi · K3" },
+  { value: "kimi|kimi-k2-0711-preview", label: "Kimi · K2" },
   { value: "mistral|mistral-large-latest", label: "Mistral · Large" },
   { value: "ollama|", label: "Local (Ollama)" },
 ];
@@ -518,6 +512,7 @@ function modelContextLimit(choice: string): number {
   if (prov === "gemini") return 1000000;
   if (prov === "xai") return 131072;
   if (prov === "deepseek") return 65536;
+  if (prov === "kimi") return 131072;
   if (prov === "mistral") return 128000;
   if (prov === "ollama") return 8192;
   if (prov === "copilot") return 128000;
@@ -555,6 +550,7 @@ function connectedModelChoices(): { value: string; label: string }[] {
     copilot: has("keak_cu_copilot_token"),
     xai: has("keak_cu_xai_key"),
     deepseek: has("keak_cu_deepseek_key"),
+    kimi: has("keak_cu_kimi_key"),
     mistral: has("keak_cu_mistral_key"),
   };
   const out: { value: string; label: string }[] = [{ value: "", label: "Default AI" }];
@@ -692,18 +688,23 @@ const NAV_ICONS: Record<string, ReactNode> = {
 // monochrome (currentColor) so they always sit in the Keak palette.
 const PROVIDER_MARKS: Record<string, ReactNode> = {
   // Real brand logos from Pep's files, shown in white app-icon tiles (see .cx-provider-logo).
-  claude: <img className="cx-provider-logo" src={provClaude} alt="" />,
-  openai: <img className="cx-provider-logo" src={provOpenai} alt="" />,
+  claude: <img className="cx-provider-logo" src="/logos/claude.png" alt="" />,
+  openai: <img className="cx-provider-logo" src="/logos/openai.png" alt="" />,
   gemini: ( // four-point spark — kept as SVG (Pep confirmed this one is good)
     <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
       <path d="M12 2.4c.85 5.1 4.5 8.75 9.6 9.6-5.1.85-8.75 4.5-9.6 9.6-.85-5.1-4.5-8.75-9.6-9.6 5.1-.85 8.75-4.5 9.6-9.6z" />
     </svg>
   ),
-  copilot: <img className="cx-provider-logo" src={provCopilot} alt="" />,
-  xai: <img className="cx-provider-logo" src={provGrok} alt="" />,
-  deepseek: <img className="cx-provider-logo" src={provDeepseek} alt="" />,
-  mistral: <img className="cx-provider-logo" src={provMistral} alt="" />,
-  ollama: <img className="cx-provider-logo" src={provOllama} alt="" />,
+  copilot: <img className="cx-provider-logo" src="/logos/copilot.png" alt="" />,
+  xai: <img className="cx-provider-logo" src="/logos/xai.png" alt="" />,
+  deepseek: <img className="cx-provider-logo" src="/logos/deepseek.png" alt="" />,
+  kimi: ( // crescent moon — Moonshot AI / Kimi mark
+    <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+      <path d="M12 3a9 9 0 1 0 9 9 7 7 0 1 1-9-9z" />
+    </svg>
+  ),
+  mistral: <img className="cx-provider-logo" src="/logos/mistral.png" alt="" />,
+  ollama: <img className="cx-provider-logo" src="/logos/ollama.png" alt="" />,
 };
 
 // The provider cards in "Your AI" — same ids the pickProvider handler expects.
@@ -714,6 +715,7 @@ const PROVIDER_CARDS: { id: string; name: string }[] = [
   { id: "copilot", name: "Copilot" },
   { id: "xai", name: "Grok" },
   { id: "deepseek", name: "DeepSeek" },
+  { id: "kimi", name: "Kimi" },
   { id: "mistral", name: "Mistral" },
   { id: "ollama", name: "Local" },
 ];
@@ -733,7 +735,7 @@ const ATK_FX_CLASSES = [
 ];
 const ATK_WIND_UP: Record<string, string> = {
   ollama: "lunge", claude: "burst", openai: "spin", gemini: "shoot",
-  copilot: "slam", xai: "jab", mistral: "fling", deepseek: "wave",
+  copilot: "slam", xai: "jab", mistral: "fling", deepseek: "wave", kimi: "sweep",
 };
 
 function playProviderAttack(grid: HTMLElement | null, id: string): () => void {
@@ -973,6 +975,7 @@ export default function Connect() {
   const [deepseekKey, setDeepseekKey] = useState<string>(() => localStorage.getItem("keak_cu_deepseek_key") || "");
   const [mistralKey, setMistralKey] = useState<string>(() => localStorage.getItem("keak_cu_mistral_key") || "");
   const [xaiKey, setXaiKey] = useState<string>(() => localStorage.getItem("keak_cu_xai_key") || "");
+  const [kimiKey, setKimiKey] = useState<string>(() => localStorage.getItem("keak_cu_kimi_key") || "");
   const [copilotToken, setCopilotToken] = useState<string>(() => localStorage.getItem("keak_cu_copilot_token") || "");
   const [copilotBusy, setCopilotBusy] = useState<boolean>(false);
   // "Saved" flags decide whether to show the connected card. They must be separate from the input state
@@ -985,6 +988,7 @@ export default function Connect() {
   const [deepseekSaved, setDeepseekSaved] = useState<boolean>(() => !!localStorage.getItem("keak_cu_deepseek_key"));
   const [mistralSaved, setMistralSaved] = useState<boolean>(() => !!localStorage.getItem("keak_cu_mistral_key"));
   const [xaiSaved, setXaiSaved] = useState<boolean>(() => !!localStorage.getItem("keak_cu_xai_key"));
+  const [kimiSaved, setKimiSaved] = useState<boolean>(() => !!localStorage.getItem("keak_cu_kimi_key"));
   // Local models the user has actually pulled (from `ollama list`), so we only offer those.
   const [ollamaModels, setOllamaModels] = useState<string[]>([]);
   const [ollamaLoading, setOllamaLoading] = useState<boolean>(false);
@@ -1223,14 +1227,18 @@ export default function Connect() {
   function stopChat() { chatReqRef.current++; setChatBusy(false); setChatStatus(""); setQuotePop(null); }
   // Discover the skills inside the connected Second Brain (AI/skills/<name>/SKILL.md) for the /skill command.
   async function loadBrainSkills() {
-    const root = localStorage.getItem("keak_brain_path") || "";
+    const root = localStorage.getItem("keak_brain_path") || brainPath || "";
     if (!root) { setBrainSkills([]); return; }
     try {
       const raw = await invoke<string>("sb_tree", { args: { root, maxDepth: 3, maxEntries: 900 } });
       const items = JSON.parse(raw) as string[];
       const names = items.filter((p) => /^AI\/skills\/[^/]+\/SKILL\.md$/i.test(p)).map((p) => p.split("/")[2]);
-      setBrainSkills(Array.from(new Set(names)));
-    } catch { setBrainSkills([]); }
+      const mpSkills = JSON.parse(localStorage.getItem("keak_activated_skills") || "[]") as string[];
+      setBrainSkills(Array.from(new Set([...names, ...mpSkills])));
+    } catch {
+      const mpSkills = JSON.parse(localStorage.getItem("keak_activated_skills") || "[]") as string[];
+      setBrainSkills(mpSkills);
+    }
   }
   function newChat() {
     const now = Date.now();
@@ -1381,8 +1389,15 @@ export default function Connect() {
       if (root) { try { tree = await invoke<string>("sb_tree", { args: { root, maxDepth: 2, maxEntries: 300 } }); } catch { /* ignore */ } }
       let base = chatSystem(agent || undefined);
       if (run.goal) base += `\n\nThe user's goal for this whole chat: ${run.goal}`;
-      if (run.skill && root) {
-        try { const sk = await invoke<string>("sb_read", { args: { root, path: `AI/skills/${run.skill}/SKILL.md` } }); if (sk) base += `\n\nYou are using the "${run.skill}" skill from the user's Second Brain. Follow it:\n${sk.slice(0, 6000)}`; } catch { /* skill missing */ }
+      if (run.skill) {
+        let skillContent = "";
+        if (root) {
+          try { skillContent = await invoke<string>("sb_read", { args: { root, path: `AI/skills/${run.skill}/SKILL.md` } }); } catch { /* missing from brain */ }
+        }
+        if (!skillContent) {
+          skillContent = localStorage.getItem(`keak_marketplace_skill_${run.skill}`) || "";
+        }
+        if (skillContent) base += `\n\nYou are using the "${run.skill}" skill. Follow it:\n${skillContent.slice(0, 6000)}`;
       }
       const webOn = !!localStorage.getItem("keak_tool_perplexity");
       // Connected MCP servers: discover each one's tools (cached after first use) and advertise them to the model.
@@ -1408,7 +1423,7 @@ export default function Connect() {
       let finalText = "";
       const artifacts: ChatArtifact[] = [];
       const seen = new Set<string>(); // stop the model looping on the same read/search forever
-      const MAX = 8;
+      const MAX = 18;
       for (let step = 0; step < MAX; step++) {
         if (reqId !== chatReqRef.current) return; // the user hit Stop
         const message = convo[convo.length - 1].content;
@@ -1443,9 +1458,19 @@ export default function Connect() {
         if (reqId !== chatReqRef.current) return;
         if (artifact) artifacts.push(artifact);
         convo.push({ role: "user", content: `TOOL RESULT (${tool.tool}): ${result}` });
-        if (step === MAX - 1 && !finalText) finalText = artifacts.length ? `${t("Done.")} ${artifacts.map((a) => a.label).join(", ")}` : t("I gathered what I could, but ran out of steps. Ask me to continue.");
       }
       if (reqId !== chatReqRef.current) return;
+      // Out of tool steps and no answer yet: force ONE final call that answers directly (no tools) using
+      // everything gathered, so the chat never dead-ends with "ran out of steps".
+      if (!finalText) {
+        try {
+          const synthSys = system + "\n\nYou are OUT of tool steps now. Do NOT output a tool call or JSON. Answer the user directly and fully using everything above. If you could not fully do one part (e.g. watch a video or run code), do every part you CAN and briefly note the single part you couldn't, then give the best result you can.";
+          const synth = await invoke<string>("cu_chat", { args: { provider: ai.provider, credential: ai.credential, accountId: ai.accountId, isSubscription: ai.isSub, model: ai.model, effort: ai.effort, system: synthSys, history: convo.slice(0, -1), message: convo[convo.length - 1].content } });
+          if (reqId !== chatReqRef.current) return;
+          finalText = (synth || "").trim();
+        } catch { /* fall through to a minimal message */ }
+        if (!finalText) finalText = artifacts.length ? `${t("Done.")} ${artifacts.map((a) => a.label).join(", ")}` : t("I gathered what I could. Ask me to continue.");
+      }
       const asst: ChatMsg = { role: "assistant", text: finalText || "…", ts: Date.now(), artifacts: artifacts.length ? artifacts : undefined };
       persistHistory([{ ...withUser, messages: [...withUser.messages!, asst], ts: Date.now() }, ...rest]); setSelectedRun(0);
     } catch (e) {
@@ -2018,6 +2043,8 @@ export default function Connect() {
     localStorage.setItem("keak_telegram_token", tok);
     localStorage.removeItem("keak_telegram_chat"); // re-bind to whoever messages the bot first (that's you)
     setTelegramConnected(true); setConnectMsg(t("Telegram connected. Message your bot from your phone to link it."));
+    // Give the fresh bot the Keak logo as its profile picture (best-effort; ignored if Telegram declines).
+    invoke("telegram_set_photo", { token: tok }).catch(() => { /* user can still set it via BotFather */ });
   }
   function disconnectTelegram() {
     ["keak_telegram_token", "keak_telegram_chat"].forEach((k) => localStorage.removeItem(k));
@@ -2068,6 +2095,7 @@ export default function Connect() {
   function chooseStreamMode(v: string) { setStreamMode(v); localStorage.setItem("keak_streaming", v); }
   // At-cursor live typing is deferred to the proper streaming engine; normalise any old "cursor" setting.
   useEffect(() => { const v = localStorage.getItem("keak_streaming"); if (v && v !== "off" && v !== "pill") localStorage.setItem("keak_streaming", "pill"); }, []);
+  useEffect(() => { if (activeSection === "work" && localStorage.getItem("keak_brain_path")) loadBrainSkills(); }, [activeSection]);
   // Team-to-team (Telegram group): your name in the group + what an incoming task can use + a live log.
   const [teamName, setTeamName] = useState<string>(() => localStorage.getItem("keak_team_name") || localStorage.getItem("keak_user_name") || "");
   const [teamAccess, setTeamAccess] = useState<string>(() => localStorage.getItem("keak_team_access") || "ai");
@@ -2288,6 +2316,8 @@ export default function Connect() {
   function disconnectMistral() { localStorage.setItem("keak_cu_mistral_key", ""); setMistralKey(""); setMistralSaved(false); setConnectMsg(t("Mistral disconnected.")); }
   function saveXaiKey() { const v = xaiKey.trim(); localStorage.setItem("keak_cu_xai_key", v); setXaiSaved(!!v); setConnectMsg(v ? t("Grok connected.") : t("Cleared.")); }
   function disconnectXai() { localStorage.setItem("keak_cu_xai_key", ""); setXaiKey(""); setXaiSaved(false); setConnectMsg(t("Grok disconnected.")); }
+  function saveKimiKey() { const v = kimiKey.trim(); localStorage.setItem("keak_cu_kimi_key", v); setKimiSaved(!!v); setConnectMsg(v ? t("Kimi connected.") : t("Cleared.")); }
+  function disconnectKimi() { localStorage.setItem("keak_cu_kimi_key", ""); setKimiKey(""); setKimiSaved(false); setConnectMsg(t("Kimi disconnected.")); }
 
   // Copilot: the user runs `copilot /login` in a terminal, then we read the token its CLI stored.
   async function connectCopilot() {
@@ -2433,6 +2463,7 @@ export default function Connect() {
   const kxCosmosRef = useRef<HTMLDivElement | null>(null);
   const kxSceneRef = useRef<HTMLDivElement | null>(null);
   const kxTrailRef = useRef<HTMLDivElement | null>(null);
+  const kxMoonCursorRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
     if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
     let raf = 0;
@@ -2495,6 +2526,59 @@ export default function Connect() {
     };
   }, []);
 
+  // The cursor IS a moon (Sirius-coloured, like the agent moons). It eases toward the pointer, and when it
+  // drifts near the Keak planet it locks into ORBIT and circles the planet on its own — like being one of
+  // its moons — until the pointer pulls away again. Purely presentational; pointer-events:none so it never
+  // blocks a click. Off under prefers-reduced-motion (the native cursor stays). Remove this effect + the
+  // .kx-cursor-moon div + CSS to drop the feature.
+  useEffect(() => {
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+    const moon = kxMoonCursorRef.current;
+    if (!moon) return;
+    let px = window.innerWidth / 2, py = window.innerHeight / 2; // pointer target
+    let mx = px, my = py;                                        // rendered moon position (eased)
+    let orbiting = false, angle = 0, over = false, seen = false, raf = 0;
+    const ENTER = 148, EXIT = 250, ORB = 116, SPEED = 0.036;      // orbit geometry
+    const onMove = (e: PointerEvent) => {
+      px = e.clientX; py = e.clientY; seen = true;
+      moon.style.opacity = "1";
+      const el = e.target as Element | null;
+      over = !!(el && el.closest && el.closest("button, a, [role=button], input, select, textarea, .cx-card, .cx-provider, .cx-conn, .cx-nav-item, label, .kx-moon"));
+    };
+    const onLeaveWin = () => { moon.style.opacity = "0"; };
+    const loop = () => {
+      if (seen) {
+        const scene = kxSceneRef.current;
+        let cx = -1e5, cy = -1e5;
+        if (scene) { const r = scene.getBoundingClientRect(); cx = r.left + r.width / 2; cy = r.top + r.height / 2; }
+        const dist = Math.hypot(px - cx, py - cy);
+        if (over) orbiting = false; // hovering something clickable (e.g. an agent moon) → drop orbit so you can aim + see its name
+        else if (!orbiting && dist < ENTER) { orbiting = true; angle = Math.atan2(my - cy, mx - cx); }
+        else if (orbiting && dist > EXIT) orbiting = false;
+        if (orbiting) {
+          angle += SPEED;
+          const tx = cx + Math.cos(angle) * ORB, ty = cy + Math.sin(angle) * ORB;
+          mx += (tx - mx) * 0.26; my += (ty - my) * 0.26;
+        } else {
+          mx += (px - mx) * 0.30; my += (py - my) * 0.30;
+        }
+        const scale = orbiting ? 0.8 : over ? 1.35 : 1;
+        moon.style.transform = `translate(${mx.toFixed(2)}px, ${my.toFixed(2)}px) translate(-50%, -50%) scale(${scale})`;
+        moon.classList.toggle("kx-cursor-moon--orbit", orbiting);
+        moon.classList.toggle("kx-cursor-moon--over", over && !orbiting);
+      }
+      raf = requestAnimationFrame(loop);
+    };
+    raf = requestAnimationFrame(loop);
+    window.addEventListener("pointermove", onMove, { passive: true });
+    document.documentElement.addEventListener("pointerleave", onLeaveWin);
+    return () => {
+      window.removeEventListener("pointermove", onMove);
+      document.documentElement.removeEventListener("pointerleave", onLeaveWin);
+      if (raf) cancelAnimationFrame(raf);
+    };
+  }, []);
+
   // Provider attack show — purely presentational. We only WATCH cuProvider
   // change (pickProvider and its logic are untouched); the newly chosen card
   // then plays its signature move over the grid. Debounced; self-cleaning.
@@ -2543,6 +2627,8 @@ export default function Connect() {
           remove themselves on animationend; delete this div + the effect +
           the .kx-mote CSS to drop the feature entirely */}
       <div className="kx-trail" aria-hidden="true" ref={kxTrailRef} />
+      {/* The cursor, as a Sirius-coloured moon that orbits the Keak planet when it gets close. */}
+      <div className="kx-cursor-moon" aria-hidden="true" ref={kxMoonCursorRef} />
       <div className="connect-view connect-view--full">
         <div className="connect-layout">
           <aside className="cx-sidebar">
@@ -2933,6 +3019,36 @@ export default function Connect() {
                   <option value="">{t("Default (Mistral Large)")}</option>
                   <option value="mistral-large-latest">Mistral Large</option>
                   <option value="mistral-small-latest">{t("Mistral Small — faster")}</option>
+                </select>
+              </div>
+            </div>
+          )}
+
+          {cuProvider === "kimi" && (
+            <div className="cx-body">
+              {kimiSaved ? (
+                <div className="cx-connected">
+                  <div className="cx-check"><CheckIcon /></div>
+                  <div className="cx-connected-name">{t("Kimi connected")}</div>
+                  <div className="cx-connected-hint">{t("Your Moonshot AI key is powering Keak.")}</div>
+                  <button className="cx-btn cx-btn--ghost cx-btn--sm" onClick={disconnectKimi}>{t("Disconnect")}</button>
+                </div>
+              ) : (
+                <>
+                  <p className="cx-help">{t("Kimi K2 is one of the best cost-performance models available. Get a key from the Moonshot AI platform, then paste it below.")}</p>
+                  <button className="cx-btn cx-btn--ghost cx-btn--sm" onClick={() => openUrl("https://platform.moonshot.cn/console/api-keys")}>{t("Get an API key")}</button>
+                  <input className="cx-input" type="password" placeholder={t("Moonshot AI API key")} value={kimiKey} onChange={(e) => setKimiKey(e.target.value)} />
+                  <button className="cx-btn" onClick={saveKimiKey}>{t("Save key")}</button>
+                </>
+              )}
+
+              <div className="cx-field">
+                <label className="cx-field-label">{t("Model")}</label>
+                <select className="cx-select" defaultValue={localStorage.getItem("keak_cu_kimi_model") || ""} onChange={(e) => saveModel("kimi", e.target.value, () => {})}>
+                  <option value="">{t("Default (Kimi K3)")}</option>
+                  <option value="kimi-k3">Kimi K3</option>
+                  <option value="kimi-k2-0711-preview">Kimi K2</option>
+                  <option value="kimi-1.5">{t("Kimi 1.5 — faster")}</option>
                 </select>
               </div>
             </div>
@@ -4288,6 +4404,7 @@ export default function Connect() {
           </div>
             </section>
             )}
+
 
 
             {activeSection === "help" && (
