@@ -1285,10 +1285,9 @@ export default function Connect() {
   });
   const [connectMsg, setConnectMsg] = useState<string>("");
   const [activeSection, setActiveSection] = useState<string>("ai");
-  // First-run Setup: shown once, the first time the Connect window opens, before the full
-  // multi-section window. Dismissed for good by setting keak_setup_done.
-  const [showSetup, setShowSetup] = useState<boolean>(() => localStorage.getItem("keak_setup_done") !== "1");
-  function finishSetup() { localStorage.setItem("keak_setup_done", "1"); setShowSetup(false); }
+  // SetupScreen disabled — OS language is auto-detected via getUiLang() → navigator.language.
+  const showSetup = false;
+  function finishSetup() { localStorage.setItem("keak_setup_done", "1"); }
   // When the keak.app dashboard's "Keak AI" button opens this window (via the desktop bridge), land on the chat.
   useEffect(() => {
     const un = listen("keak-open-work", () => setActiveSection("work"));

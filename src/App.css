@@ -22,6 +22,7 @@ body {
   height: 100vh;
   overflow: hidden;
   -webkit-font-smoothing: antialiased;
+  cursor: default;
 }
 
 #root { height: 100vh; }
