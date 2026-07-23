@@ -3642,6 +3642,200 @@ async fn stt_download_engine(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+// ── Listening orb window — small transparent pill shown during PTT recording ─────────────────────────
+// A dedicated 220×64 chromeless window that floats near the bottom of the screen. Created lazily on
+// first call; subsequent calls just show/hide it so the DOM stays alive and the animation keeps running.
+#[tauri::command]
+fn show_listening_orb(app: AppHandle) {
+    if let Some(w) = app.get_webview_window("listening-orb") {
+        let _ = w.show();
+        return;
+    }
+    let primary_pos: (f64, f64) = app.get_webview_window("overlay")
+        .and_then(|w| w.primary_monitor().ok().flatten())
+        .map(|m| {
+            let sf = m.scale_factor();
+            let sz = m.size();
+            let x = (sz.width as f64 / sf / 2.0) - 110.0;
+            let y = (sz.height as f64 / sf) - 120.0 - 64.0;
+            (x, y)
+        })
+        .unwrap_or((760.0, 820.0));
+    let _ = tauri::WebviewWindowBuilder::new(
+        &app,
+        "listening-orb",
+        tauri::WebviewUrl::App("orb/index.html".into()),
+    )
+    .title("Keak")
+    .inner_size(220.0, 64.0)
+    .position(primary_pos.0, primary_pos.1)
+    .decorations(false)
+    .transparent(true)
+    .always_on_top(true)
+    .skip_taskbar(true)
+    .resizable(false)
+    .focused(false)
+    .build();
+}
+
+#[tauri::command]
+fn hide_listening_orb(app: AppHandle) {
+    if let Some(w) = app.get_webview_window("listening-orb") {
+        let _ = w.hide();
+    }
+}
+
+// Write the recorded audio (base64 webm) to a temp file and return its path. No network at all — pure
+// disk I/O, which always works. The frontend then hands this path to the whisper server via a GET
+// (GET works from the app; POST does not — blocked by security software/proxy on the app process).
+#[tauri::command]
+fn save_temp_audio(audio: String, language: String) -> Result<String, String> {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let bytes = STANDARD
+        .decode(audio.as_bytes())
+        .map_err(|e| format!("decode audio: {e}"))?;
+    let dir = std::env::temp_dir();
+    let webm = dir.join("keak_job.webm");
+    let result = dir.join("keak_job.result.json");
+    let request = dir.join("keak_job.request");
+    // Clear any stale result from a previous job so the poll can't read an old transcript.
+    let _ = std::fs::remove_file(&result);
+    // Write the audio first, THEN the request marker — the server watcher only fires on the marker, so the
+    // audio is always fully written before it's read. The marker's contents are the forced language ("" = auto).
+    std::fs::write(&webm, &bytes).map_err(|e| format!("write audio: {e}"))?;
+    std::fs::write(&request, language.as_bytes()).map_err(|e| format!("write request: {e}"))?;
+    Ok(result.to_string_lossy().to_string())
+}
+
+// Read the transcription result file the whisper server wrote (and delete it). Returns None until it
+// exists. The app polls this instead of reading an HTTP response, which is unreliable on this machine.
+#[tauri::command]
+fn read_result_file(path: String) -> Option<String> {
+    let content = std::fs::read_to_string(&path).ok()?;
+    let _ = std::fs::remove_file(&path);
+    Some(content)
+}
+
+// (kept for reference / future use) Transcribe via the local whisper server FROM RUST using reqwest.
+// Unreliable in practice: the app process's outbound POST to localhost is blocked (security software /
+// proxy), so this returns "error sending request". The file+GET path via save_temp_audio is used instead.
+#[tauri::command]
+async fn stt_transcribe(audio: String, language: String) -> Result<String, String> {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let bytes = STANDARD
+        .decode(audio.as_bytes())
+        .map_err(|e| format!("decode audio: {e}"))?;
+    let boundary = "KeakBoundary7fZ2x9Qk";
+    let mut body: Vec<u8> = Vec::with_capacity(bytes.len() + 512);
+    body.extend_from_slice(
+        format!("--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"rec.webm\"\r\nContent-Type: audio/webm\r\n\r\n").as_bytes(),
+    );
+    body.extend_from_slice(&bytes);
+    body.extend_from_slice(
+        format!("\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"language\"\r\n\r\n{language}\r\n--{boundary}--\r\n").as_bytes(),
+    );
+    // .no_proxy() is critical: without it reqwest routes 127.0.0.1 through the Windows system proxy and
+    // hangs forever. connect_timeout fails fast if the server is down; the overall timeout covers slow CPU
+    // transcription.
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .map_err(|e| format!("client: {e}"))?;
+    let resp = client
+        .post("http://127.0.0.1:9889/transcribe")
+        .header("Content-Type", format!("multipart/form-data; boundary={boundary}"))
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| format!("connect: {e}"))?;
+    resp.text().await.map_err(|e| format!("read: {e}"))
+}
+
+// ── PTT mode toggle — "hold" (default) vs "tap" ───────────────────────────────────────────────────────
+// In tap mode the first Ctrl+Win press starts recording; the second press stops it. Persisted in the
+// ptt_watch module's own atomics so the poller thread can read it without any cross-module state.
+#[tauri::command]
+fn set_ptt_mode(mode: String) {
+    ptt_watch::set_tap_mode(mode == "tap");
+}
+
+// ── Sovereign model helpers — ggml Whisper model download + status ───────────────────────────────────
+// The keak-stt sidecar expects the model file at {app_data_dir}/keak-stt/ggml-large-v3-turbo-q5_0.bin.
+// stt_model_status reports whether it's present and how large it is. stt_download_model streams it from
+// HuggingFace and emits progress events so the frontend can show a progress bar.
+
+fn sovereign_model_path(app: &AppHandle) -> Option<std::path::PathBuf> {
+    app.path().app_data_dir().ok().map(|d| {
+        d.join("keak-stt").join("ggml-large-v3-turbo-q5_0.bin")
+    })
+}
+
+#[tauri::command]
+fn stt_model_status(app: AppHandle) -> serde_json::Value {
+    match sovereign_model_path(&app) {
+        Some(p) => {
+            let present = p.exists();
+            let size_mb = if present {
+                std::fs::metadata(&p).map(|m| m.len() as f64 / 1_000_000.0).unwrap_or(0.0)
+            } else {
+                0.0
+            };
+            serde_json::json!({ "present": present, "path": p.to_string_lossy(), "size_mb": size_mb })
+        }
+        None => serde_json::json!({ "present": false, "path": "", "size_mb": 0.0 }),
+    }
+}
+
+#[tauri::command]
+async fn stt_health() -> bool {
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    client.get("http://127.0.0.1:9889/health").send().await
+        .map(|r| r.status().is_success())
+        .unwrap_or(false)
+}
+
+#[tauri::command]
+async fn stt_download_model(app: AppHandle) -> Result<(), String> {
+    use futures_util::StreamExt;
+    let dest = sovereign_model_path(&app).ok_or("No app data directory")?;
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let url = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin";
+    let _ = app.emit("stt-model-progress", serde_json::json!({ "pct": 0.0 }));
+    let client = reqwest::Client::new();
+    let resp = client.get(url).send().await.map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("Download failed ({})", resp.status()));
+    }
+    let total = resp.content_length().unwrap_or(0);
+    let tmp = dest.with_extension("part");
+    let mut file = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
+    let mut downloaded: u64 = 0;
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| e.to_string())?;
+        std::io::Write::write_all(&mut file, &chunk).map_err(|e| e.to_string())?;
+        downloaded += chunk.len() as u64;
+        if total > 0 {
+            let pct = (downloaded as f64 / total as f64) * 100.0;
+            let _ = app.emit("stt-model-progress", serde_json::json!({ "pct": pct }));
+        }
+    }
+    drop(file);
+    std::fs::rename(&tmp, &dest).map_err(|e| e.to_string())?;
+    let _ = app.emit("stt-model-progress", serde_json::json!({ "pct": 100.0 }));
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let mut builder = tauri::Builder::default();
@@ -3809,7 +4003,7 @@ pub fn run() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![open_url, inject_text, hide_overlay, show_main, show_agents, hide_agents, save_artifact, restore_clipboard, capture_selection, capture_screen, send_browser_command, capture_screen_full, mouse_click, mouse_move, cursor_pos, type_text, mouse_scroll, press_key, openai_login_start, openai_login_poll, cu_step, cu_chat, copilot_read_cli_token, ollama_list_models, pick_folder, set_autostart, get_autostart, whatsapp_send, sb_tree, sb_read, sb_write, sb_mkdir, sb_delete, sb_search, sb_graph, openai_tts, gemini_tts, google_connect, google_refresh, google_calendar_create, youtube_get, gmail_list, gmail_send, drive_create, ms_connect, ms_refresh, ms_calendar_create, ms_mail_send, ms_drive_create, notion_connect, notion_create_page, slack_connect, slack_test, slack_post, perplexity_ask, elevenlabs_tts, elevenlabs_speak, gamma_generate, heygen_video, webhook_post, manus_task, higgsfield_generate, heygen_assets, figma_connect, resend_send, supabase_rest, supabase_schema, figma_api, github_device_start, github_device_poll, github_api, shopify_api, gumloop_start, telegram_poll, telegram_send, telegram_get_voice, telegram_set_photo, mcp_rpc, claude_verify, claude_read_cli_token, make_scenarios, make_run, stt_status, stt_start, stt_stop, stt_download_engine, orb_talk_start, orb_talk_stop, orb_show, orb_hide, set_standby, wake_start, wake_stop, wake_save_sample, wake_clear, wake_has_samples, recap_start, recap_stop, recap_status, recap_chunk_count, recap_chunk_b64, recap_cancel, stream_type, stream_replace])
+        .invoke_handler(tauri::generate_handler![open_url, inject_text, hide_overlay, show_main, show_agents, hide_agents, save_artifact, restore_clipboard, capture_selection, capture_screen, send_browser_command, capture_screen_full, mouse_click, mouse_move, cursor_pos, type_text, mouse_scroll, press_key, openai_login_start, openai_login_poll, cu_step, cu_chat, copilot_read_cli_token, ollama_list_models, pick_folder, set_autostart, get_autostart, whatsapp_send, sb_tree, sb_read, sb_write, sb_mkdir, sb_delete, sb_search, sb_graph, openai_tts, gemini_tts, google_connect, google_refresh, google_calendar_create, youtube_get, gmail_list, gmail_send, drive_create, ms_connect, ms_refresh, ms_calendar_create, ms_mail_send, ms_drive_create, notion_connect, notion_create_page, slack_connect, slack_test, slack_post, perplexity_ask, elevenlabs_tts, elevenlabs_speak, gamma_generate, heygen_video, webhook_post, manus_task, higgsfield_generate, heygen_assets, figma_connect, resend_send, supabase_rest, supabase_schema, figma_api, github_device_start, github_device_poll, github_api, shopify_api, gumloop_start, telegram_poll, telegram_send, telegram_get_voice, telegram_set_photo, mcp_rpc, claude_verify, claude_read_cli_token, make_scenarios, make_run, stt_status, stt_start, stt_stop, stt_download_engine, stt_health, stt_model_status, stt_download_model, stt_transcribe, save_temp_audio, read_result_file, show_listening_orb, hide_listening_orb, set_ptt_mode, orb_talk_start, orb_talk_stop, orb_show, orb_hide, set_standby, wake_start, wake_stop, wake_save_sample, wake_clear, wake_has_samples, recap_start, recap_stop, recap_status, recap_chunk_count, recap_chunk_b64, recap_cancel, stream_type, stream_replace])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
@@ -3818,7 +4012,7 @@ pub fn run() {
 // global shortcuts, so we poll key state ~30ms and drive the same ptt-start / ptt-stop events.
 #[cfg(windows)]
 mod ptt_watch {
-    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
     use std::sync::OnceLock;
     use std::time::Duration;
     use tauri::{AppHandle, Emitter, Manager};
@@ -3829,6 +4023,18 @@ mod ptt_watch {
     // 3 = rewrite (Win+Alt — rewrite the current selection from a spoken instruction),
     // 4 = translate-dictate (Ctrl+Space — dictate and translate into the chosen language)
     static ACTIVE: AtomicU8 = AtomicU8::new(0);
+    // PTT tap mode: false = hold-to-record (default), true = first press starts / second press stops
+    static PTT_TAP_MODE: AtomicBool = AtomicBool::new(false);
+    // Whether recording is currently active (used in tap mode to decide start vs stop on keydown)
+    static PTT_RECORDING: AtomicBool = AtomicBool::new(false);
+
+    pub fn set_tap_mode(tap: bool) {
+        PTT_TAP_MODE.store(tap, Ordering::SeqCst);
+    }
+
+    // Tracks whether Ctrl+Win was down on the previous poll tick, so we can detect the rising edge
+    // (key just became pressed) for tap mode's second-press stop.
+    static CTRL_WIN_PREV: AtomicBool = AtomicBool::new(false);
 
     fn down(vk: i32) -> bool {
         (unsafe { GetAsyncKeyState(vk) } as u16 & 0x8000) != 0
@@ -3845,6 +4051,7 @@ mod ptt_watch {
 
     fn start_dictate(translate: bool, active: u8) {
         ACTIVE.store(active, Ordering::SeqCst);
+        PTT_RECORDING.store(true, Ordering::SeqCst);
         if let Some(app) = APP.get() {
             show_overlay(app);
             // Ctrl+Win = plain dictation (translate=false). Ctrl+Space = dictate + translate (translate=true).
@@ -3872,6 +4079,7 @@ mod ptt_watch {
 
     fn emit_stop(event: &'static str) {
         ACTIVE.store(0, Ordering::SeqCst);
+        PTT_RECORDING.store(false, Ordering::SeqCst);
         if let Some(app) = APP.get() {
             let _ = app.emit(event, ());
         }
@@ -3888,25 +4096,51 @@ mod ptt_watch {
             let space = down(0x20); // VK_SPACE — Ctrl+Space = dictate + translate
             // Mutually exclusive so the combos never overlap:
             let ctrl_win = ctrl && win && !lalt && !ralt; // Dictate (same language)
+            let ctrl_win_prev = CTRL_WIN_PREV.load(Ordering::SeqCst);
+            let ctrl_win_rising = ctrl_win && !ctrl_win_prev; // true only on the first tick the key is down
+            CTRL_WIN_PREV.store(ctrl_win, Ordering::SeqCst);
             let ctrl_space = ctrl && space && !win && !lalt && !ralt; // Dictate + translate (NOT AltGr+Space)
             let ctrl_alt = ctrl && lalt && !win; // Thought Dump / Keak AI
             let win_alt = win && lalt && !ctrl; // Rewrite selection
+            let tap_mode = PTT_TAP_MODE.load(Ordering::SeqCst);
 
             match ACTIVE.load(Ordering::SeqCst) {
                 0 => {
-                    if ctrl_win {
-                        start_dictate(false, 1);
-                    } else if ctrl_space {
-                        start_dictate(true, 4);
-                    } else if ctrl_alt {
-                        start_alt();
-                    } else if win_alt {
-                        start_rewrite();
+                    if tap_mode {
+                        // Tap mode: start on rising edge of Ctrl+Win only
+                        if ctrl_win_rising {
+                            start_dictate(false, 1);
+                        } else if ctrl_space {
+                            start_dictate(true, 4);
+                        } else if ctrl_alt {
+                            start_alt();
+                        } else if win_alt {
+                            start_rewrite();
+                        }
+                    } else {
+                        // Hold mode (default): start while key is held
+                        if ctrl_win {
+                            start_dictate(false, 1);
+                        } else if ctrl_space {
+                            start_dictate(true, 4);
+                        } else if ctrl_alt {
+                            start_alt();
+                        } else if win_alt {
+                            start_rewrite();
+                        }
                     }
                 }
                 1 => {
-                    if !ctrl_win {
-                        emit_stop("ptt-stop");
+                    if tap_mode {
+                        // Tap mode: stop on second rising edge of Ctrl+Win (key released then re-pressed)
+                        if ctrl_win_rising {
+                            emit_stop("ptt-stop");
+                        }
+                    } else {
+                        // Hold mode: stop when key is released
+                        if !ctrl_win {
+                            emit_stop("ptt-stop");
+                        }
                     }
                 }
                 4 => {

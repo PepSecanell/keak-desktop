@@ -3550,3 +3550,67 @@
   .cx-empty::before, .cx-empty::after { animation: none !important; }
   .cx-agent-dot { animation: none !important; }
 }
+
+/* ── First-run Setup screen ─────────────────────────────────────────────────
+   The one clean thing a new user sees. A full-window cream veil over the normal
+   Connect shell, holding a single centred column: connect your AI + dictation
+   essentials. Reuses the same cx-* card / field / button vocabulary.          */
+.cx-setup-veil {
+  position: fixed; inset: 0; z-index: 60;
+  background: var(--kx-paper);
+  overflow-y: auto;
+  display: flex; justify-content: center;
+  padding: 48px 24px 64px;
+}
+.cx-setup {
+  width: 100%; max-width: 620px;
+  display: flex; flex-direction: column; gap: 18px;
+}
+/* live "connected?" row under the provider grid */
+.cx-setup-airow {
+  display: flex; align-items: center; gap: 10px;
+  margin-top: 16px;
+}
+.cx-setup-dot {
+  width: 9px; height: 9px; border-radius: 50%;
+  background: var(--kx-line); flex: 0 0 auto;
+  box-shadow: 0 0 0 3px var(--kx-wash);
+}
+.cx-setup-dot--on {
+  background: var(--kx-rose-deep);
+  box-shadow: 0 0 0 3px var(--kx-wash-md);
+}
+/* two-input add row (Kodes + Vocabulary) */
+.cx-setup-koderow {
+  display: flex; gap: 8px; align-items: stretch; flex-wrap: wrap;
+}
+.cx-setup-koderow .cx-input { flex: 1 1 140px; min-width: 0; }
+.cx-setup-koderow .cx-btn { align-self: stretch; white-space: nowrap; }
+/* saved trigger→expansion / word chips */
+.cx-setup-chips {
+  list-style: none; margin: 12px 0 0; padding: 0;
+  display: flex; flex-direction: column; gap: 6px;
+}
+.cx-setup-chip {
+  display: flex; align-items: center; gap: 6px;
+  padding: 8px 12px;
+  font-size: 13px; color: var(--kx-ink);
+  background: var(--kx-card); border: 1px solid var(--kx-line-soft);
+  border-radius: var(--kx-r-ctl);
+}
+.cx-setup-chip b { color: var(--kx-rose-dark); font-weight: 700; }
+.cx-setup-chip span { color: var(--kx-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cx-setup-chip-x {
+  margin-left: auto; flex: 0 0 auto;
+  width: 22px; height: 22px; line-height: 20px; text-align: center;
+  font-size: 16px; color: var(--kx-muted-2);
+  background: transparent; border: 0; border-radius: 50%;
+  cursor: pointer;
+}
+.cx-setup-chip-x:hover { background: var(--kx-wash); color: var(--kx-rose-dark); }
+/* footer actions */
+.cx-setup-actions {
+  display: flex; align-items: center; gap: 12px;
+  margin-top: 4px;
+}
+.cx-setup-actions .cx-btn--block { flex: 1; }

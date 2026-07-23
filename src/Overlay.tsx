@@ -20,8 +20,12 @@ const LOCAL_WHISPER = "http://127.0.0.1:9889";
 let _sovereignCache: { ok: boolean; ts: number } | null = null;
 async function isLocalServerUp(): Promise<boolean> {
   const now = Date.now();
-  if (_sovereignCache && now - _sovereignCache.ts < 20_000) return _sovereignCache.ok;
-  const ok = await fetch(`${LOCAL_WHISPER}/health`, { signal: AbortSignal.timeout(400) })
+  // Cache a HIT for 20s (the server rarely goes away mid-session). Cache a MISS for only 2s so a single slow
+  // probe can't lock us onto the cloud for 20s — we re-check almost immediately. Timeout is generous (2.5s)
+  // because the local server can be briefly busy right after boot or between transcriptions on CPU.
+  if (_sovereignCache && _sovereignCache.ok && now - _sovereignCache.ts < 20_000) return true;
+  if (_sovereignCache && !_sovereignCache.ok && now - _sovereignCache.ts < 2_000) return false;
+  const ok = await fetch(`${LOCAL_WHISPER}/health`, { signal: AbortSignal.timeout(2500) })
     .then((r) => r.ok)
     .catch(() => false);
   _sovereignCache = { ok, ts: now };
@@ -98,6 +102,7 @@ async function ensureFreshSession(session: any): Promise<any> {
       method: "POST",
       headers: { "Content-Type": "application/json", apikey: SUPABASE_ANON_KEY },
       body: JSON.stringify({ refresh_token: session.refresh_token }),
+      signal: AbortSignal.timeout(6000), // never hang dictation on a slow/dead auth refresh
     });
     if (res.ok) {
       const data = await res.json();
@@ -1712,6 +1717,15 @@ export default function Overlay() {
     }
   }, []);
 
+  // Push-to-talk mode: "hold" (hold Ctrl+Win the whole time) or "tap" (click once to start, click again or
+  // pause to stop). Tell Rust which mode the ptt watcher should use, and re-sync whenever it changes elsewhere.
+  useEffect(() => {
+    const sync = () => invoke("set_ptt_mode", { mode: localStorage.getItem("keak_ptt_mode") === "tap" ? "tap" : "hold" }).catch(() => { /* older build */ });
+    sync();
+    window.addEventListener("keak-ptt-mode-changed", sync);
+    return () => window.removeEventListener("keak-ptt-mode-changed", sync);
+  }, []);
+
   // Reset the orb's "listening" ring whenever the turn ends — on idle OR error (else it spins forever).
   useEffect(() => {
     if (state === "idle" || state === "error") emitTo("orb", "orb-idle").catch(() => { /* ignore */ });
@@ -2069,6 +2083,9 @@ export default function Overlay() {
 
   async function processAudio() {
     releaseMicSoon(); // keep the mic warm for the next dictation, then turn it off after idle
+    // TEMP DEBUG: ping the local server with step markers so we can see in its log exactly where a hang is.
+    const dbg = (s: string) => { fetch(`${LOCAL_WHISPER}/health?dbg=${s}`).catch(() => { /* ignore */ }); };
+    dbg("A_start_chunks" + chunks.current.length + "_mode_" + modeRef.current + "_stream_" + streamMode());
 
     let session = getSession();
     if (!session) {
@@ -2087,6 +2104,7 @@ export default function Overlay() {
     // last queued sentence to finish typing, then finish — don't transcribe + inject again. Only when the live
     // engine produced nothing do we fall through to the normal accurate pipeline (so dictation never breaks).
     if (modeRef.current === "dictate" && streamMode() === "cursor" && recogGotResultRef.current) {
+      dbg("SC_cursor_branch");
       try { await cleanChainRef.current; } catch { /* ignore */ }
       const finalText = streamRawRef.current.trim();
       if (finalText) {
@@ -2102,10 +2120,14 @@ export default function Overlay() {
     }
 
     // Renew the token if it expired (~1h), so authed calls don't silently fail.
+    dbg("A2_presession");
     session = await ensureFreshSession(session);
+    dbg("A3_postsession");
 
     try {
       const blob = new Blob(chunks.current, { type: "audio/webm" });
+      const _tr = streamRef.current?.getAudioTracks()[0];
+      dbg("blob" + blob.size + "_muted_" + (_tr?.muted) + "_rs_" + (_tr?.readyState) + "_lbl_" + encodeURIComponent((_tr?.label || "none").slice(0, 18)));
       // A header-only clip (too short a hold, or the mic gave nothing) is a few hundred bytes and
       // OpenAI rejects it as "corrupted". Treat it as "didn't catch that" instead of a scary error.
       if (blob.size < 1500) {
@@ -2132,23 +2154,43 @@ export default function Overlay() {
       const offlineMode = sovereignOn() ? true : await isLocalServerUp();
       let tData: any;
       if (offlineMode) {
-        const localRes = await fetch("http://127.0.0.1:9889/transcribe", {
-          method: "POST",
-          body: form,
-        }).catch(() => null);
-        if (!localRes || !localRes.ok) {
-          const friendly = "Offline mode: local server not running. Start PROJECTS/KEAK/local-whisper/start.bat first, or disable with: localStorage.setItem('keak_offline_mode','false')";
+        dbg("T1_prefetch");
+        // Route the transcribe POST through Rust. The WebView rejects the cross-origin POST to
+        // http://127.0.0.1:9889 (T2_null, request never reaches the server), but reqwest in Rust connects
+        // fine. Hand the audio over as base64; Rust returns the raw JSON string.
+        const buf = new Uint8Array(await blob.arrayBuffer());
+        let bin = "";
+        for (let i = 0; i < buf.length; i++) bin += String.fromCharCode(buf[i]);
+        const audioB64 = btoa(bin);
+        const langArg = lang && lang !== "auto" ? lang : "";
+        let raw = "";
+        let sttErr = "";
+        try {
+          // Fully file-based, NO HTTP: the app's localhost HTTP is unreliable on this machine, so Rust writes
+          // the audio + a job marker to the temp dir, the whisper server's file-watcher picks it up and writes
+          // the result file, and we poll that result file from disk via Rust. Only file I/O — always reliable.
+          const outPath = await invoke<string>("save_temp_audio", { audio: audioB64, language: langArg });
+          for (let i = 0; i < 200; i++) { // poll up to ~60s (CPU transcription can be slow)
+            await new Promise((r) => setTimeout(r, 300));
+            const got = await invoke<string | null>("read_result_file", { path: outPath });
+            if (got) { raw = got; break; }
+          }
+          if (!raw) sttErr = "transcription timed out";
+        } catch (e) { raw = ""; sttErr = String(e); dbg("T2err_" + encodeURIComponent(String(e).slice(0, 60))); }
+        dbg("T2_" + (raw ? "ok" + raw.length : "null"));
+        if (!raw) {
           if (modeRef.current === "assistant") {
-            setAiReply(friendly);
+            setAiReply("Local transcribe failed: " + (sttErr || "empty response"));
             setStateSafe("idle");
             scheduleAssistantClose(9000);
           } else {
             setStateSafe("error");
-            setErrorMsg("Offline mode: local server not running. Run start.bat first.");
+            setErrorMsg("Local transcribe error: " + (sttErr || "empty response").slice(0, 140));
           }
           return;
         }
-        tData = await localRes.json().catch(() => ({} as any));
+        try { tData = JSON.parse(raw); } catch { tData = {} as any; }
+        dbg("B_transcribed");
       } else {
         // ── Cloud path (default) ───────────────────────────────────────────
         const tRes = await fetch(`${SUPABASE_URL}/functions/v1/transcribe`, {
@@ -2258,10 +2300,11 @@ export default function Overlay() {
       // Kodes: check if the transcription matches any saved trigger and expand it.
       // Fetch the user's kodes, replace any triggers found in the text, and if any matched
       // inject the result directly (skip enhance — kodes are exact, not AI-rewritten).
+      dbg("C_prekodes");
       try {
         const kRes = await fetch(
           `${SUPABASE_URL}/rest/v1/kodes?select=trigger,expansion`,
-          { headers: { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${session.access_token}` } }
+          { headers: { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${session.access_token}` }, signal: AbortSignal.timeout(4000) }
         );
         if (kRes.ok) {
           const kodes: { trigger: string; expansion: string }[] = await kRes.json();
@@ -2282,7 +2325,13 @@ export default function Overlay() {
         }
       } catch { /* kodes are best-effort — fall through to normal enhance */ }
 
+      dbg("D_postkodes");
       const stylePrompt = localStorage.getItem("keak_default_style") || null;
+      const toneMode = localStorage.getItem("keak_tone_mode") === "1";
+      const toneInstruction = "Detect the emotional register of this text and adjust accordingly: frustrated or angry → rewrite as firm but professional, remove exclamation marks and harsh language; excited or enthusiastic → preserve the energy but clean grammar; exhausted or fragmented (lots of '...', trailing off, unfinished sentences) → clean up and append [DRAFT — review before sending]; neutral → normal cleanup. Apply automatically, output only the rewritten text.";
+      const effectiveStylePrompt = toneMode
+        ? (stylePrompt ? `${toneInstruction} ${stylePrompt}` : toneInstruction)
+        : stylePrompt;
       // Translate-while-dictating: if a target language is armed, the cleaned text is translated into it
       // before injecting. Prefer the user's own connected AI (free, works offline / in Sovereign); if none
       // is connected, fall back to Keak's cloud AI — except in Sovereign mode, which must stay zero-cloud.
@@ -2292,14 +2341,21 @@ export default function Overlay() {
       const outLang = forcedLang;
       const targetName = outLang ? (TRANSLATE_LANG_NAMES[outLang] || outLang) : "";
       // The user's own model — used for translation, and for the clean-up step in Sovereign mode.
-      const ownAi = (outLang || sovereignOn()) ? resolveOwnAI() : null;
+      const ownAi = (outLang || sovereignOn() || offlineMode) ? resolveOwnAI() : null;
       let finalText: string;
-      if (sovereignOn()) {
-        // Zero-cloud: clean up the transcript on the user's own model. No connected model → use the raw
-        // transcript (whisper output is already clean). The cloud enhance function is never called.
+      if (sovereignOn() || offlineMode) {
+        // Zero-cloud (Sovereign OR local whisper auto-detected): clean up the transcript on the user's own
+        // model. No connected model → use the raw transcript (whisper output is already clean). The cloud
+        // enhance function is never called, so offline dictation never hangs on a down/slow cloud.
         if (ownAi) {
           try {
-            finalText = (await askOwnAIRaw(ownAi, localCleanupSystem(!!thoughtDumpRef.current, stylePrompt), tData.text)).trim() || tData.text;
+            // Cap the own-AI cleanup: if the connected model hangs (expired token, bad config, slow local
+            // model), never stay stuck on "thinking" — fall back to the raw transcript after 12s.
+            const cleaned = await Promise.race([
+              askOwnAIRaw(ownAi, localCleanupSystem(!!thoughtDumpRef.current, effectiveStylePrompt), tData.text),
+              new Promise<string>((_, reject) => setTimeout(() => reject(new Error("own-AI cleanup timed out")), 12000)),
+            ]);
+            finalText = cleaned.trim() || tData.text;
           } catch { finalText = tData.text; }
         } else {
           finalText = tData.text;
@@ -2308,18 +2364,24 @@ export default function Overlay() {
         const enhanceBody: Record<string, unknown> = {
           text: tData.text,
           mode: thoughtDumpRef.current ? "thought_dump" : "normal",
-          style_prompt: stylePrompt,
+          style_prompt: effectiveStylePrompt,
         };
-        const eRes = await fetch(`${SUPABASE_URL}/functions/v1/enhance`, {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${session.access_token}`,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify(enhanceBody),
-        });
-        const eData = await eRes.json();
-        finalText = eData.enhanced_text || tData.text;
+        try {
+          const eRes = await fetch(`${SUPABASE_URL}/functions/v1/enhance`, {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${session.access_token}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify(enhanceBody),
+            signal: AbortSignal.timeout(20000),
+          });
+          const eData = await eRes.json();
+          finalText = eData.enhanced_text || tData.text;
+        } catch {
+          // Cloud cleanup is down or slow — never hang on "thinking". Inject the raw transcript instead.
+          finalText = tData.text;
+        }
       }
       // Translate the cleaned text into the target language. Own AI first (free/offline); if that isn't
       // available or fails, a dedicated cloud enhance call does the translation — so it works even with no
@@ -2352,7 +2414,9 @@ export default function Overlay() {
         if (translated) finalText = translated;
       }
       // Wispr-style: drop the cleaned text straight where the cursor was, no review step.
+      dbg("E_preinject");
       await invoke("inject_text", { text: finalText });
+      dbg("F_injected");
       setLiveTranslate(""); // clear the one-off translate badge now the dictation is done
       // Save to shared History (best-effort) so it shows across web/mobile/desktop.
       saveHistory(session, {
@@ -4668,6 +4732,9 @@ export default function Overlay() {
               <span className="pill-label" style={liveText ? { maxWidth: 360, overflow: "hidden", whiteSpace: "nowrap", opacity: 0.85, fontWeight: 500 } : undefined}>
                 {liveText ? (liveText.length > 70 ? "…" + liveText.slice(-69) : liveText) : (rewriting ? t("Rewrite") : thoughtDump ? t("Thought Dump") : t("Listening"))}
               </span>
+              {!liveText && localStorage.getItem("keak_tone_mode") === "1" && (
+                <span style={{ fontSize: 11, fontWeight: 700, color: "#2C1508", background: "#D4A49A", borderRadius: 6, padding: "2px 6px", marginLeft: 4 }}>Tone</span>
+              )}
             </div>
           ) : state === "processing" ? (
             <div className="pill-live">

@@ -9,15 +9,12 @@ import "./App.css";
 const SUPABASE_URL = (import.meta.env.VITE_SUPABASE_URL || "https://c--8d6c4aab-d6cd-4281-ad41-da14196d68fc-prod.lovable.cloud") as string;
 const SUPABASE_ANON_KEY = (import.meta.env.VITE_SUPABASE_ANON_KEY || "sb_publishable_GjF5OPvQRDcdLyuiFGroOg_FiyrnhjN") as string;
 
-// The full Keak dashboard lives on the web. Once the native gate has authenticated (and fed the overlay
-// its session via localStorage), we hand the session to the web app and show it as the main window, so the
-// installed app IS the web dashboard (Wispr-Flow style) while the overlay stays native.
-const DASHBOARD_URL = "https://keak.app";
-function goToDashboard(s: Session) {
-  const hash = `#access_token=${encodeURIComponent(s.access_token)}` +
-    `&refresh_token=${encodeURIComponent(s.refresh_token || "")}` +
-    `&kk_desktop=1`;
-  window.location.replace(`${DASHBOARD_URL}/${hash}`);
+// The desktop app IS the native Connect experience (all sections: Your AI, Agents, Second Brain, Routines,
+// Settings, etc.), NOT the web dashboard. Once the native gate has authenticated (and stored the session in
+// localStorage for the overlay + Connect to read), we send the main window to the native Connect view. We do
+// NOT load keak.app into the app anymore — no embedded web, no blank redirect.
+function goToDashboard(_s: Session) {
+  window.location.replace(`/?view=connect`);
 }
 
 // Guards against the deep-link callback firing twice (single-instance + on_open_url).

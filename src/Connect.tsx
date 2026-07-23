@@ -263,6 +263,9 @@ function resolveChatAI(choice: string): { provider: string; credential: string; 
 // Keak Recap: the transcribe endpoint (same backend the overlay uses) + a base64->Blob helper for the WAV
 // chunks Rust hands back.
 const RECAP_SUPABASE_URL = (import.meta.env.VITE_SUPABASE_URL || "https://c--8d6c4aab-d6cd-4281-ad41-da14196d68fc-prod.lovable.cloud") as string;
+// Same anon key the overlay uses (Overlay.tsx). Needed for the first-run Setup screen's Kodes editor,
+// which reads/writes the same cloud PostgREST `kodes` table the dictation flow expands from.
+const RECAP_SUPABASE_ANON_KEY = (import.meta.env.VITE_SUPABASE_ANON_KEY || "sb_publishable_GjF5OPvQRDcdLyuiFGroOg_FiyrnhjN") as string;
 function b64ToBlob(b64: string, type: string): Blob {
   const bin = atob(b64);
   const arr = new Uint8Array(bin.length);
@@ -962,6 +965,249 @@ function MiniHead({ icon, children }: { icon: ReactNode; children: ReactNode }) 
 // overlay, so everything it writes to localStorage (provider, tokens, action mode, captions) is read
 // straight back by the screen agent in the overlay. The keak.app dashboard can't do this because a
 // website can't reach the native ChatGPT login or move the mouse.
+// ─────────────────────────────────────────────────────────────────────────────
+// First-run Setup screen. The ONE clean thing a new user sees when the Connect
+// window first opens: connect your AI + the dictation essentials, in a single
+// minimal view. Gated on the `keak_setup_done` localStorage flag — once finished
+// it never shows again, and the full multi-section Connect window stays intact.
+// Everything here reads/writes the SAME data the rest of the app already uses:
+//   • AI provider   → keak_cu_provider (+ per-provider tokens/keys)
+//   • Language      → keak_language
+//   • Writing style → keak_default_style  (read by Overlay before enhance)
+//   • Kodes         → cloud PostgREST `kodes` table (trigger→expansion), the exact
+//                     table the overlay expands from
+//   • Vocabulary    → keak_vocab (custom spellings Keak should keep as-is)
+// ─────────────────────────────────────────────────────────────────────────────
+type Kode = { id?: string; trigger: string; expansion: string };
+function keakSession(): { access_token: string } | null {
+  try { return JSON.parse(localStorage.getItem("keak_session") || "null"); } catch { return null; }
+}
+function SetupScreen({
+  t, cuProvider, pickProvider, dictLang, chooseDictLang, onOpenFull, onDone,
+}: {
+  t: (s: string) => string;
+  cuProvider: string;
+  pickProvider: (id: string) => void;
+  dictLang: string;
+  chooseDictLang: (code: string) => void;
+  onOpenFull: () => void;
+  onDone: () => void;
+}) {
+  // Whether the picked provider actually has a credential yet (mirrors resolveChatAI).
+  const providerReady = (() => {
+    const p = cuProvider;
+    if (p === "ollama") return true;
+    if (p === "openai") return !!(localStorage.getItem("keak_cu_openai_token") || localStorage.getItem("keak_cu_openai_key"));
+    if (p === "gemini") return !!localStorage.getItem("keak_cu_gemini_key");
+    if (p === "claude") return !!localStorage.getItem("keak_cu_claude_token");
+    if (p === "copilot") return !!localStorage.getItem("keak_cu_copilot_token");
+    return !!localStorage.getItem(`keak_cu_${p}_key`);
+  })();
+
+  // Writing style (default cleanup prompt) — plain localStorage string.
+  const [style, setStyle] = useState<string>(() => localStorage.getItem("keak_default_style") || "");
+  function saveStyle(v: string) { setStyle(v); if (v.trim()) localStorage.setItem("keak_default_style", v); else localStorage.removeItem("keak_default_style"); }
+
+  // Vocabulary — custom spellings Keak should keep. Stored locally as a simple list.
+  const [vocab, setVocab] = useState<string[]>(() => {
+    try { const a = JSON.parse(localStorage.getItem("keak_vocab") || "[]"); return Array.isArray(a) ? a : []; } catch { return []; }
+  });
+  const [vocabInput, setVocabInput] = useState("");
+  function persistVocab(list: string[]) { setVocab(list); localStorage.setItem("keak_vocab", JSON.stringify(list)); }
+  function addVocab() {
+    const w = vocabInput.trim();
+    if (!w || vocab.includes(w)) { setVocabInput(""); return; }
+    persistVocab([...vocab, w]); setVocabInput("");
+  }
+  function removeVocab(w: string) { persistVocab(vocab.filter((x) => x !== w)); }
+
+  // Kodes — voice-triggered snippets. Read/written against the SAME cloud table the
+  // overlay expands from: /rest/v1/kodes (trigger, expansion).
+  const [kodes, setKodes] = useState<Kode[]>([]);
+  const [kTrigger, setKTrigger] = useState("");
+  const [kExpansion, setKExpansion] = useState("");
+  const [kBusy, setKBusy] = useState(false);
+  const [kMsg, setKMsg] = useState("");
+
+  async function loadKodes() {
+    const s = keakSession();
+    if (!s?.access_token) { setKMsg(t("Sign in first to save Kodes.")); return; }
+    try {
+      const res = await fetch(`${RECAP_SUPABASE_URL}/rest/v1/kodes?select=id,trigger,expansion&order=trigger.asc`, {
+        headers: { apikey: RECAP_SUPABASE_ANON_KEY, Authorization: `Bearer ${s.access_token}` },
+      });
+      if (res.ok) setKodes(await res.json());
+    } catch { /* best-effort — offline just shows an empty list */ }
+  }
+  useEffect(() => { loadKodes(); }, []);
+
+  async function addKode() {
+    const trig = kTrigger.trim(); const exp = kExpansion.trim();
+    if (!trig || !exp) return;
+    const s = keakSession();
+    if (!s?.access_token) { setKMsg(t("Sign in first to save Kodes.")); return; }
+    setKBusy(true); setKMsg("");
+    try {
+      const res = await fetch(`${RECAP_SUPABASE_URL}/rest/v1/kodes`, {
+        method: "POST",
+        headers: {
+          apikey: RECAP_SUPABASE_ANON_KEY,
+          Authorization: `Bearer ${s.access_token}`,
+          "Content-Type": "application/json",
+          Prefer: "return=representation",
+        },
+        body: JSON.stringify({ trigger: trig, expansion: exp }),
+      });
+      if (res.ok) {
+        const rows: Kode[] = await res.json();
+        setKodes((prev) => [...prev, ...rows].sort((a, b) => a.trigger.localeCompare(b.trigger)));
+        setKTrigger(""); setKExpansion("");
+      } else {
+        setKMsg(t("Couldn't save that Kode. Try again."));
+      }
+    } catch {
+      setKMsg(t("Couldn't reach the server. Try again."));
+    }
+    setKBusy(false);
+  }
+
+  async function removeKode(k: Kode) {
+    const s = keakSession();
+    if (!s?.access_token || !k.id) return;
+    setKodes((prev) => prev.filter((x) => x.id !== k.id)); // optimistic
+    try {
+      await fetch(`${RECAP_SUPABASE_URL}/rest/v1/kodes?id=eq.${k.id}`, {
+        method: "DELETE",
+        headers: { apikey: RECAP_SUPABASE_ANON_KEY, Authorization: `Bearer ${s.access_token}` },
+      });
+    } catch { /* optimistic removal already done; overlay re-reads live anyway */ }
+  }
+
+  return (
+    <div className="cx-setup-veil">
+      <div className="cx-setup">
+        <header className="cx-secthero cx-secthero--ai" style={{ marginBottom: 20 }}>
+          <span className="cx-medallion" aria-hidden="true">{NAV_ICONS.ai}</span>
+          <div className="cx-secthero-text">
+            <p className="cx-eyebrow">{t("Welcome to Keak")}</p>
+            <h2 className="cx-h">{t("Two quick things and you're set")}</h2>
+            <p className="cx-lead">{t("Connect your own AI, then tune how Keak writes for you. You can change all of this later.")}</p>
+          </div>
+        </header>
+
+        {/* 1 — Connect your AI (reuses the exact provider grid) */}
+        <section className="cx-card">
+          <MiniHead icon={NAV_ICONS.ai}>
+            <p className="cx-eyebrow">{t("Step 1")}</p>
+            <h2 className="cx-h">{t("Connect your AI")}</h2>
+          </MiniHead>
+          <div className="cx-provider-grid" role="group" aria-label={t("Your AI")} style={{ marginTop: 4 }}>
+            {PROVIDER_CARDS.map((p) => (
+              <button
+                key={p.id}
+                type="button"
+                className={`cx-provider-card${cuProvider === p.id ? " cx-provider-card--on" : ""}`}
+                onClick={() => pickProvider(p.id)}
+              >
+                <span className="cx-provider-mark" aria-hidden="true">{PROVIDER_MARKS[p.id]}</span>
+                <span className="cx-provider-name">{p.name}</span>
+                {cuProvider === p.id && <span className="cx-provider-check" aria-hidden="true"><CheckIcon /></span>}
+              </button>
+            ))}
+          </div>
+          <div className="cx-setup-airow">
+            <span className={`cx-setup-dot${providerReady ? " cx-setup-dot--on" : ""}`} aria-hidden="true" />
+            <span className="cx-help" style={{ margin: 0 }}>
+              {providerReady ? t("Connected and ready.") : t("Pick your AI, then finish connecting it.")}
+            </span>
+            <button className="cx-btn cx-btn--ghost cx-btn--sm" style={{ marginLeft: "auto" }} onClick={onOpenFull}>
+              {providerReady ? t("Change") : t("Set it up")}
+            </button>
+          </div>
+        </section>
+
+        {/* 2 — Dictation essentials, one compact card */}
+        <section className="cx-card">
+          <MiniHead icon={SET_ICONS.mic}>
+            <p className="cx-eyebrow">{t("Step 2")}</p>
+            <h2 className="cx-h">{t("Dictation essentials")}</h2>
+          </MiniHead>
+
+          <div className="cx-field">
+            <label className="cx-field-label">{t("Language")}</label>
+            <select className="cx-select" value={dictLang} onChange={(e) => chooseDictLang(e.target.value)}>
+              <option value="auto">{t("Auto-detect")}</option>
+              {UI_LANGS.map((l) => <option key={l.code} value={l.code}>{l.label}</option>)}
+            </select>
+          </div>
+
+          <div className="cx-field">
+            <label className="cx-field-label">{t("Writing style")}</label>
+            <input
+              className="cx-input"
+              type="text"
+              placeholder={t("e.g. Clean and professional, no emojis")}
+              value={style}
+              onChange={(e) => saveStyle(e.target.value)}
+            />
+            <p className="cx-help">{t("How Keak cleans up what you say. Leave blank for the default.")}</p>
+          </div>
+
+          <div className="cx-field">
+            <label className="cx-field-label">{t("Kodes")} <span className="cx-field-tag">{t("say a word, Keak types the whole thing")}</span></label>
+            <div className="cx-setup-koderow">
+              <input className="cx-input" type="text" placeholder={t("Trigger (e.g. myemail)")} value={kTrigger} onChange={(e) => setKTrigger(e.target.value)} />
+              <input className="cx-input" type="text" placeholder={t("Expands to…")} value={kExpansion} onChange={(e) => setKExpansion(e.target.value)} />
+              <button className="cx-btn cx-btn--sm" onClick={addKode} disabled={kBusy || !kTrigger.trim() || !kExpansion.trim()}>{kBusy ? t("Saving…") : t("Add")}</button>
+            </div>
+            {kMsg && <p className="cx-help" style={{ color: "#B4553F" }}>{kMsg}</p>}
+            {kodes.length > 0 && (
+              <ul className="cx-setup-chips">
+                {kodes.map((k) => (
+                  <li key={k.id || k.trigger} className="cx-setup-chip">
+                    <b>{k.trigger}</b> → <span>{k.expansion}</span>
+                    <button className="cx-setup-chip-x" aria-label={t("Delete")} onClick={() => removeKode(k)}>×</button>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+
+          <div className="cx-field">
+            <label className="cx-field-label">{t("Vocabulary")} <span className="cx-field-tag">{t("names & spellings to keep")}</span></label>
+            <div className="cx-setup-koderow">
+              <input
+                className="cx-input"
+                type="text"
+                placeholder={t("e.g. Keak, Keoly, Aumakua")}
+                value={vocabInput}
+                onChange={(e) => setVocabInput(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); addVocab(); } }}
+              />
+              <button className="cx-btn cx-btn--sm" onClick={addVocab} disabled={!vocabInput.trim()}>{t("Add")}</button>
+            </div>
+            {vocab.length > 0 && (
+              <ul className="cx-setup-chips">
+                {vocab.map((w) => (
+                  <li key={w} className="cx-setup-chip">
+                    <span>{w}</span>
+                    <button className="cx-setup-chip-x" aria-label={t("Delete")} onClick={() => removeVocab(w)}>×</button>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        </section>
+
+        <div className="cx-setup-actions">
+          <button className="cx-btn cx-btn--ghost cx-btn--sm" onClick={onDone}>{t("Skip for now")}</button>
+          <button className="cx-btn cx-btn--block" onClick={onDone}>{t("Start using Keak")}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function Connect() {
   const [cuProvider, setCuProvider] = useState<string>(() => localStorage.getItem("keak_cu_provider") || "claude");
   const [claudeToken, setClaudeToken] = useState<string>(() => localStorage.getItem("keak_cu_claude_token") || "");
@@ -1039,6 +1285,10 @@ export default function Connect() {
   });
   const [connectMsg, setConnectMsg] = useState<string>("");
   const [activeSection, setActiveSection] = useState<string>("ai");
+  // First-run Setup: shown once, the first time the Connect window opens, before the full
+  // multi-section window. Dismissed for good by setting keak_setup_done.
+  const [showSetup, setShowSetup] = useState<boolean>(() => localStorage.getItem("keak_setup_done") !== "1");
+  function finishSetup() { localStorage.setItem("keak_setup_done", "1"); setShowSetup(false); }
   // When the keak.app dashboard's "Keak AI" button opens this window (via the desktop bridge), land on the chat.
   useEffect(() => {
     const un = listen("keak-open-work", () => setActiveSection("work"));
@@ -1061,6 +1311,36 @@ export default function Connect() {
   // Standby: the always-on Keak orb in a screen corner. Click it to talk to Keak AI without a hotkey.
   const [standby, setStandby] = useState<boolean>(localStorage.getItem("keak_standby") === "1");
   const [orbCorner, setOrbCorner] = useState<string>(localStorage.getItem("keak_orb_corner") || "br");
+  const [toneMode, setToneMode] = useState<boolean>(localStorage.getItem("keak_tone_mode") === "1");
+  function toggleToneMode(v: boolean) { setToneMode(v); localStorage.setItem("keak_tone_mode", v ? "1" : "0"); }
+  // Push-to-talk mode: "hold" (hold Ctrl+Win) or "tap" (click once to start, click again or pause to stop).
+  const [pttMode, setPttMode] = useState<string>(localStorage.getItem("keak_ptt_mode") === "tap" ? "tap" : "hold");
+  function choosePttMode(v: string) {
+    setPttMode(v);
+    localStorage.setItem("keak_ptt_mode", v);
+    invoke("set_ptt_mode", { mode: v }).catch(() => { /* older build */ });
+    window.dispatchEvent(new Event("keak-ptt-mode-changed")); // let the overlay re-sync
+  }
+  // Keak Sovereign (BETA): fully local dictation via on-device Whisper — zero cloud, free per minute.
+  const [sovereign, setSovereign] = useState<boolean>(localStorage.getItem("keak_sovereign") === "1");
+  function toggleSovereign(v: boolean) { setSovereign(v); localStorage.setItem("keak_sovereign", v ? "1" : "0"); }
+  const [modelPresent, setModelPresent] = useState<boolean>(false);
+  const [modelSizeMb, setModelSizeMb] = useState<number>(0);
+  const [dlPct, setDlPct] = useState<number>(-1); // -1 = not downloading
+  const refreshModelStatus = () => invoke<{ present: boolean; size_mb: number }>("stt_model_status")
+    .then((s) => { setModelPresent(!!s?.present); setModelSizeMb(s?.size_mb || 0); })
+    .catch(() => { /* older build */ });
+  useEffect(() => { refreshModelStatus(); }, []);
+  useEffect(() => {
+    const p = listen<{ pct: number }>("stt-model-progress", (e) => setDlPct(e.payload?.pct ?? 0));
+    return () => { p.then((f) => f()); };
+  }, []);
+  async function downloadSovereignModel() {
+    setDlPct(0);
+    try { await invoke("stt_download_model"); await refreshModelStatus(); }
+    catch { /* surfaced by lack of model */ }
+    setDlPct(-1);
+  }
   function toggleStandby(v: boolean) {
     setStandby(v);
     localStorage.setItem("keak_standby", v ? "1" : "0");
@@ -3197,6 +3477,61 @@ export default function Connect() {
             <section className="cx-card">
           <MiniHead icon={SET_ICONS.mic}>
             <p className="cx-eyebrow">{t("Dictation")}</p>
+            <h2 className="cx-h">{t("Tone-aware rewrite")}</h2>
+          </MiniHead>
+          <label className="cx-check-row">
+            <input type="checkbox" checked={toneMode} onChange={(e) => toggleToneMode(e.target.checked)} />
+            <span>{t("Keak detects your register — frustrated becomes firm-professional, excited keeps its energy.")}</span>
+          </label>
+            </section>
+            )}
+
+            {activeSection === "settings" && (
+            <section className="cx-card">
+          <MiniHead icon={SET_ICONS.mic}>
+            <p className="cx-eyebrow">{t("Dictation")}</p>
+            <h2 className="cx-h">{t("How you talk")}</h2>
+          </MiniHead>
+          <div className="cx-field">
+            <select className="cx-select" value={pttMode} onChange={(e) => choosePttMode(e.target.value)}>
+              <option value="hold">{t("Hold Ctrl+Win while I talk")}</option>
+              <option value="tap">{t("Tap Ctrl+Win once, tap again to stop")}</option>
+            </select>
+            <p className="cx-help" style={{ marginTop: 12 }}>{t("Hold mode records only while you press the keys. Tap mode starts on one press and stops when you press again or pause, so your hands stay free.")}</p>
+          </div>
+            </section>
+            )}
+
+            {activeSection === "settings" && (
+            <section className="cx-card">
+          <MiniHead icon={SET_ICONS.mic}>
+            <p className="cx-eyebrow">{t("Dictation")}</p>
+            <h2 className="cx-h">{t("Keak Sovereign")} <span style={{ fontSize: 11, fontWeight: 700, color: "#2C1508", background: "#D4A49A", borderRadius: 6, padding: "2px 6px", marginLeft: 6, verticalAlign: "middle" }}>BETA</span></h2>
+          </MiniHead>
+          <p className="cx-help" style={{ marginBottom: 14 }}>{t("Run dictation fully on your own machine. No cloud, no per-minute cost, works offline. Download the voice model once to turn it on.")}</p>
+          <label className="cx-check-row" style={{ marginBottom: 12 }}>
+            <input type="checkbox" checked={sovereign} onChange={(e) => toggleSovereign(e.target.checked)} />
+            <span>{t("Force fully-local dictation — never use the cloud, even if the local server blips.")}</span>
+          </label>
+          {dlPct >= 0 ? (
+            <div className="cx-field">
+              <div style={{ height: 8, background: "#EDE4CC", borderRadius: 6, overflow: "hidden" }}>
+                <div style={{ height: "100%", width: `${Math.round(dlPct)}%`, background: "#D4A49A", transition: "width 0.2s" }} />
+              </div>
+              <p className="cx-help" style={{ marginTop: 10 }}>{t("Downloading voice model…")} {Math.round(dlPct)}%</p>
+            </div>
+          ) : modelPresent ? (
+            <p className="cx-help" style={{ color: "#5E8C4A", fontWeight: 600 }}>{t("Voice model ready")} ({Math.round(modelSizeMb)} MB) — {t("Keak uses local dictation automatically when it's running.")}</p>
+          ) : (
+            <button className="cx-btn" onClick={downloadSovereignModel}>{t("Download voice model (~1 GB)")}</button>
+          )}
+            </section>
+            )}
+
+            {activeSection === "settings" && (
+            <section className="cx-card">
+          <MiniHead icon={SET_ICONS.mic}>
+            <p className="cx-eyebrow">{t("Dictation")}</p>
             <h2 className="cx-h">{t("Live dictation")}</h2>
           </MiniHead>
           <div className="cx-field">
@@ -4429,6 +4764,18 @@ export default function Connect() {
       </div>
 
       {showGraph && <BrainGraph root={brainPath} onClose={() => setShowGraph(false)} />}
+
+      {showSetup && (
+        <SetupScreen
+          t={t}
+          cuProvider={cuProvider}
+          pickProvider={pickProvider}
+          dictLang={dictLang}
+          chooseDictLang={chooseDictLang}
+          onOpenFull={() => { setActiveSection("ai"); finishSetup(); }}
+          onDone={finishSetup}
+        />
+      )}
     </div>
   );
 }
