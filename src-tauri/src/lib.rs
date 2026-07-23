@@ -3761,9 +3761,11 @@ async fn stt_transcribe(audio: String, language: String) -> Result<String, Strin
 // ── PTT mode toggle — "hold" (default) vs "tap" ───────────────────────────────────────────────────────
 // In tap mode the first Ctrl+Win press starts recording; the second press stops it. Persisted in the
 // ptt_watch module's own atomics so the poller thread can read it without any cross-module state.
+// ptt_watch is Windows-only; on macOS/Linux this is a no-op (PTT is keyboard-driven on Windows only).
 #[tauri::command]
 fn set_ptt_mode(mode: String) {
-    ptt_watch::set_tap_mode(mode == "tap");
+    #[cfg(windows)] { ptt_watch::set_tap_mode(mode == "tap"); }
+    #[cfg(not(windows))] { let _ = mode; }
 }
 
 // ── Sovereign model helpers — ggml Whisper model download + status ───────────────────────────────────
