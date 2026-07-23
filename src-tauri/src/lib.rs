@@ -3648,6 +3648,7 @@ async fn stt_download_engine(app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 fn show_listening_orb(app: AppHandle) {
     if let Some(w) = app.get_webview_window("listening-orb") {
+        let _ = w.set_ignore_cursor_events(true);
         let _ = w.show();
         return;
     }
@@ -3661,7 +3662,7 @@ fn show_listening_orb(app: AppHandle) {
             (x, y)
         })
         .unwrap_or((760.0, 820.0));
-    let _ = tauri::WebviewWindowBuilder::new(
+    if let Ok(w) = tauri::WebviewWindowBuilder::new(
         &app,
         "listening-orb",
         tauri::WebviewUrl::App("orb/index.html".into()),
@@ -3675,7 +3676,11 @@ fn show_listening_orb(app: AppHandle) {
     .skip_taskbar(true)
     .resizable(false)
     .focused(false)
-    .build();
+    .build() {
+        // Mouse events pass through the orb — cursor stays visible and the user can still
+        // click on whatever is behind it. The orb is purely visual.
+        let _ = w.set_ignore_cursor_events(true);
+    }
 }
 
 #[tauri::command]
